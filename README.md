@@ -14,7 +14,7 @@ Current safety status: the production-hardening source boundary is implemented,
 but executable HNS and Bitcoin value operations and all mainnet settlement
 remain release-gated. The HNS runtime rejects configurations that enable send
 or settlement, and the Bitcoin module cannot issue its value permit, until the
-adapter/persistence and qualification gates recorded in
+adapter-qualification and persistence gates recorded in
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
 [`docs/QUALIFICATION.md`](docs/QUALIFICATION.md) are complete. Test success is
 never a mainnet authorization signal.
@@ -41,6 +41,7 @@ Run `scripts/check.sh` once for the complete local qualification gate.
 - [Security model](docs/SECURITY.md)
 - [Provider API](docs/PROVIDER_API.md)
 - [Persistence and recovery](docs/PERSISTENCE_AND_RECOVERY.md)
+- [Handshake node RPC adapter](docs/HNS_NODE_RPC.md)
 - [Bitcoin Kyoto-only module](docs/BITCOIN_KYOTO.md)
 - [Ethereum model and contract](docs/ETHEREUM.md)
 - [Shakedex and market state](docs/SHAKEDEX_AND_MARKET.md)

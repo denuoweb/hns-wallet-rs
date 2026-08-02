@@ -57,10 +57,14 @@ The product runtime must:
 10. determine refund eligibility from validated local chain time; and
 11. surface user actions without automatically moving value.
 
-The HNS source implements bounded snapshot/reconciliation and prepared-
-transaction recovery, but the concrete async node adapter and complete
-multi-chain product supervisor are not integrated. The runtime therefore keeps
-HNS value operations release-gated.
+The HNS source implements the concrete synchronous authenticated node adapter,
+bounded chain/mempool snapshot reconciliation, and prepared-transaction
+recovery. The learned durable chain epoch and process-instance/generation pair
+remain exact across gap expansion and all point reads in one reconciliation;
+they are intentionally reacquired after process restart rather than persisted
+as timeless authority. The complete multi-chain product supervisor and current
+qualification evidence are not integrated, so HNS value operations remain
+release-gated.
 
 ## Bitcoin Kyoto recovery journal
 

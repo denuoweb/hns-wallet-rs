@@ -10,7 +10,7 @@ mainnet settlement remains disabled independently.
 | Standalone workspace | 11 crates, resolver 3, Rust 1.89, independent lockfile, no sibling paths | release CI and published artifacts |
 | Wallet types | IDs, decimal integer amounts, roles, capabilities, UI-safe status | API stabilization review |
 | Store | schema v3; Argon2id and XChaCha20-Poly1305; encrypted typed entities/workflows/provider records; metadata-bound AEAD; bounded heterogeneous CAS batches; bounded passphrase input, approvals and replays; monotonic permission tombstones; migration checkpoint; Linux file-boundary enforcement | platform key wrapping, supported secure-open policy on non-Linux targets, migration/import tooling for populated schema-v1 entity tables, DB benchmarks and audit |
-| HNS | create/restore, separated keys, BLAKE2b-160 version-0 addresses, bounded paginated atomic snapshots, restart-safe mempool instance/generation binding, restore/history/reorg reconciliation, send construction/signing, atomic account/workflow/input reservation preparation, watch-only split current/proof name evidence, canonical HTLC construction/spends, settlement evidence and restart supervision | concrete `hns-node-rs` adapter, released canonical NameState/resource decoder plus dedicated HNS-name key scan before ownership actions, published canonical settlement profile, regtest/restart/reorg qualification |
+| HNS | create/restore, separated keys, BLAKE2b-160 version-0 addresses, authenticated loopback `hns-node-rs` wallet RPC v1 adapter, bounded paginated atomic snapshots, durable chain epoch and restart-safe mempool instance/generation binding, restore/history/reorg reconciliation, ordered spender evidence, optional exact time/transaction positions, exact current/proof NameState bytes, send construction/signing, atomic account/workflow/input reservation preparation, watch-only split name evidence, canonical HTLC construction/spends, settlement evidence and restart supervision | consolidated adapter CI plus regtest/restart/reorg/adversarial qualification, released canonical NameState/resource decoder plus dedicated HNS-name key scan before ownership actions, published canonical settlement profile |
 | Provider | exact secure origin, authority/session generations, monotonic permission generations and revocation tombstones, bounded encrypted approvals/replays, rate limits, forbidden methods | browser/native runtime dispatch and complete trusted approval UI |
 | Shakedex | persisted seller/buyer/recovery state machines and canonical proof decoding | complete signed transaction construction, live node/Denuo integration, restart/reorg/regtest qualification |
 | Denuo market | chain-neutral reservations/sessions; canonical V2 protocol implemented in `hns-rs` | released protocol dependency, reporter governance, live relay/board integration |
@@ -35,9 +35,15 @@ nor reuse a change key nor leave an invisible losing workflow.
 
 Other exact blockers are:
 
-- a concrete adapter implementing the bounded, paginated chain-epoch/tip and
-  restart-safe mempool-instance/generation evidence boundary and exact version-0
-  Address-to-ScriptId conversion is not integrated or published;
+- the concrete authenticated loopback adapter is integrated in source, but its
+  consolidated CI, multi-process regtest, restart/reorg, malformed-transport,
+  stale-cursor, and resource qualification evidence is not yet recorded;
+- coinbase identity is preserved but coinbase outputs remain unselectable until
+  released canonical maturity evidence is integrated and qualified;
+- the node fee estimate is denominated per 1,000 HSD policy virtual bytes,
+  while the dormant wallet builder still sizes by transaction weight;
+  canonical sigop-adjusted sizing must replace that mismatch before value
+  enablement;
 - a released canonical NameState/resource decoder and a separately persisted,
   bounded `HnsName` derivation scan do not exist; imported names are therefore
   explicitly watch-only and owner/resource assertions are unavailable;

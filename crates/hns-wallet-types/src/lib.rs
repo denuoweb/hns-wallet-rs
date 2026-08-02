@@ -214,7 +214,7 @@ pub struct TransactionSummary {
     pub net_amount: SignedBaseUnits,
     pub fee: Option<BaseUnits>,
     pub block_height: Option<u64>,
-    pub first_seen_unix: u64,
+    pub first_seen_unix: Option<u64>,
     pub confirmation_count: u32,
 }
 

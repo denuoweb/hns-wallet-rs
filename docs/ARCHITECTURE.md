@@ -73,9 +73,14 @@ decoder is still required to bind owner, transfer, renewal and resource fields
 to those bytes; until it and a dedicated bounded `HnsName` key-role scan exist,
 known names are watch-only and raw resource/ownership claims are unavailable.
 
-The source does not yet contain the concrete async HNS node adapter or complete
-enclosing product runtime for every chain. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED`
-therefore remains false and HNS value capabilities are not advertised. See
+The concrete synchronous HNS adapter now speaks the authenticated loopback
+`hns-node-rs` wallet RPC v1 boundary, pinned to node commit `74f7ae36`. It
+derives canonical ScriptIds, enforces full chain/mempool bindings, and validates
+HTTP, JSON, transaction, spender, and name evidence without giving the node
+signing authority. The complete enclosing product runtime and qualification
+evidence are still pending. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` therefore
+remains false and HNS value capabilities are not advertised. See
+[HNS_NODE_RPC.md](HNS_NODE_RPC.md) and
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
 
 ## Bitcoin supervisor boundary

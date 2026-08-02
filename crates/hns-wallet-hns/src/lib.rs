@@ -1,6 +1,10 @@
 #![doc = "Handshake wallet key roles, restoration, UTXO selection, and name workflows."]
 #![forbid(unsafe_code)]
 
+mod node_rpc;
+
+pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
+
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, RwLock};
@@ -62,12 +66,14 @@ pub const MAX_TRANSACTION_INPUTS: usize = 10_000;
 pub const PREPARED_ARTIFACT_LIFETIME_SECONDS: u64 = 300;
 pub const DEFAULT_DUST_THRESHOLD: u128 = 546;
 pub const HNS_LOCKTIME_THRESHOLD: u64 = 500_000_000;
-pub const MAX_SCAN_PAGE_RESULTS: usize = 1_000;
-pub const MAX_SCAN_CURSOR_BYTES: usize = 256;
+pub const MAX_SCAN_PAGE_RESULTS: usize = 256;
+pub const MAX_MEMPOOL_SCAN_RESULTS: usize = 1_024;
+pub const MAX_OUTPOINT_SPEND_BATCH: usize = 256;
+pub const MAX_SCAN_CURSOR_BYTES: usize = 4_096;
 pub const MAX_SCAN_PAGES: usize = 128;
 pub const MAX_SNAPSHOT_RESTARTS: usize = 3;
-/// Release gate: value operations stay unavailable until the concrete atomic
-/// node-evidence adapter and the complete runtime qualification suite land.
+/// Release gate: value operations stay unavailable until the concrete node
+/// adapter and the complete runtime qualification suite pass together.
 pub const HNS_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -242,7 +248,15 @@ pub struct WalletCoin {
     pub outpoint: HnsOutpoint,
     pub value: BaseUnits,
     pub confirmation_count: u32,
+    /// Exact node evidence. Coinbase outputs remain conservatively excluded
+    /// until a released canonical maturity policy is wired into selection.
+    #[serde(default = "coinbase_evidence_unknown")]
+    pub coinbase: bool,
     pub name_locked: bool,
+}
+
+const fn coinbase_evidence_unknown() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -260,7 +274,7 @@ pub fn select_coins(
     }
     let mut candidates: Vec<_> = coins
         .iter()
-        .filter(|coin| !coin.name_locked)
+        .filter(|coin| !coin.name_locked && !coin.coinbase)
         .cloned()
         .collect();
     candidates.sort_by(|left, right| {
@@ -299,7 +313,11 @@ pub struct CoinSelection {
 
 pub trait HnsBackend {
     fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError>;
-    fn get_block_hash(&self, height: u64) -> Result<Option<[u8; 32]>, HnsWalletError>;
+    fn get_block_hash(
+        &self,
+        height: u64,
+        binding: SnapshotBinding,
+    ) -> Result<BlockHashEvidence, HnsWalletError>;
     /// Pages confirmed history and UTXOs over the complete sorted script set.
     /// The adapter must reject a stale epoch/cursor with `StaleNodeSnapshot`.
     fn get_confirmed_wallet_page(
@@ -319,6 +337,7 @@ pub trait HnsBackend {
         &self,
         txid: TransactionHash,
         binding: SnapshotBinding,
+        expected_mempool: Option<MempoolSnapshotBinding>,
     ) -> Result<TransactionEvidence, HnsWalletError>;
     fn get_outpoint_spend_evidence(
         &self,
@@ -326,6 +345,9 @@ pub trait HnsBackend {
         binding: SnapshotBinding,
     ) -> Result<OutpointSpendEvidence, HnsWalletError>;
     fn broadcast_transaction(&self, raw: &[u8]) -> Result<TransactionHash, HnsWalletError>;
+    /// Node estimate in atomic units per 1,000 HSD policy virtual bytes. The
+    /// dormant wallet fee constructor is not release-qualified to apply this
+    /// rate until canonical sigop-adjusted policy sizing is available.
     fn estimate_fee_rate(&self, target_blocks: u16) -> Result<BaseUnits, HnsWalletError>;
     /// Returns the interval-committed proof view and current name view without
     /// collapsing them. Every field is tied to the supplied snapshot binding.
@@ -346,7 +368,15 @@ pub struct ChainTip {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotBinding {
     pub tip: ChainTip,
-    pub chain_epoch: ObjectHash,
+    /// Durable monotonic canonical-chain epoch owned by the node wallet index.
+    pub chain_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockHashEvidence {
+    pub binding: SnapshotBinding,
+    pub height: u64,
+    pub block_hash: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -360,15 +390,21 @@ pub struct TransactionStatus {
 pub struct TransactionInclusion {
     pub block_hash: [u8; 32],
     pub height: u64,
-    pub transaction_index: u32,
+    /// Exact block transaction position when retained payload permits the node
+    /// to derive it. A pruned payload must remain `None`, never invented zero.
+    pub transaction_index: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub txid: TransactionHash,
     pub height: Option<u64>,
+    pub block_hash: Option<[u8; 32]>,
+    pub transaction_position: Option<u32>,
     pub spent: bool,
-    pub first_seen_unix: u64,
+    /// Exact block time or mempool admission time. Confirmed header time may
+    /// be unavailable and must remain `None`.
+    pub first_seen_unix: Option<u64>,
     pub script_index: u32,
 }
 
@@ -395,7 +431,7 @@ pub struct WalletAddressKey {
 pub struct ConfirmedWalletPageRequest<'a> {
     pub scripts: &'a [WalletAddressKey],
     pub expected_tip: ChainTip,
-    pub expected_epoch: Option<ObjectHash>,
+    pub expected_epoch: Option<u64>,
     pub cursor: Option<&'a [u8]>,
     pub limit: u32,
 }
@@ -438,6 +474,7 @@ pub struct MempoolWalletPage {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransactionEvidence {
     pub binding: SnapshotBinding,
+    pub mempool: MempoolSnapshotBinding,
     pub raw: Option<Vec<u8>>,
     pub status: TransactionStatus,
     pub inclusion: Option<TransactionInclusion>,
@@ -446,8 +483,22 @@ pub struct TransactionEvidence {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutpointSpendEvidence {
     pub binding: SnapshotBinding,
-    /// Exactly one entry per requested outpoint, in request order.
-    pub spenders: Vec<Option<TransactionHash>>,
+    /// Exactly one echoed entry per requested outpoint, in request order.
+    pub entries: Vec<OutpointSpendEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutpointSpendEntry {
+    pub outpoint: HnsOutpoint,
+    pub spending: Option<SpendingTransactionEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpendingTransactionEvidence {
+    pub transaction: TransactionHash,
+    pub input_position: u32,
+    pub block_hash: [u8; 32],
+    pub height: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -784,6 +835,7 @@ struct HnsRuntimeCache {
     coins: Vec<TrackedHnsCoin>,
     transactions: Vec<HnsTransactionRecord>,
     binding: Option<SnapshotBinding>,
+    mempool_binding: Option<MempoolSnapshotBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1027,6 +1079,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 coins,
                 transactions,
                 binding: None,
+                mempool_binding: None,
             }),
         })
     }
@@ -1559,28 +1612,53 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .map_or((HnsRecoveryState::default(), 0), |stored| {
                 (stored.value, stored.revision)
             });
-        let common_ancestor = self.find_common_ancestor(&recovery, tip)?;
+        self.set_sync_phase(SyncPhase::WalletScan, None)?;
+        let (
+            account,
+            account_revision,
+            binding,
+            mempool_binding,
+            addresses,
+            history,
+            indexed_coins,
+        ) =
+            self.restore_scan(&mut store, account, tip, now)?;
+        let common_ancestor = self.find_common_ancestor(&recovery, binding)?;
         let reorg_detected = recovery.last_tip.is_some()
             && common_ancestor
                 != recovery
                     .last_tip
                     .map(|old_tip| old_tip.height.min(tip.height));
-
-        self.set_sync_phase(SyncPhase::WalletScan, None)?;
-        let (account, account_revision, binding, addresses, history, indexed_coins) =
-            self.restore_scan(&mut store, account, tip, now)?;
         let coins = reconcile_coins(indexed_coins, &addresses)?;
-        let transactions =
-            self.reconcile_transactions(&history, &addresses, binding, common_ancestor)?;
+        let transactions = self.reconcile_transactions(
+            &history,
+            &addresses,
+            binding,
+            mempool_binding,
+            common_ancestor,
+        )?;
         let revalidated_names = self.revalidate_names(&mut store, binding, now)?;
         persist_reconciled_entities(&mut store, &account.config, &coins, &transactions, now)?;
-        let mut pending_user_actions = self.reconcile_send_workflows(&mut store, binding, now)?;
-        pending_user_actions.extend(self.reconcile_settlement_workflows(&mut store, binding, now)?);
+        let mut pending_user_actions =
+            self.reconcile_send_workflows(&mut store, binding, mempool_binding, now)?;
+        pending_user_actions.extend(self.reconcile_settlement_workflows(
+            &mut store,
+            binding,
+            mempool_binding,
+            now,
+        )?);
         pending_user_actions.sort();
         pending_user_actions.dedup();
-        self.cleanup_input_reservations(&mut store, &account.config, &coins, binding, now)?;
+        self.cleanup_input_reservations(
+            &mut store,
+            &account.config,
+            &coins,
+            binding,
+            mempool_binding,
+            now,
+        )?;
 
-        recovery.checkpoints = self.refresh_checkpoints(tip)?;
+        recovery.checkpoints = self.refresh_checkpoints(binding)?;
         recovery.last_tip = Some(tip);
         recovery.last_common_ancestor = common_ancestor;
         recovery.last_reconciled_unix = now;
@@ -1611,6 +1689,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             cache.coins = coins.clone();
             cache.transactions = transactions.clone();
             cache.binding = Some(binding);
+            cache.mempool_binding = Some(mempool_binding);
         }
         Ok(HnsReconciliationReport {
             tip,
@@ -1626,8 +1705,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     fn find_common_ancestor(
         &self,
         recovery: &HnsRecoveryState,
-        tip: ChainTip,
+        binding: SnapshotBinding,
     ) -> Result<Option<u64>, HnsWalletError> {
+        let tip = binding.tip;
         if recovery.last_tip.is_none() {
             return Ok(None);
         }
@@ -1635,7 +1715,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             if checkpoint.height > tip.height {
                 continue;
             }
-            if self.backend.get_block_hash(checkpoint.height)? == Some(checkpoint.block_hash) {
+            let evidence = self.backend.get_block_hash(checkpoint.height, binding)?;
+            if evidence.binding != binding || evidence.height != checkpoint.height {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            if evidence.block_hash == Some(checkpoint.block_hash) {
                 return Ok(Some(checkpoint.height));
             }
         }
@@ -1646,8 +1730,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
 
     fn refresh_checkpoints(
         &self,
-        tip: ChainTip,
+        binding: SnapshotBinding,
     ) -> Result<Vec<HnsChainCheckpoint>, HnsWalletError> {
+        let tip = binding.tip;
         let birthday = self.cache_read()?.account.config.birthday_height;
         let start = tip
             .height
@@ -1658,7 +1743,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let block_hash = if height == tip.height {
                 Some(tip.block_hash)
             } else {
-                self.backend.get_block_hash(height)?
+                let evidence = self.backend.get_block_hash(height, binding)?;
+                if evidence.binding != binding || evidence.height != height {
+                    return Err(HnsWalletError::StaleNodeSnapshot);
+                }
+                evidence.block_hash
             };
             let block_hash = block_hash.ok_or(HnsWalletError::InvalidEvidence)?;
             checkpoints.push(HnsChainCheckpoint { height, block_hash });
@@ -1818,6 +1907,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             HnsAccountRecord,
             u64,
             SnapshotBinding,
+            MempoolSnapshotBinding,
             Vec<DerivedHnsAddress>,
             Vec<HistoryEntry>,
             Vec<IndexedWalletCoin>,
@@ -1844,15 +1934,26 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         account.internal_scan_end = account.internal_scan_end.max(minimum_internal_end);
 
         let mut expected_binding = None;
-        let (mut addresses, mut history, indexed_coins, binding) = loop {
+        let mut expected_mempool = None;
+        let (mut addresses, mut history, indexed_coins, binding, mempool_binding) = loop {
             let addresses = derive_restore_addresses(store, &account)?;
             let (scripts, index_remap) = sorted_restore_scripts(&addresses)?;
-            let (binding, history, indexed_coins) =
-                load_wallet_snapshot(&self.backend, &scripts, &index_remap, expected_tip)?;
+            let (binding, mempool_binding, history, indexed_coins) = load_wallet_snapshot(
+                &self.backend,
+                &scripts,
+                &index_remap,
+                expected_tip,
+                expected_binding,
+                expected_mempool,
+            )?;
             if expected_binding.is_some_and(|expected| expected != binding) {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
+            if expected_mempool.is_some_and(|expected| expected != mempool_binding) {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
             expected_binding = Some(binding);
+            expected_mempool = Some(mempool_binding);
             let mut last_external = None;
             let mut last_internal = None;
             for entry in &history {
@@ -1889,7 +1990,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             if required_external <= account.external_scan_end
                 && required_internal <= account.internal_scan_end
             {
-                break (addresses, history, indexed_coins, binding);
+                break (
+                    addresses,
+                    history,
+                    indexed_coins,
+                    binding,
+                    mempool_binding,
+                );
             }
             account.external_scan_end = required_external;
             account.internal_scan_end = required_internal;
@@ -1943,6 +2050,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             account,
             account_revision,
             binding,
+            mempool_binding,
             addresses,
             history,
             indexed_coins,
@@ -1978,6 +2086,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         history: &[HistoryEntry],
         addresses: &[DerivedHnsAddress],
         binding: SnapshotBinding,
+        mempool_binding: MempoolSnapshotBinding,
         common_ancestor: Option<u64>,
     ) -> Result<Vec<HnsTransactionRecord>, HnsWalletError> {
         let mut history = coalesce_transaction_history(history)?;
@@ -2002,6 +2111,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 history.push(HistoryEntry {
                     txid: summary.txid,
                     height: summary.block_height,
+                    block_hash: None,
+                    transaction_position: None,
                     spent: false,
                     first_seen_unix: summary.first_seen_unix,
                     script_index: 0,
@@ -2017,8 +2128,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .map(|record| (record.summary.txid, record.raw.clone()))
             .collect();
         for entry in &history {
-            let evidence = self.backend.get_transaction_evidence(entry.txid, binding)?;
-            if evidence.binding != binding {
+            let evidence = self.backend.get_transaction_evidence(
+                entry.txid,
+                binding,
+                Some(mempool_binding),
+            )?;
+            if evidence.binding != binding || evidence.mempool != mempool_binding {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
             let raw = match evidence.raw {
@@ -2048,6 +2163,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 &mut raw_cache,
                 &persisted_raw,
                 binding,
+                mempool_binding,
             )?;
             let current_status = if status.conflicted || competing_spender {
                 LocalTransactionStatus::Conflicted
@@ -2129,6 +2245,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         &self,
         store: &mut WalletStore,
         binding: SnapshotBinding,
+        mempool_binding: MempoolSnapshotBinding,
         now_unix: u64,
     ) -> Result<Vec<WorkflowId>, HnsWalletError> {
         let workflows =
@@ -2163,8 +2280,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let Some(txid) = stored.state.transaction else {
                 continue;
             };
-            let evidence = self.backend.get_transaction_evidence(txid, binding)?;
-            if evidence.binding != binding {
+            let evidence = self.backend.get_transaction_evidence(
+                txid,
+                binding,
+                Some(mempool_binding),
+            )?;
+            if evidence.binding != binding || evidence.mempool != mempool_binding {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
             let chain_status = evidence.status;
@@ -2175,14 +2296,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 .iter()
                 .map(|input| input.coin.outpoint)
                 .collect();
-            let spend_evidence = self
-                .backend
-                .get_outpoint_spend_evidence(&outpoints, binding)?;
-            validate_spend_evidence(&spend_evidence, binding, outpoints.len())?;
-            let competing_spender = spend_evidence
-                .spenders
-                .iter()
-                .any(|spender| spender.is_some_and(|spender| spender != txid));
+            let competing_spender = has_competing_spender_in_batches(
+                &self.backend,
+                &outpoints,
+                binding,
+                txid,
+            )?;
             let next_stage = if chain_status.conflicted || competing_spender {
                 HnsSendStage::Conflicted
             } else if chain_status.confirmation_count > 0 {
@@ -2244,14 +2363,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             };
             outpoints.push(outpoint);
         }
-        let evidence = self
-            .backend
-            .get_outpoint_spend_evidence(&outpoints, binding)?;
-        validate_spend_evidence(&evidence, binding, outpoints.len())?;
-        Ok(evidence
-            .spenders
-            .into_iter()
-            .any(|spender| spender.is_some_and(|spender| spender != transaction_id)))
+        has_competing_spender_in_batches(&self.backend, &outpoints, binding, transaction_id)
     }
 
     fn cleanup_input_reservations(
@@ -2260,6 +2372,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         config: &HnsRuntimeConfig,
         coins: &[TrackedHnsCoin],
         binding: SnapshotBinding,
+        mempool_binding: MempoolSnapshotBinding,
         now_unix: u64,
     ) -> Result<(), HnsWalletError> {
         let unspent: BTreeSet<HnsOutpoint> = coins.iter().map(|coin| coin.coin.outpoint).collect();
@@ -2281,8 +2394,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     Ok(Some(workflow)) => {
                         let evidence = self
                             .backend
-                            .get_transaction_evidence(workflow.state.transaction, binding)?;
-                        if evidence.binding != binding {
+                            .get_transaction_evidence(
+                                workflow.state.transaction,
+                                binding,
+                                Some(mempool_binding),
+                            )?;
+                        if evidence.binding != binding || evidence.mempool != mempool_binding {
                             return Err(HnsWalletError::StaleNodeSnapshot);
                         }
                         evidence.status.conflicted
@@ -2314,6 +2431,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         &self,
         store: &mut WalletStore,
         binding: SnapshotBinding,
+        mempool_binding: MempoolSnapshotBinding,
         now_unix: u64,
     ) -> Result<Vec<WorkflowId>, HnsWalletError> {
         let config = self.cache_read()?.account.config.clone();
@@ -2332,8 +2450,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 let next_stage = if previous_stage == HnsSettlementStage::Prepared {
                     let evidence = self
                         .backend
-                        .get_transaction_evidence(stored.state.transaction, binding)?;
-                    if evidence.binding != binding {
+                        .get_transaction_evidence(
+                            stored.state.transaction,
+                            binding,
+                            Some(mempool_binding),
+                        )?;
+                    if evidence.binding != binding || evidence.mempool != mempool_binding {
                         return Err(HnsWalletError::StaleNodeSnapshot);
                     }
                     if evidence.status.conflicted {
@@ -2355,8 +2477,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 ) {
                     let evidence = self
                         .backend
-                        .get_transaction_evidence(stored.state.transaction, binding)?;
-                    if evidence.binding != binding {
+                        .get_transaction_evidence(
+                            stored.state.transaction,
+                            binding,
+                            Some(mempool_binding),
+                        )?;
+                    if evidence.binding != binding || evidence.mempool != mempool_binding {
                         return Err(HnsWalletError::StaleNodeSnapshot);
                     }
                     if evidence.status.conflicted {
@@ -2547,9 +2673,26 @@ fn load_wallet_snapshot<B: HnsBackend>(
     scripts: &[WalletAddressKey],
     index_remap: &[u32],
     expected_tip: ChainTip,
-) -> Result<(SnapshotBinding, Vec<HistoryEntry>, Vec<IndexedWalletCoin>), HnsWalletError> {
+    expected_binding: Option<SnapshotBinding>,
+    expected_mempool: Option<MempoolSnapshotBinding>,
+) -> Result<
+    (
+        SnapshotBinding,
+        MempoolSnapshotBinding,
+        Vec<HistoryEntry>,
+        Vec<IndexedWalletCoin>,
+    ),
+    HnsWalletError,
+> {
     for attempt in 0..MAX_SNAPSHOT_RESTARTS {
-        match load_wallet_snapshot_once(backend, scripts, index_remap, expected_tip) {
+        match load_wallet_snapshot_once(
+            backend,
+            scripts,
+            index_remap,
+            expected_tip,
+            expected_binding,
+            expected_mempool,
+        ) {
             Err(HnsWalletError::StaleNodeSnapshot) if attempt + 1 < MAX_SNAPSHOT_RESTARTS => {}
             result => return result,
         }
@@ -2562,7 +2705,17 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
     scripts: &[WalletAddressKey],
     index_remap: &[u32],
     expected_tip: ChainTip,
-) -> Result<(SnapshotBinding, Vec<HistoryEntry>, Vec<IndexedWalletCoin>), HnsWalletError> {
+    expected_binding: Option<SnapshotBinding>,
+    expected_mempool: Option<MempoolSnapshotBinding>,
+) -> Result<
+    (
+        SnapshotBinding,
+        MempoolSnapshotBinding,
+        Vec<HistoryEntry>,
+        Vec<IndexedWalletCoin>,
+    ),
+    HnsWalletError,
+> {
     if scripts.is_empty()
         || scripts.len() != index_remap.len()
         || scripts.len() > MAX_RESTORE_SCRIPTS_PER_QUERY
@@ -2577,7 +2730,7 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
         u32::try_from(MAX_SCAN_PAGE_RESULTS).map_err(|_| HnsWalletError::ScanCapacityExhausted)?;
     let mut confirmed_cursor: Option<Vec<u8>> = None;
     let mut seen_cursors = BTreeSet::new();
-    let mut binding = None;
+    let mut binding = expected_binding;
     let mut history = Vec::new();
     let mut utxos = Vec::new();
     for _ in 0..MAX_SCAN_PAGES {
@@ -2590,8 +2743,11 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
         })?;
         if page.binding.tip != expected_tip
             || binding.is_some_and(|expected| expected != page.binding)
-            || page.history.len() > MAX_SCAN_PAGE_RESULTS
-            || page.utxos.len() > MAX_SCAN_PAGE_RESULTS
+            || page
+                .history
+                .len()
+                .saturating_add(page.utxos.len())
+                > MAX_SCAN_PAGE_RESULTS
         {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
@@ -2609,7 +2765,9 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
     let binding = binding.ok_or(HnsWalletError::InvalidEvidence)?;
 
     let mut mempool_cursor: Option<Vec<u8>> = None;
-    let mut mempool_binding = None;
+    let mut mempool_binding = expected_mempool;
+    let mempool_limit = u32::try_from(MAX_MEMPOOL_SCAN_RESULTS)
+        .map_err(|_| HnsWalletError::ScanCapacityExhausted)?;
     seen_cursors.clear();
     for _ in 0..MAX_SCAN_PAGES {
         let page = backend.get_mempool_wallet_page(MempoolWalletPageRequest {
@@ -2617,12 +2775,12 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
             binding,
             expected_mempool: mempool_binding,
             cursor: mempool_cursor.as_deref(),
-            limit,
+            limit: mempool_limit,
         })?;
         if page.binding != binding
             || page.mempool.instance_nonce == [0; 32]
             || mempool_binding.is_some_and(|expected| expected != page.mempool)
-            || page.history.len() > MAX_SCAN_PAGE_RESULTS
+            || page.history.len() > MAX_HISTORY_RESULTS
         {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
@@ -2636,7 +2794,13 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
     if mempool_cursor.is_some() {
         return Err(HnsWalletError::ScanCapacityExhausted);
     }
-    Ok((binding, bounded_history(history, index_remap.len())?, utxos))
+    let mempool_binding = mempool_binding.ok_or(HnsWalletError::InvalidEvidence)?;
+    Ok((
+        binding,
+        mempool_binding,
+        bounded_history(history, index_remap.len())?,
+        utxos,
+    ))
 }
 
 fn validated_next_cursor(
@@ -2665,7 +2829,16 @@ fn append_remapped_history(
         return Err(HnsWalletError::HistoryLimit);
     }
     for mut entry in entries {
-        if entry.height.is_some() != confirmed {
+        if confirmed
+            != (entry.height.is_some()
+                && entry.block_hash.is_some()
+                && entry.transaction_position.is_some())
+            || (!confirmed
+                && (entry.height.is_some()
+                    || entry.block_hash.is_some()
+                    || entry.transaction_position.is_some()
+                    || entry.first_seen_unix.is_none()))
+        {
             return Err(HnsWalletError::InvalidEvidence);
         }
         entry.script_index = *index_remap
@@ -2703,12 +2876,41 @@ fn append_remapped_utxos(
 fn validate_spend_evidence(
     evidence: &OutpointSpendEvidence,
     binding: SnapshotBinding,
-    expected_len: usize,
+    expected_outpoints: &[HnsOutpoint],
 ) -> Result<(), HnsWalletError> {
-    if evidence.binding != binding || evidence.spenders.len() != expected_len {
+    if evidence.binding != binding || evidence.entries.len() != expected_outpoints.len() {
         return Err(HnsWalletError::StaleNodeSnapshot);
     }
+    for (entry, expected) in evidence.entries.iter().zip(expected_outpoints) {
+        if entry.outpoint != *expected
+            || entry.spending.is_some_and(|spending| {
+                spending.height > binding.tip.height
+                    || spending.block_hash == [0; 32]
+            })
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
     Ok(())
+}
+
+fn has_competing_spender_in_batches<B: HnsBackend>(
+    backend: &B,
+    outpoints: &[HnsOutpoint],
+    binding: SnapshotBinding,
+    expected_spender: TransactionHash,
+) -> Result<bool, HnsWalletError> {
+    let mut competing = false;
+    for batch in outpoints.chunks(MAX_OUTPOINT_SPEND_BATCH) {
+        let evidence = backend.get_outpoint_spend_evidence(batch, binding)?;
+        validate_spend_evidence(&evidence, binding, batch)?;
+        competing |= evidence.entries.iter().any(|entry| {
+            entry
+                .spending
+                .is_some_and(|spending| spending.transaction != expected_spender)
+        });
+    }
+    Ok(competing)
 }
 
 fn public_key_hash(public_key: &[u8; 33]) -> Result<[u8; 20], HnsWalletError> {
@@ -2751,6 +2953,8 @@ fn coalesce_transaction_history(
         match transactions.get_mut(&entry.txid) {
             Some(previous) => {
                 if previous.height != entry.height
+                    || previous.block_hash != entry.block_hash
+                    || previous.transaction_position != entry.transaction_position
                     || previous.first_seen_unix != entry.first_seen_unix
                 {
                     return Err(HnsWalletError::InvalidEvidence);
@@ -2827,6 +3031,11 @@ fn validate_inclusion(
         Some(inclusion) => {
             if inclusion.height > tip.height
                 || (observed_in_current_history && entry.height != Some(inclusion.height))
+                || (observed_in_current_history
+                    && entry.block_hash != Some(inclusion.block_hash))
+                || (observed_in_current_history
+                    && inclusion.transaction_index.is_some()
+                    && entry.transaction_position != inclusion.transaction_index)
                 || status.confirmation_count == 0
             {
                 return Err(HnsWalletError::InvalidEvidence);
@@ -2854,6 +3063,7 @@ fn transaction_value_effect<B: HnsBackend>(
     raw_cache: &mut BTreeMap<TransactionHash, Transaction>,
     persisted_raw: &BTreeMap<TransactionHash, Vec<u8>>,
     binding: SnapshotBinding,
+    mempool_binding: MempoolSnapshotBinding,
 ) -> Result<(SignedBaseUnits, Option<BaseUnits>), HnsWalletError> {
     if transaction.inputs.len() > MAX_TRANSACTION_INPUTS {
         return Err(HnsWalletError::InvalidEvidence);
@@ -2876,8 +3086,12 @@ fn transaction_value_effect<B: HnsBackend>(
         }
         let parent_id = TransactionHash::new(input.previous_output.transaction_hash.into_bytes());
         if !raw_cache.contains_key(&parent_id) {
-            let evidence = backend.get_transaction_evidence(parent_id, binding)?;
-            if evidence.binding != binding {
+            let evidence = backend.get_transaction_evidence(
+                parent_id,
+                binding,
+                Some(mempool_binding),
+            )?;
+            if evidence.binding != binding || evidence.mempool != mempool_binding {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
             let raw = match evidence.raw {
@@ -3259,7 +3473,7 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             .coins
             .iter()
             .try_fold(BaseUnits::ZERO, |total, coin| {
-                if coin.coin.name_locked {
+                if coin.coin.name_locked || coin.coin.coinbase {
                     Ok(total)
                 } else {
                     total
@@ -3581,7 +3795,7 @@ impl<B: HnsBackend, C: HnsClock> UtxoChainModule for HnsWalletRuntime<B, C> {
                     base_units: coin.coin.value,
                 },
                 confirmation_count: coin.coin.confirmation_count,
-                spendable: !coin.coin.name_locked,
+                spendable: !coin.coin.name_locked && !coin.coin.coinbase,
             })
             .collect())
     }
@@ -3846,6 +4060,9 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         ensure_settlement_ready(&cache)?;
         let configured_minimum = cache.account.config.minimum_confirmations;
         let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
+        let mempool_binding = cache
+            .mempool_binding
+            .ok_or(ChainError::NotSynchronized)?;
         let config = cache.account.config.clone();
         drop(cache);
         if request.expected.module != ModuleId::Handshake
@@ -3872,9 +4089,10 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         let txid = wallet_transaction_hash(&transaction).map_err(map_chain_error)?;
         let evidence = self
             .backend
-            .get_transaction_evidence(txid, binding)
+            .get_transaction_evidence(txid, binding, Some(mempool_binding))
             .map_err(map_chain_error)?;
         if evidence.binding != binding
+            || evidence.mempool != mempool_binding
             || evidence.raw.as_deref() != Some(request.transaction_or_receipt.as_slice())
         {
             return Err(ChainError::InvalidEvidence);
@@ -4016,6 +4234,9 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         let cache = self.cache_read().map_err(map_chain_error)?;
         ensure_settlement_ready(&cache)?;
         let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
+        let mempool_binding = cache
+            .mempool_binding
+            .ok_or(ChainError::NotSynchronized)?;
         let config = cache.account.config.clone();
         drop(cache);
         let record = self
@@ -4035,9 +4256,13 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         }
         let evidence = self
             .backend
-            .get_transaction_evidence(request.spending_transaction, binding)
+            .get_transaction_evidence(
+                request.spending_transaction,
+                binding,
+                Some(mempool_binding),
+            )
             .map_err(map_chain_error)?;
-        if evidence.binding != binding {
+        if evidence.binding != binding || evidence.mempool != mempool_binding {
             return Err(ChainError::InvalidEvidence);
         }
         let status = evidence.status;
@@ -4144,7 +4369,9 @@ fn build_unsigned_payment(
     if amount == 0 || fee_rate.is_zero() || maximum_fee.is_zero() {
         return Err(HnsWalletError::InvalidAmount);
     }
-    coins.retain(|coin| !coin.coin.name_locked && coin.coin.confirmation_count > 0);
+    coins.retain(|coin| {
+        !coin.coin.name_locked && !coin.coin.coinbase && coin.coin.confirmation_count > 0
+    });
     coins.sort_by(|left, right| {
         left.coin
             .value
@@ -4240,12 +4467,12 @@ fn unsigned_payment_transaction(
 
 fn transaction_fee(
     transaction: &Transaction,
-    rate_per_kweight: BaseUnits,
+    unqualified_node_rate_per_kvb: BaseUnits,
 ) -> Result<BaseUnits, HnsWalletError> {
     let weight = transaction
         .weight()
         .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
-    let product = rate_per_kweight
+    let product = unqualified_node_rate_per_kvb
         .get()
         .checked_mul(weight as u128)
         .ok_or(HnsWalletError::Arithmetic)?;
@@ -4674,6 +4901,7 @@ mod tests {
                 },
                 value: BaseUnits::new(7),
                 confirmation_count: 1,
+                coinbase: false,
                 name_locked: true,
             },
             WalletCoin {
@@ -4683,6 +4911,7 @@ mod tests {
                 },
                 value: BaseUnits::new(5),
                 confirmation_count: 1,
+                coinbase: false,
                 name_locked: false,
             },
             WalletCoin {
@@ -4692,6 +4921,7 @@ mod tests {
                 },
                 value: BaseUnits::new(4),
                 confirmation_count: 2,
+                coinbase: false,
                 name_locked: false,
             },
         ];
@@ -4699,7 +4929,12 @@ mod tests {
         assert_eq!(selected.coins.len(), 2);
         assert_eq!(selected.total, BaseUnits::new(9));
         assert_eq!(selected.change, BaseUnits::new(1));
-        assert!(selected.coins.iter().all(|coin| !coin.name_locked));
+        assert!(
+            selected
+                .coins
+                .iter()
+                .all(|coin| !coin.name_locked && !coin.coinbase)
+        );
     }
 
     #[test]

@@ -18,6 +18,10 @@ marketplace settlement is independently disabled.
   state, or peer claim. Canonical signatures and local chain evidence decide.
 - Bitcoin production synchronization has one backend: Kyoto direct P2P with
   BIP157/158. There is no trusted indexer fallback.
+- Handshake node evidence crosses one authenticated loopback HTTP/1.1 boundary.
+  Loopback is not authorization: the wallet requires an exact, bounded,
+  visible-ASCII Authorization value and rejects redirects, remote endpoints,
+  ambiguous HTTP framing, and noncanonical RPC envelopes.
 - Ethereum availability still depends on configured consensus and execution
   data providers. The selected Helios model is intended to verify consensus
   and execution evidence, but providers may censor, omit, delay, correlate, or
@@ -97,11 +101,12 @@ view. Because released protocol crates do not yet decode canonical NameState
 owner/resource/transfer/renewal fields, imported names remain watch-only;
 current/proof owner hints and raw resource bytes are not authorization evidence.
 
-Current cross-chain code is not qualified for live value. A concrete HNS node
-adapter, released canonical HNS name-state/resource decoding, a published
-canonical HNS settlement profile, Bitcoin supervisor qualification, Helios
-proof construction, restart/reorg demonstrations, real-chain tests, resource
-benchmarks, and independent review remain blockers.
+Current cross-chain code is not qualified for live value. The concrete HNS node
+adapter source is present, but its consolidated qualification, released
+canonical HNS name-state/resource decoding, a published canonical HNS
+settlement profile, canonical HSD sigop-adjusted fee sizing, Bitcoin supervisor
+qualification, Helios proof construction, restart/reorg demonstrations,
+real-chain tests, resource benchmarks, and independent review remain blockers.
 
 Bitcoin's supervisor does not authorize from a peer status field. A completed
 Kyoto wallet update is committed to BDK SQLite before encrypted transaction and
