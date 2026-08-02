@@ -2,8 +2,8 @@
 
 Snapshot: 2026-08-02. The production-hardening source boundary is implemented;
 the executable wallet product is not yet release-qualified. HNS send and
-settlement are hard-disabled on every network, and mainnet settlement remains
-disabled independently.
+settlement and Bitcoin send/settlement are hard-disabled on every network, and
+mainnet settlement remains disabled independently.
 
 | Deliverable | Implemented source | Required before availability |
 | --- | --- | --- |
@@ -14,7 +14,7 @@ disabled independently.
 | Provider | exact secure origin, authority/session generations, monotonic permission generations and revocation tombstones, bounded encrypted approvals/replays, rate limits, forbidden methods | browser/native runtime dispatch and complete trusted approval UI |
 | Shakedex | persisted seller/buyer/recovery state machines and canonical proof decoding | complete signed transaction construction, live node/Denuo integration, restart/reorg/regtest qualification |
 | Denuo market | chain-neutral reservations/sessions; canonical V2 protocol implemented in `hns-rs` | released protocol dependency, reporter governance, live relay/board integration |
-| Bitcoin | BDK BIP84 create/load/receive/send, Kyoto client boundary, HTLC funding/spend/evidence units | supervisor integration, broadcast/reorg/regtest/benchmarks |
+| Bitcoin | BDK BIP84 create/load/receive/send primitives; bounded Kyoto tip discovery and supervisor; encrypted birthday/phase/checkpoint journal; BDK-first restart reconciliation; bounded transaction/output mirrors; exact fee-bound pre-broadcast journal; HTLC funding/spend/evidence units | pinned Kyoto durable header/filter/peer API, record archival, signed-spend/settlement integration, consolidated CI, regtest/restart/reorg/adversarial qualification and benchmarks; value gate remains false |
 | Ethereum | separated accounts, typed EIP-1559 native/HTLC signing, Helios policy, exact code/state/receipt/event checks, deterministic contract | embedded Helios proof source, persistence/history, local-chain qualification, approved address and audit |
 | FFI | versioned bounded typed frames; Chromium phrase denial | generated JNI/Swift/Chromium bindings and compatibility E2E |
 | Testkit | deterministic non-mainnet, hostile-input, reorg, and qualification fixtures | full multi-process network harnesses |
@@ -47,6 +47,28 @@ Other exact blockers are:
   and non-Linux secure persistent database opening are unavailable; and
 - regtest, restart/reorg, installed-product, resource, and independent security
   qualification have not been recorded for this source tranche.
+
+## Bitcoin value release gate
+
+`BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED` is `false`. Bitcoin receive address
+derivation and source-level history remain discoverable, but capability output
+does not advertise send or atomic settlement and the private value permit
+cannot be constructed.
+
+The dormant broadcast boundary requires a durable ready scan, a running Kyoto
+node, configured peer quorum, owned unspent inputs, BDK-calculated exact fee,
+and a canonical approval commitment over network, txid, wtxid, exact fee, fee
+maximum, and exclusive expiry. Native-send signing and broadcast both require
+the unavailable permit. It journals `submission_started` before the bounded
+Kyoto request and applies the rebroadcast interval before retrying an ambiguous
+submission.
+
+The pinned `bip157` 0.6.3 source ignores `data_dir`; exact headers, compact-
+filter headers/filters, and address-book state are not durably exposed. A
+reviewed persistence-capable Kyoto boundary, safe archival at the 4,096-record
+lifetime caps, signed HTLC spend supervision, regtest/restart/reorg/adversarial
+evidence, trusted-time policy, resource measurements, and independent review
+remain blockers.
 
 ## Evidence statement
 

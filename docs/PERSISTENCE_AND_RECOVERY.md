@@ -62,6 +62,41 @@ transaction recovery, but the concrete async node adapter and complete
 multi-chain product supervisor are not integrated. The runtime therefore keeps
 HNS value operations release-gated.
 
+## Bitcoin Kyoto recovery journal
+
+The Bitcoin module persists two coordinated stores. BDK SQLite is the durable
+descriptor/local-chain/transaction/output authority. The encrypted wallet store
+records an authenticated birthday, a distinct non-genesis new-wallet recovery
+anchor, bounded recent checkpoints, supervisor sequence and phase,
+transaction/output reconciliation mirrors, and signed broadcast intents.
+
+A sync records `synchronizing`, applies the Kyoto update, persists BDK, records
+`reconciling`, applies encrypted mirror changes in bounded chunks, and commits
+`ready` last. Consumers must ignore an incomplete mirror unless the scan record
+is ready at its completed sequence. Restart from `reconciling` compares the BDK
+tip to the pending checkpoint and resumes the chunks without another network
+update. A sync timeout discards the non-cancel-safe subscriber, shuts down the
+node, and persists `recovery_required`; the poisoned supervisor cannot be
+reused.
+
+Broadcast preparation resolves every input through the same BDK wallet,
+calculates the exact fee, verifies the approved maximum, and persists raw bytes
+plus a network/txid/wtxid/fee/maximum/expiry commitment before Kyoto receives
+them. A timeout after `submission_started` is restart-safe and retryable. This
+retry observes the same rebroadcast interval as a known submission; approval
+expiry is exclusive. Native-send signing and broadcast are dormant because the
+Bitcoin value permit is release-gated.
+
+Execution rejects a clock value behind the durable preparation or latest
+attempt timestamp. A production release still requires a reviewed source of
+trusted or monotonic time across process and device restart.
+
+The pinned `bip157` 0.6.3 implementation ignores its configured `data_dir` and
+does not expose durable headers, filter headers/filters, or peer address-book
+state. Those databases cannot be truthfully restored by this source and remain
+a release blocker. Canonically absent transaction/output records are retained;
+safe archival is also pending, so the fixed lifetime caps fail closed.
+
 ## Migrations and backups
 
 Opening a database with a newer schema fails. Schema upgrades are transactional.

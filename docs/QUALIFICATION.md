@@ -12,7 +12,7 @@ current commit has no recorded result for that gate.
 | Provider core | pending consolidated gate | encrypted grants/tombstones/approvals/replays implemented | n/a | no installed-browser E2E | no audit | product integration pending |
 | Fixed-price Shakedex | prior unit baseline only | CAS journal source | evidence incomplete | no regtest/Denuo E2E | no audit | unavailable |
 | Market sessions | prior unit baseline only | CAS journal source | evidence incomplete | no pair E2E | no audit | unavailable |
-| Bitcoin Kyoto | prior unit baseline only | BDK/Kyoto stores designed | unit rewind baseline only | no regtest/P2P run | not measured | unavailable |
+| Bitcoin Kyoto | current supervisor tranche pending consolidated gate | source includes BDK-first sync journal, bounded reconciliation chunks, restart resume, and pre-broadcast intent; pinned Kyoto header/filter/peer persistence unavailable | source queries exact canonical hash membership within a bounded retained window; no current execution evidence | no regtest/P2P/broadcast run | not measured/no audit | send and settlement hard-disabled |
 | Ethereum | prior unit baseline only | schema only | rollback negative baseline only | contract compiles in baseline; no local-chain/Helios run | no contract audit | unavailable |
 | ABI | prior unit baseline only | session field only | n/a | no platform ABI E2E | no audit | product integration pending |
 | Browser products | separate repositories | platform integration pending | n/a | no installed/signed E2E | no review | unavailable |

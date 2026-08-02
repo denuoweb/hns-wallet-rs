@@ -1,6 +1,10 @@
 #![doc = "Kyoto-only Bitcoin wallet integration and native HTLC settlement."]
 #![forbid(unsafe_code)]
 
+mod runtime;
+
+pub use runtime::*;
+
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -36,6 +40,11 @@ pub const MAX_BITCOIN_TRANSACTION_BYTES: usize = 400_000;
 pub const MAX_REQUIRED_PEERS: u8 = 8;
 pub const MAX_RECOVERY_SCRIPT_INDEX: u32 = 100_000;
 pub const DEFAULT_REQUIRED_PEERS: u8 = 3;
+pub const MAX_KYOTO_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+pub const MAX_KYOTO_SYNC_TIMEOUT: Duration = Duration::from_secs(86_400);
+/// The source contains value-moving primitives, but the complete Kyoto
+/// persistence and independent release gate have not passed.
+pub const BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
 
 /// The only production synchronization model exposed by this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,62 +60,13 @@ pub const fn synchronization_model() -> BitcoinSynchronizationModel {
 pub const fn capabilities() -> ChainCapabilities {
     ChainCapabilities {
         receive: true,
-        send: true,
+        send: BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED,
         history: true,
-        atomic_settlement: true,
+        atomic_settlement: BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED,
         hash_algorithm: HashAlgorithm::Sha256,
         locktime_model: LocktimeModel::BlockHeight,
         finality_model: FinalityModel::ProofOfWorkConfirmations,
         fee_model: FeeModel::WeightRate,
-    }
-}
-
-/// Wallet-owned checkpoint metadata. Kyoto persists validated headers, filter
-/// headers, compact filters and peer state in `data_dir`; BDK persists wallet
-/// checkpoints, transactions and outputs in the wallet SQLite connection.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct KyotoWalletState {
-    pub birthday_height: u32,
-    pub validated_height: u32,
-    pub scanned_height: u32,
-    pub last_consistent_height: u32,
-    pub relevant_block_hashes: Vec<[u8; 32]>,
-    pub last_started_at_unix: u64,
-}
-
-impl KyotoWalletState {
-    pub fn new_wallet(validated_height: u32, now_unix: u64) -> Self {
-        Self {
-            birthday_height: validated_height,
-            validated_height,
-            scanned_height: validated_height,
-            last_consistent_height: validated_height,
-            relevant_block_hashes: Vec::new(),
-            last_started_at_unix: now_unix,
-        }
-    }
-
-    pub fn restored_wallet(birthday_height: Option<u32>, now_unix: u64) -> Self {
-        let birthday = birthday_height.unwrap_or(0);
-        Self {
-            birthday_height: birthday,
-            validated_height: birthday,
-            scanned_height: birthday,
-            last_consistent_height: birthday,
-            relevant_block_hashes: Vec::new(),
-            last_started_at_unix: now_unix,
-        }
-    }
-
-    pub fn rewind_for_reorg(&mut self, common_ancestor_height: u32) {
-        self.validated_height = self.validated_height.min(common_ancestor_height);
-        self.scanned_height = self.scanned_height.min(common_ancestor_height);
-        self.last_consistent_height = common_ancestor_height;
-        self.relevant_block_hashes.truncate(
-            usize::try_from(common_ancestor_height.saturating_sub(self.birthday_height))
-                .unwrap_or(usize::MAX)
-                .saturating_add(1),
-        );
     }
 }
 
@@ -116,6 +76,8 @@ pub struct KyotoRuntimeConfig {
     pub data_dir: PathBuf,
     pub required_peers: u8,
     pub response_timeout: Duration,
+    pub supervisor_request_timeout: Duration,
+    pub supervisor_sync_timeout: Duration,
     pub trusted_peers: Vec<TrustedPeer>,
 }
 
@@ -125,6 +87,10 @@ impl KyotoRuntimeConfig {
             || self.required_peers == 0
             || self.required_peers > MAX_REQUIRED_PEERS
             || self.response_timeout.is_zero()
+            || self.supervisor_request_timeout.is_zero()
+            || self.supervisor_request_timeout > MAX_KYOTO_REQUEST_TIMEOUT
+            || self.supervisor_sync_timeout.is_zero()
+            || self.supervisor_sync_timeout > MAX_KYOTO_SYNC_TIMEOUT
         {
             return Err(BitcoinWalletError::InvalidConfiguration);
         }
@@ -282,9 +248,12 @@ pub fn prepare_native_send(
 }
 
 /// The caller must bind the approval to the prepared destination, amount, fee
-/// and serialized PSBT commitment before invoking this signing boundary.
+/// and serialized PSBT commitment before invoking this signing boundary. The
+/// release-qualified value-runtime permit is deliberately unavailable until
+/// the Bitcoin value path passes its independent qualification gate.
 pub fn authorize_native_send(
     wallet: &Wallet,
+    _permit: &BitcoinValueRuntimePermit,
     mut prepared: PreparedBitcoinSend,
 ) -> Result<Vec<u8>, BitcoinWalletError> {
     let finalized = wallet
@@ -557,6 +526,22 @@ pub enum BitcoinWalletError {
     Wallet(String),
     #[error("Kyoto client error: {0}")]
     Kyoto(String),
+    #[error("Kyoto node stopped before completing synchronization")]
+    KyotoNodeStopped,
+    #[error("Kyoto supervisor operation exceeded its configured timeout")]
+    OperationTimedOut,
+    #[error("Kyoto supervisor must be discarded and restarted")]
+    SupervisorPoisoned,
+    #[error("Kyoto wallet state is not at a durable ready checkpoint")]
+    RuntimeNotReady,
+    #[error("Kyoto does not currently have the required peer quorum")]
+    PeerQuorumUnavailable,
+    #[error("a Tokio runtime is required to supervise Kyoto")]
+    RuntimeUnavailable,
+    #[error("Bitcoin wallet-state persistence failed: {0}")]
+    WalletPersistence(String),
+    #[error(transparent)]
+    Store(#[from] hns_wallet_store::StoreError),
     #[error("address or wallet network mismatch")]
     NetworkMismatch,
     #[error("invalid destination")]
@@ -585,6 +570,50 @@ pub enum BitcoinWalletError {
     InvalidEvidence,
     #[error("chain evidence contains multiple possible matches")]
     AmbiguousEvidence,
+    #[error("Bitcoin checkpoint is invalid")]
+    InvalidCheckpoint,
+    #[error("Bitcoin checkpoint does not match the applied wallet update")]
+    CheckpointMismatch,
+    #[error("Bitcoin wallet birthday is invalid")]
+    InvalidBirthday,
+    #[error("Bitcoin recovery script index is invalid or unbounded")]
+    InvalidRecoveryScriptIndex,
+    #[error("Bitcoin runtime state uses an unsupported schema version")]
+    UnsupportedStateVersion,
+    #[error("Bitcoin runtime state is corrupt or internally inconsistent")]
+    CorruptRuntimeState,
+    #[error("Bitcoin runtime sequence overflow")]
+    SequenceOverflow,
+    #[error("Bitcoin checkpoint retention capacity was exceeded")]
+    CheckpointCapacity,
+    #[error("a reorganization exceeded the retained recovery boundary")]
+    DeepReorganization,
+    #[error("Bitcoin transaction tracking capacity was exceeded")]
+    BitcoinTransactionCapacity,
+    #[error("Bitcoin output tracking capacity was exceeded")]
+    BitcoinOutputCapacity,
+    #[error("Bitcoin scan state was not found")]
+    BitcoinStateNotFound,
+    #[error("Bitcoin value operations are disabled until release qualification")]
+    ValueOperationsDisabled,
+    #[error("Bitcoin broadcast approval is invalid")]
+    InvalidBroadcastApproval,
+    #[error("prepared Bitcoin broadcast conflicts with durable state")]
+    BroadcastConflict,
+    #[error("prepared Bitcoin broadcast was not found")]
+    BroadcastIntentNotFound,
+    #[error("Bitcoin transaction is not durably prepared for broadcast")]
+    BroadcastNotPrepared,
+    #[error("Bitcoin broadcast approval has expired")]
+    BroadcastApprovalExpired,
+    #[error("Bitcoin broadcast clock moved behind durable approval state")]
+    ClockRollbackDetected,
+    #[error("Bitcoin broadcast retry interval has not elapsed")]
+    BroadcastRetryNotReady,
+    #[error("Bitcoin broadcast retry limit was reached")]
+    BroadcastAttemptLimit,
+    #[error("Kyoto returned a broadcast receipt for a different transaction")]
+    BroadcastReceiptMismatch,
 }
 
 #[cfg(test)]
@@ -628,9 +657,25 @@ mod tests {
 
     #[test]
     fn new_wallet_birthday_does_not_start_at_genesis() {
-        let state = KyotoWalletState::new_wallet(850_000, 1);
-        assert_eq!(state.birthday_height, 850_000);
-        assert_eq!(state.scanned_height, 850_000);
+        let recovery_anchor = BitcoinCheckpoint {
+            height: 849_990,
+            block_hash: [2; 32],
+        };
+        let checkpoint = BitcoinCheckpoint {
+            height: 850_000,
+            block_hash: [1; 32],
+        };
+        let validated_tip = DiscoveredKyotoTip::testing(
+            Network::Bitcoin,
+            checkpoint,
+            recovery_anchor,
+            vec![recovery_anchor, checkpoint],
+        );
+        let state = KyotoWalletState::new_wallet(validated_tip, 1).expect("validated birthday");
+        assert_eq!(state.birthday.checkpoint, checkpoint);
+        assert_eq!(state.recovery_checkpoint, recovery_anchor);
+        assert_eq!(state.recent_checkpoints, vec![recovery_anchor, checkpoint]);
+        assert_eq!(state.scanned_checkpoint, checkpoint);
     }
 
     #[test]
@@ -687,17 +732,17 @@ mod tests {
 
     #[test]
     fn reorg_rewinds_wallet_owned_progress() {
-        let mut state = KyotoWalletState {
-            birthday_height: 100,
-            validated_height: 130,
-            scanned_height: 128,
-            last_consistent_height: 128,
-            relevant_block_hashes: vec![[1; 32]; 29],
-            last_started_at_unix: 1,
+        let first = BitcoinCheckpoint {
+            height: 120,
+            block_hash: [1; 32],
         };
-        state.rewind_for_reorg(120);
-        assert_eq!(state.validated_height, 120);
-        assert_eq!(state.scanned_height, 120);
-        assert_eq!(state.relevant_block_hashes.len(), 21);
+        let second = BitcoinCheckpoint {
+            height: 121,
+            block_hash: [2; 32],
+        };
+        assert_eq!(
+            highest_common_checkpoint(&[first, second], &[first]),
+            Some(first)
+        );
     }
 }

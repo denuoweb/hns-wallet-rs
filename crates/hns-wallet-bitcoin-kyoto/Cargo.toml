@@ -14,10 +14,12 @@ bip157.workspace = true
 bip39.workspace = true
 bitcoin.workspace = true
 hns-wallet-chain-api.workspace = true
+hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

@@ -765,11 +765,13 @@ dependencies = [
  "bip39",
  "bitcoin",
  "hns-wallet-chain-api",
+ "hns-wallet-store",
  "hns-wallet-types",
  "serde",
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
  "zeroize",
 ]
 

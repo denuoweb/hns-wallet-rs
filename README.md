@@ -11,9 +11,10 @@ repositories. It consumes released protocol crates and exposes a versioned ABI
 for separately released browser adapters.
 
 Current safety status: the production-hardening source boundary is implemented,
-but executable HNS value operations and all mainnet settlement remain
-release-gated. The HNS runtime rejects configurations that enable send or
-settlement until the concrete node adapter and qualification gates recorded in
+but executable HNS and Bitcoin value operations and all mainnet settlement
+remain release-gated. The HNS runtime rejects configurations that enable send
+or settlement, and the Bitcoin module cannot issue its value permit, until the
+adapter/persistence and qualification gates recorded in
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
 [`docs/QUALIFICATION.md`](docs/QUALIFICATION.md) are complete. Test success is
 never a mainnet authorization signal.

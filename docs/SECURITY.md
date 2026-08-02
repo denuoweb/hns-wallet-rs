@@ -103,6 +103,33 @@ canonical HNS settlement profile, Bitcoin supervisor qualification, Helios
 proof construction, restart/reorg demonstrations, real-chain tests, resource
 benchmarks, and independent review remain blockers.
 
+Bitcoin's supervisor does not authorize from a peer status field. A completed
+Kyoto wallet update is committed to BDK SQLite before encrypted transaction and
+output mirrors advance; the authenticated scan record becomes ready only after
+all bounded reconciliation chunks commit. Exact local-chain hash-membership
+queries identify a retained reorg ancestor. Missing ancestry, capacity
+exhaustion, timeout of the non-cancel-safe update, or BDK/encrypted-state
+rollback mismatch fails closed and requires a new supervisor/recovery scan.
+
+The dormant broadcast path resolves every input as an unspent wallet output,
+uses BDK's exact fee calculation, and verifies a domain-separated approval over
+network, txid, wtxid, exact fee, approved maximum, and expiry. It persists
+`submission_started` before a timeout-bounded P2P send and also requires ready
+state, a live node, and peer quorum. Approval expiry is exclusive and an
+ambiguous `submission_started` attempt must wait the rebroadcast interval
+before retry. Native-send signing and broadcast require the value permit, which
+remains unobtainable in this revision.
+
+The journal rejects wall-clock rollback behind durable preparation or attempt
+timestamps. This fail-closed check does not replace a reviewed trusted-time or
+monotonic-clock source, which remains a Bitcoin value-release requirement.
+
+Pinned `bip157` 0.6.3 discards `data_dir` and does not expose persistent header,
+filter-header/filter, or address-book state. BDK checkpoints and wallet records
+are durable, but they do not fill that light-client persistence gap. Bitcoin
+send/settlement therefore remain disabled pending a reviewed Kyoto boundary,
+adversarial/restart/reorg qualification, resource measurements, and audit.
+
 ## Reporting
 
 Do not include live seeds, keys, database files, preimages, capability tokens,
