@@ -33,7 +33,7 @@ semantics, approvals, and recoverable application workflows.
 | `hns-wallet-provider` | hostile-input parsing, origin grants, approvals, events | JavaScript injection |
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state | proof codecs |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
-| `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
+| `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | native ETH, selected Helios policy, approved HTLC | general Ethereum provider |
 | `hns-wallet-ffi` | versioned typed host frames | raw keys/native commands |
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
@@ -84,6 +84,18 @@ remains false and HNS value capabilities are not advertised. See
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
 
 ## Bitcoin supervisor boundary
+
+Bitcoin ordinary receive/change keys remain exclusively in BDK's BIP84
+descriptor trees. Atomic-swap keys use a wallet-private HKDF-SHA256 domain over
+the recovery seed with separately encoded coin type, exact network, bounded
+account/index, and receiver/refund role. The swap derivation therefore never
+traverses or allocates an ordinary BIP84 child. Only the public half crosses
+into HTLC construction, where its declared role selects the exact script
+branch. The byte-level scheme and public recovery vectors are documented in
+[BITCOIN_KYOTO.md](BITCOIN_KYOTO.md). Allocation persistence and signed-spend
+supervision remain release blockers: every session must authenticate and
+persist its exact scheme version and coordinates, and deterministic
+regeneration is not a bounded discovery scan.
 
 The Kyoto module starts from an explicit validated birthday, persists a
 sequence/phase transition before sync, commits each returned update to BDK

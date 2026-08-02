@@ -14,7 +14,7 @@ mainnet settlement remains disabled independently.
 | Provider | exact secure origin, authority/session generations, monotonic permission generations and revocation tombstones, bounded encrypted approvals/replays, rate limits, forbidden methods | browser/native runtime dispatch and complete trusted approval UI |
 | Shakedex | persisted seller/buyer/recovery state machines and canonical proof decoding | complete signed transaction construction, live node/Denuo integration, restart/reorg/regtest qualification |
 | Denuo market | chain-neutral reservations/sessions; canonical V2 protocol implemented in `hns-rs` | released protocol dependency, reporter governance, live relay/board integration |
-| Bitcoin | BDK BIP84 create/load/receive/send primitives; bounded Kyoto tip discovery and supervisor; encrypted birthday/phase/checkpoint journal; BDK-first restart reconciliation; bounded transaction/output mirrors; exact fee-bound pre-broadcast journal; HTLC funding/spend/evidence units | pinned Kyoto durable header/filter/peer API, record archival, signed-spend/settlement integration, consolidated CI, regtest/restart/reorg/adversarial qualification and benchmarks; value gate remains false |
+| Bitcoin | BDK BIP84 create/load/receive/send primitives; deterministic domain/network/role-separated atomic-swap keys with public recovery vectors; bounded Kyoto tip discovery and supervisor; encrypted birthday/phase/checkpoint journal; BDK-first restart reconciliation; bounded transaction/output mirrors; exact fee-bound pre-broadcast journal; HTLC funding/spend/evidence units | pinned Kyoto durable header/filter/peer API, record archival, durable swap-key allocation, signed-spend/settlement integration, consolidated CI, regtest/restart/reorg/adversarial qualification and benchmarks; value gate remains false |
 | Ethereum | separated accounts, typed EIP-1559 native/HTLC signing, Helios policy, exact code/state/receipt/event checks, deterministic contract | embedded Helios proof source, persistence/history, local-chain qualification, approved address and audit |
 | FFI | versioned bounded typed frames; Chromium phrase denial | generated JNI/Swift/Chromium bindings and compatibility E2E |
 | Testkit | deterministic non-mainnet, hostile-input, reorg, and qualification fixtures | full multi-process network harnesses |
@@ -72,9 +72,11 @@ submission.
 The pinned `bip157` 0.6.3 source ignores `data_dir`; exact headers, compact-
 filter headers/filters, and address-book state are not durably exposed. A
 reviewed persistence-capable Kyoto boundary, safe archival at the 4,096-record
-lifetime caps, signed HTLC spend supervision, regtest/restart/reorg/adversarial
-evidence, trusted-time policy, resource measurements, and independent review
-remain blockers.
+lifetime caps, durable per-session swap-key allocation, signed HTLC spend
+supervision, regtest/restart/reorg/adversarial evidence, trusted-time policy,
+resource measurements, and independent review remain blockers. The new
+domain-separated swap-key source and its unexecuted conformance tests do not
+change the false value-release gate.
 
 ## Evidence statement
 

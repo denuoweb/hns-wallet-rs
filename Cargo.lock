@@ -764,6 +764,7 @@ dependencies = [
  "bip157",
  "bip39",
  "bitcoin",
+ "hkdf",
  "hns-wallet-chain-api",
  "hns-wallet-store",
  "hns-wallet-types",

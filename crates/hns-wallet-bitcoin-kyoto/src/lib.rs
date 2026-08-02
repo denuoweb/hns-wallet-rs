@@ -5,6 +5,7 @@ mod runtime;
 
 pub use runtime::*;
 
+use core::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use bdk_wallet::bitcoin::blockdata::opcodes::all::{
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use bdk_wallet::bitcoin::script::Builder as ScriptBuilder;
+use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bdk_wallet::bitcoin::{
     Address, Amount as BitcoinAmount, Network, OutPoint, PublicKey, ScriptBuf, Sequence,
     Transaction, TxIn, TxOut, Witness, bip32::Xpriv, psbt::Psbt, transaction,
@@ -25,23 +27,33 @@ use bdk_wallet::bitcoin::{
 use bdk_wallet::template::Bip84;
 use bdk_wallet::{KeychainKind, PersistedWallet, SignOptions, Wallet};
 use bip39::{Language, Mnemonic};
+use hkdf::Hkdf;
+use hns_wallet_store::{SecretKind, WalletStore};
 use hns_wallet_types::{
     ChainCapabilities, FeeModel, FinalityModel, HashAlgorithm, LocktimeModel, ObjectHash,
-    TransactionHash,
+    TransactionHash, WalletId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const MIN_HTLC_DUST_SATS: u64 = 330;
 pub const MAX_HTLC_SCRIPT_BYTES: usize = 256;
 pub const MAX_BITCOIN_TRANSACTION_BYTES: usize = 400_000;
 pub const MAX_REQUIRED_PEERS: u8 = 8;
 pub const MAX_RECOVERY_SCRIPT_INDEX: u32 = 100_000;
+pub const BITCOIN_SWAP_KEY_SCHEME_VERSION: u16 = 1;
+pub const MAX_BITCOIN_SWAP_ACCOUNT_INDEX: u32 = 100_000;
+pub const MAX_BITCOIN_SWAP_KEY_INDEX: u32 = 100_000;
 pub const DEFAULT_REQUIRED_PEERS: u8 = 3;
 pub const MAX_KYOTO_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_KYOTO_SYNC_TIMEOUT: Duration = Duration::from_secs(86_400);
+/// Wallet-private HKDF-SHA256 salt for Bitcoin atomic-swap keys. This is not a
+/// registered BIP-32 purpose or an interoperable descriptor path.
+pub const BITCOIN_SWAP_DERIVATION_DOMAIN: &[u8] =
+    b"hns-wallet-rs/bitcoin-atomic-swap-key/v1";
+const BITCOIN_SWAP_DERIVATION_INFO_TAG: &[u8; 4] = b"HSWP";
 /// The source contains value-moving primitives, but the complete Kyoto
 /// persistence and independent release gate have not passed.
 pub const BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
@@ -124,6 +136,223 @@ pub fn build_kyoto_client(
 pub fn parse_recovery_phrase(phrase: &str) -> Result<Mnemonic, BitcoinWalletError> {
     Mnemonic::parse_in_normalized(Language::English, phrase)
         .map_err(|_| BitcoinWalletError::InvalidRecoveryPhrase)
+}
+
+/// Script position owned by one locally derived Bitcoin atomic-swap key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitcoinSwapKeyRole {
+    Receiver,
+    RefundOwner,
+}
+
+impl BitcoinSwapKeyRole {
+    const fn code(self) -> u32 {
+        match self {
+            Self::Receiver => 0,
+            Self::RefundOwner => 1,
+        }
+    }
+}
+
+/// Stable recovery coordinates for a Bitcoin atomic-swap key.
+///
+/// This is deliberately not a BIP-32 path. The HKDF info is the byte sequence
+/// `HSWP || coin_type || network_code || account || role || index || counter`,
+/// where every integer is an unsigned big-endian `u32`. The final rejection
+/// counter is one byte. Mainnet uses coin type/network code `(0, 0)`;
+/// testnet3, testnet4, signet, and regtest use coin type `1` and network codes
+/// `1`, `2`, `3`, and `4`, respectively.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinSwapKeyReference {
+    scheme_version: u16,
+    network: Network,
+    role: BitcoinSwapKeyRole,
+    account_index: u32,
+    key_index: u32,
+}
+
+impl BitcoinSwapKeyReference {
+    pub fn new(
+        network: Network,
+        role: BitcoinSwapKeyRole,
+        account_index: u32,
+        key_index: u32,
+    ) -> Result<Self, BitcoinWalletError> {
+        let reference = Self {
+            scheme_version: BITCOIN_SWAP_KEY_SCHEME_VERSION,
+            network,
+            role,
+            account_index,
+            key_index,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub fn validate(self) -> Result<(), BitcoinWalletError> {
+        if self.scheme_version != BITCOIN_SWAP_KEY_SCHEME_VERSION
+            || self.account_index > MAX_BITCOIN_SWAP_ACCOUNT_INDEX
+            || self.key_index > MAX_BITCOIN_SWAP_KEY_INDEX
+        {
+            return Err(BitcoinWalletError::InvalidSwapKeyReference);
+        }
+        Ok(())
+    }
+
+    pub const fn scheme_version(self) -> u16 {
+        self.scheme_version
+    }
+
+    pub const fn network(self) -> Network {
+        self.network
+    }
+
+    pub const fn role(self) -> BitcoinSwapKeyRole {
+        self.role
+    }
+
+    pub const fn account_index(self) -> u32 {
+        self.account_index
+    }
+
+    pub const fn key_index(self) -> u32 {
+        self.key_index
+    }
+
+    pub const fn coin_type(self) -> u32 {
+        match self.network {
+            Network::Bitcoin => 0,
+            Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => 1,
+        }
+    }
+
+    pub const fn network_code(self) -> u32 {
+        match self.network {
+            Network::Bitcoin => 0,
+            Network::Testnet => 1,
+            Network::Testnet4 => 2,
+            Network::Signet => 3,
+            Network::Regtest => 4,
+        }
+    }
+
+    fn derivation_info(self, counter: u8) -> Result<[u8; 25], BitcoinWalletError> {
+        self.validate()?;
+        let mut info = [0_u8; 25];
+        info[..4].copy_from_slice(BITCOIN_SWAP_DERIVATION_INFO_TAG);
+        info[4..8].copy_from_slice(&self.coin_type().to_be_bytes());
+        info[8..12].copy_from_slice(&self.network_code().to_be_bytes());
+        info[12..16].copy_from_slice(&self.account_index.to_be_bytes());
+        info[16..20].copy_from_slice(&self.role.code().to_be_bytes());
+        info[20..24].copy_from_slice(&self.key_index.to_be_bytes());
+        info[24] = counter;
+        Ok(info)
+    }
+}
+
+/// Public, persistable half of one locally derived Bitcoin atomic-swap key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinSwapPublicKey {
+    reference: BitcoinSwapKeyReference,
+    public_key: PublicKey,
+}
+
+impl BitcoinSwapPublicKey {
+    pub const fn reference(&self) -> BitcoinSwapKeyReference {
+        self.reference
+    }
+
+    pub fn bitcoin_public_key(&self) -> Result<PublicKey, BitcoinWalletError> {
+        self.reference.validate()?;
+        if !self.public_key.compressed {
+            return Err(BitcoinWalletError::InvalidSwapKeyReference);
+        }
+        Ok(self.public_key)
+    }
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct BitcoinSwapSecretKey([u8; 32]);
+
+/// In-memory swap-key handle. Its secret bytes are not serializable or
+/// accessible through the public API and are zeroized when the handle drops.
+pub struct DerivedBitcoinSwapKey {
+    public_key: BitcoinSwapPublicKey,
+    _secret_key: BitcoinSwapSecretKey,
+}
+
+impl DerivedBitcoinSwapKey {
+    pub const fn public_key(&self) -> &BitcoinSwapPublicKey {
+        &self.public_key
+    }
+}
+
+impl fmt::Debug for DerivedBitcoinSwapKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DerivedBitcoinSwapKey")
+            .field("public_key", &self.public_key)
+            .field("secret_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Recovers a domain-separated Bitcoin atomic-swap key from the encrypted
+/// wallet profile's BIP-39 seed. Ordinary BIP84 descriptor derivations are not
+/// used by this function.
+pub fn derive_bitcoin_swap_key_from_store(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    reference: BitcoinSwapKeyReference,
+) -> Result<DerivedBitcoinSwapKey, BitcoinWalletError> {
+    let seed = store
+        .get_secret(wallet_id.as_bytes(), SecretKind::RecoverySeed)?
+        .ok_or(BitcoinWalletError::MissingRecoverySeed)?;
+    derive_bitcoin_swap_key_from_seed(seed.as_slice(), reference)
+}
+
+/// Recovers a domain-separated Bitcoin atomic-swap key from a mnemonic. The
+/// wallet profile currently uses the empty BIP-39 passphrase consistently with
+/// its ordinary BIP84 descriptor wallet.
+pub fn derive_bitcoin_swap_key(
+    mnemonic: &Mnemonic,
+    reference: BitcoinSwapKeyReference,
+) -> Result<DerivedBitcoinSwapKey, BitcoinWalletError> {
+    let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
+    derive_bitcoin_swap_key_from_seed(seed.as_slice(), reference)
+}
+
+fn derive_bitcoin_swap_key_from_seed(
+    seed: &[u8],
+    reference: BitcoinSwapKeyReference,
+) -> Result<DerivedBitcoinSwapKey, BitcoinWalletError> {
+    reference.validate()?;
+    if seed.len() != 64 {
+        return Err(BitcoinWalletError::InvalidRecoverySeed);
+    }
+    let hkdf = Hkdf::<Sha256>::new(Some(BITCOIN_SWAP_DERIVATION_DOMAIN), seed);
+    for counter in 0_u8..=u8::MAX {
+        let info = reference.derivation_info(counter)?;
+        let mut candidate = Zeroizing::new([0_u8; 32]);
+        hkdf.expand(&info, candidate.as_mut())
+            .map_err(|_| BitcoinWalletError::KeyDerivation)?;
+        let Ok(mut secret_key) = SecretKey::from_slice(candidate.as_slice()) else {
+            continue;
+        };
+        let public_key = PublicKey::new(secret_key.public_key(&Secp256k1::new()));
+        secret_key.non_secure_erase();
+        return Ok(DerivedBitcoinSwapKey {
+            public_key: BitcoinSwapPublicKey {
+                reference,
+                public_key,
+            },
+            _secret_key: BitcoinSwapSecretKey(*candidate),
+        });
+    }
+    Err(BitcoinWalletError::KeyDerivation)
 }
 
 pub fn create_descriptor_wallet(
@@ -322,6 +551,31 @@ impl BitcoinHtlc {
         })
     }
 
+    /// Constructs an HTLC with one locally owned, role-checked swap key and
+    /// one counterparty key. This does not sign, fund, or enable settlement.
+    pub fn new_with_local_swap_key(
+        hashlock: [u8; 32],
+        local_key: &BitcoinSwapPublicKey,
+        counterparty_public_key: PublicKey,
+        refund_height: u32,
+    ) -> Result<Self, BitcoinWalletError> {
+        let local_public_key = local_key.bitcoin_public_key()?;
+        match local_key.reference().role() {
+            BitcoinSwapKeyRole::Receiver => Self::new(
+                hashlock,
+                local_public_key,
+                counterparty_public_key,
+                refund_height,
+            ),
+            BitcoinSwapKeyRole::RefundOwner => Self::new(
+                hashlock,
+                counterparty_public_key,
+                local_public_key,
+                refund_height,
+            ),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), BitcoinWalletError> {
         let receiver = PublicKey::from_slice(&self.receiver_public_key)
             .map_err(|_| BitcoinWalletError::InvalidHtlc)?;
@@ -518,8 +772,14 @@ pub enum BitcoinWalletError {
     InvalidConfiguration,
     #[error("invalid recovery phrase")]
     InvalidRecoveryPhrase,
+    #[error("wallet recovery seed is missing")]
+    MissingRecoverySeed,
+    #[error("wallet recovery seed has an invalid length")]
+    InvalidRecoverySeed,
     #[error("Bitcoin key derivation failed")]
     KeyDerivation,
+    #[error("Bitcoin atomic-swap key reference is invalid or unbounded")]
+    InvalidSwapKeyReference,
     #[error("Bitcoin wallet was not found in persistence")]
     WalletNotFound,
     #[error("Bitcoin wallet error: {0}")]
@@ -619,6 +879,7 @@ pub enum BitcoinWalletError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bdk_wallet::bitcoin::bip32::DerivationPath;
     use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey};
 
     fn key(byte: u8) -> PublicKey {
@@ -641,6 +902,191 @@ mod tests {
                 script_pubkey: htlc.script_pubkey(),
             }],
         }
+    }
+
+    #[test]
+    fn swap_key_derivation_has_stable_public_vectors() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = parse_recovery_phrase(phrase).expect("valid phrase");
+        let mainnet_reference = BitcoinSwapKeyReference::new(
+            Network::Bitcoin,
+            BitcoinSwapKeyRole::Receiver,
+            0,
+            0,
+        )
+        .expect("bounded reference");
+        let mainnet =
+            derive_bitcoin_swap_key(&mnemonic, mainnet_reference).expect("derived swap key");
+        assert_eq!(
+            mainnet
+                .public_key()
+                .bitcoin_public_key()
+                .expect("compressed public key")
+                .to_string(),
+            "025e70317534f24fafdbcbd0f8524967de9a5c6f6dc9655872ddb6adba94174bff"
+        );
+        assert!(format!("{mainnet:?}").contains("[REDACTED]"));
+
+        let regtest_reference = BitcoinSwapKeyReference::new(
+            Network::Regtest,
+            BitcoinSwapKeyRole::Receiver,
+            0,
+            0,
+        )
+        .expect("bounded reference");
+        let regtest =
+            derive_bitcoin_swap_key(&mnemonic, regtest_reference).expect("derived swap key");
+        assert_eq!(regtest_reference.coin_type(), 1);
+        assert_eq!(regtest_reference.network_code(), 4);
+        assert_eq!(
+            regtest
+                .public_key()
+                .bitcoin_public_key()
+                .expect("compressed public key")
+                .to_string(),
+            "02de93cfd4281366f4308cc0ed7df6753c2bb3bd3e9ef32cc2e22c28f9745277b3"
+        );
+        assert_ne!(mainnet.public_key(), regtest.public_key());
+    }
+
+    #[test]
+    fn swap_roles_are_bounded_and_do_not_reuse_bip84_keys() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = parse_recovery_phrase(phrase).expect("valid phrase");
+        let receiver_reference = BitcoinSwapKeyReference::new(
+            Network::Bitcoin,
+            BitcoinSwapKeyRole::Receiver,
+            0,
+            0,
+        )
+        .expect("bounded reference");
+        let refund_reference = BitcoinSwapKeyReference::new(
+            Network::Bitcoin,
+            BitcoinSwapKeyRole::RefundOwner,
+            0,
+            0,
+        )
+        .expect("bounded reference");
+        let receiver =
+            derive_bitcoin_swap_key(&mnemonic, receiver_reference).expect("receiver key");
+        let refund = derive_bitcoin_swap_key(&mnemonic, refund_reference).expect("refund key");
+        assert_eq!(
+            refund
+                .public_key()
+                .bitcoin_public_key()
+                .expect("compressed public key")
+                .to_string(),
+            "03a5f831491d756b0429dbe97b54280091883d16b0a9f79b74e220dfafe823f7af"
+        );
+        assert_ne!(receiver.public_key(), refund.public_key());
+
+        let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
+        let root = Xpriv::new_master(Network::Bitcoin, seed.as_slice()).expect("BIP84 root");
+        for ordinary_path in ["m/84'/0'/0'/0/0", "m/84'/0'/0'/1/0"] {
+            let ordinary_path = DerivationPath::from_str(ordinary_path).expect("BIP84 path");
+            let ordinary = root
+                .derive_priv(&Secp256k1::new(), &ordinary_path)
+                .expect("ordinary receive/change key");
+            let ordinary_public =
+                PublicKey::new(ordinary.private_key.public_key(&Secp256k1::new()));
+            assert_ne!(
+                receiver
+                    .public_key()
+                    .bitcoin_public_key()
+                    .expect("compressed public key"),
+                ordinary_public
+            );
+        }
+
+        let mut unsupported_reference = receiver_reference;
+        unsupported_reference.scheme_version = BITCOIN_SWAP_KEY_SCHEME_VERSION + 1;
+        assert!(matches!(
+            derive_bitcoin_swap_key(&mnemonic, unsupported_reference),
+            Err(BitcoinWalletError::InvalidSwapKeyReference)
+        ));
+
+        assert!(matches!(
+            BitcoinSwapKeyReference::new(
+                Network::Bitcoin,
+                BitcoinSwapKeyRole::Receiver,
+                MAX_BITCOIN_SWAP_ACCOUNT_INDEX + 1,
+                0
+            ),
+            Err(BitcoinWalletError::InvalidSwapKeyReference)
+        ));
+        assert!(matches!(
+            BitcoinSwapKeyReference::new(
+                Network::Bitcoin,
+                BitcoinSwapKeyRole::Receiver,
+                0,
+                MAX_BITCOIN_SWAP_KEY_INDEX + 1
+            ),
+            Err(BitcoinWalletError::InvalidSwapKeyReference)
+        ));
+    }
+
+    #[test]
+    fn derived_swap_role_is_bound_to_the_htlc_position() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = parse_recovery_phrase(phrase).expect("valid phrase");
+        let receiver_reference = BitcoinSwapKeyReference::new(
+            Network::Regtest,
+            BitcoinSwapKeyRole::Receiver,
+            7,
+            42,
+        )
+        .expect("bounded reference");
+        let receiver =
+            derive_bitcoin_swap_key(&mnemonic, receiver_reference).expect("receiver key");
+        assert_eq!(
+            receiver
+                .public_key()
+                .bitcoin_public_key()
+                .expect("compressed public key")
+                .to_string(),
+            "020a32c24be2befb82a9a41ef0941379195f3e7112a051f282a304757d821c79a0"
+        );
+
+        let preimage = [9_u8; 32];
+        let htlc = BitcoinHtlc::new_with_local_swap_key(
+            Sha256::digest(preimage).into(),
+            receiver.public_key(),
+            key(4),
+            500,
+        )
+        .expect("role-bound HTLC");
+        assert_eq!(
+            htlc.receiver_public_key,
+            receiver
+                .public_key()
+                .bitcoin_public_key()
+                .expect("compressed public key")
+                .to_bytes()
+        );
+
+        let refund_reference = BitcoinSwapKeyReference::new(
+            Network::Regtest,
+            BitcoinSwapKeyRole::RefundOwner,
+            7,
+            42,
+        )
+        .expect("bounded reference");
+        let refund = derive_bitcoin_swap_key(&mnemonic, refund_reference).expect("refund key");
+        let refund_htlc = BitcoinHtlc::new_with_local_swap_key(
+            Sha256::digest(preimage).into(),
+            refund.public_key(),
+            key(3),
+            500,
+        )
+        .expect("role-bound HTLC");
+        assert_eq!(
+            refund_htlc.refund_public_key,
+            refund
+                .public_key()
+                .bitcoin_public_key()
+                .expect("compressed public key")
+                .to_bytes()
+        );
     }
 
     #[test]

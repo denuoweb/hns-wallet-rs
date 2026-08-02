@@ -13,6 +13,7 @@ bdk_wallet.workspace = true
 bip157.workspace = true
 bip39.workspace = true
 bitcoin.workspace = true
+hkdf.workspace = true
 hns-wallet-chain-api.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true

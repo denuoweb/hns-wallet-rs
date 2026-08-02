@@ -51,6 +51,9 @@ wrapping is not implemented in this repo.
 Recovery-phrase display is a dedicated high-risk mobile operation. The stable
 ABI rejects it over Chromium native messaging. Logs and ordinary `Debug`
 implementations redact signing transactions, phrases, keys, and preimages.
+Bitcoin swap-key handles additionally keep their secret half private,
+non-serializable and non-cloneable, redact it from `Debug`, and zeroize the
+32-byte scalar on drop. Their public recovery coordinates contain no secret.
 
 ## Money and transaction approval
 
@@ -107,6 +110,16 @@ canonical HNS name-state/resource decoding, a published canonical HNS
 settlement profile, canonical HSD sigop-adjusted fee sizing, Bitcoin supervisor
 qualification, Helios proof construction, restart/reorg demonstrations,
 real-chain tests, resource benchmarks, and independent review remain blockers.
+
+Bitcoin swap keys now have a deterministic application-private HKDF domain
+which is disjoint from ordinary BIP84 receive/change derivation and binds the
+coin type, exact network, bounded account/index, and receiver/refund script
+role. The HTLC constructor enforces that local role. This separation does not
+enable settlement: the scheme version and exact key coordinates are not yet
+authenticated and durably allocated with each session, deterministic
+regeneration is not discovery, and signed-spend supervision and the complete
+qualification boundary are still absent. No Bitcoin signing or value permit is
+exposed by this key slice.
 
 Bitcoin's supervisor does not authorize from a peer status field. A completed
 Kyoto wallet update is committed to BDK SQLite before encrypted transaction and

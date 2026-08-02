@@ -89,6 +89,62 @@ needs a reviewed trusted-time/monotonic-clock policy.
 advertise send or atomic settlement, and both native-send signing and broadcast
 require that unavailable permit in this source revision.
 
+## Atomic-swap key derivation
+
+Ordinary receive/change keys remain in BDK's BIP84 descriptor trees. Atomic-
+swap keys never enter those trees and do not claim a standardized BIP-32 path.
+They use HKDF-SHA256 over the wallet profile's 64-byte BIP-39 recovery seed
+(the same empty BIP-39 passphrase policy used by this wallet's BIP84 setup),
+with the exact ASCII salt:
+
+```text
+hns-wallet-rs/bitcoin-atomic-swap-key/v1
+```
+
+The 25-byte HKDF info is `HSWP || coin_type || network_code || account || role
+|| index || counter`. Each numeric field except the final counter is a big-
+endian `u32`; the counter is one byte and advances from 0 through 255 only if
+the candidate is not a valid secp256k1 scalar. The first valid candidate wins.
+Role 0 is the receiver/redeem branch and role 1 is the refund-owner branch.
+Both account and key index are accepted only in the inclusive range
+0..=100,000.
+
+| Bitcoin network | coin type | network code |
+| --- | ---: | ---: |
+| mainnet | 0 | 0 |
+| testnet3 | 1 | 1 |
+| testnet4 | 1 | 2 |
+| signet | 1 | 3 |
+| regtest | 1 | 4 |
+
+The coin-type field mirrors the ordinary wallet's main/test split, while the
+separate network code prevents testnet, testnet4, signet, and regtest from
+sharing swap keys. This application-private HKDF scheme is disjoint from BIP84
+at the KDF boundary rather than relying on an unregistered BIP purpose number.
+
+Public recovery vectors below were calculated from the BIP-39 English
+`abandon` eleven times followed by `about` mnemonic, its empty-passphrase
+64-byte seed, and the exact salt/info encoding above. They are embedded as
+source conformance assertions; no private material is recorded:
+
+| Reference | compressed public key |
+| --- | --- |
+| mainnet, receiver, account 0, index 0 | `025e70317534f24fafdbcbd0f8524967de9a5c6f6dc9655872ddb6adba94174bff` |
+| mainnet, refund owner, account 0, index 0 | `03a5f831491d756b0429dbe97b54280091883d16b0a9f79b74e220dfafe823f7af` |
+| regtest, receiver, account 0, index 0 | `02de93cfd4281366f4308cc0ed7df6753c2bb3bd3e9ef32cc2e22c28f9745277b3` |
+
+The in-memory handle exposes only its role-bound public half, redacts its secret
+in `Debug`, cannot be serialized or cloned, and zeroizes its 32-byte secret on
+drop. A serializable public reference carries the exact recovery coordinates.
+The HTLC constructor can place that public key only in its declared receiver or
+refund position. The serialized reference also binds scheme version 1 and
+rejects other versions. Each swap session must authenticate and durably persist
+the exact scheme version, network, account, role, and key index before an
+irreversible action; deterministic regeneration from known coordinates is not
+a bounded discovery scan. That session allocation/persistence and signed-spend
+integration are still missing, no signing or value permit is exposed, and this
+source does not advertise atomic settlement.
+
 ## HTLC profile
 
 The native settlement template is P2WSH:
@@ -101,8 +157,10 @@ ELSE <refund-height> CLTV DROP <refund-key> CHECKSIG ENDIF
 Funding verification reconstructs the exact script, checks value, a unique
 matching output, transaction bounds, and confirmation minimum. Redeem/refund
 templates enforce the branch, hashlock, dust, fee, and refund height. Preimage
-observation requires the expected outpoint and exact witness script. Signed
-spend integration and the cross-chain settlement supervisor remain unavailable.
+observation requires the expected outpoint and exact witness script. The
+domain-separated local public key can now be bound to its HTLC script position;
+signed spend integration and the cross-chain settlement supervisor remain
+unavailable.
 
 ## Qualification and benchmarks
 

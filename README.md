@@ -28,7 +28,7 @@ never a mainnet authorization signal.
 - `hns-wallet-provider`: hostile-page request, permission, and approval core.
 - `hns-wallet-shakedex`: persisted fixed-price seller/buyer state machines.
 - `hns-wallet-market`: price-bound reservations and atomic-swap recovery.
-- `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet and Bitcoin HTLC adapter.
+- `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, separated swap keys, and Bitcoin HTLC adapter.
 - `hns-wallet-ethereum`: Helios policy and native-ETH-only HTLC adapter.
 - `hns-wallet-ffi`: stable typed Android/iOS/Chromium ABI.
 - `hns-wallet-testkit`: deterministic, non-mainnet fixtures.
