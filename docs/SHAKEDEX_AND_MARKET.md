@@ -12,10 +12,14 @@ Every transition is journaled with a compare-and-swap revision. Recovery is
 available from locked, offered, published, and cancelled seller states. Buyer
 finalization cannot occur before verified transfer lock.
 
-The orchestration exists, but complete HNS transaction construction, node
-evidence adapters, live Denuo V2 publication, restart-at-every-state/reorg
-qualification, and an installed browser approval UI are still missing. Fixed-
-price Shakedex is therefore partial, not complete. Reverse Dutch is deferred.
+The orchestration source exists, but ownership transitions are unavailable.
+Released protocol crates do not yet decode canonical NameState fields, and the
+wallet has no separately persisted bounded `HnsName` key-role scan; imported
+names are watch-only and node-supplied owner/resource hints cannot authorize a
+seller action. Name transfer/finalize transaction construction, the concrete
+node evidence adapter, live Denuo V2 publication, restart-at-every-state/reorg
+qualification, and an installed browser approval UI are also unavailable.
+Fixed-price Shakedex is therefore release-gated. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 

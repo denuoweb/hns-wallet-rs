@@ -28,6 +28,13 @@ Handshake:
 `hns_getName`, `hns_importKnownName`, `hns_transferName`, `hns_finalizeName`,
 `hns_signTypedMessage`.
 
+The method vocabulary is stable even when a capability is unavailable. In the
+current release-gated runtime, imported names expose watch-only split proof/
+current status. `hns_transferName` and `hns_finalizeName` must return unavailable
+until canonical NameState parsing and the dedicated `HnsName` derivation scan
+independently prove current ownership; unbound raw resource bytes are not
+returned as proof-authenticated data.
+
 External assets:
 
 `asset_getAccount`, `asset_getBalance`, `asset_getTransactions`,
@@ -56,6 +63,20 @@ Cross-chain market:
 Events are scoped to the same authenticated origin/context as requests. A
 navigation, permission revocation, lock, authority generation change, or wallet
 session change invalidates pending requests and event channels.
+
+Browser-authority and wallet-session values are random identities, not ordered
+counters. While both identities and the origin/namespace remain unchanged,
+browser-authority, policy, permission, and navigation generations may only stay
+equal or increase; a regression rejects the binding update. Any binding change
+invalidates in-memory approvals, and a session change also resets session rate
+state.
+
+The first permission record for an origin may adopt the trusted current nonzero
+generation. Every later grant must be exactly the authenticated stored
+generation plus one. Revocation is also a compare-and-swap increment and leaves
+an encrypted tombstone, preventing delete/regrant rollback. Approval and replay
+lifetimes are capped and their expiry/identity metadata is authenticated before
+pruning or use.
 
 ## Explicitly forbidden
 

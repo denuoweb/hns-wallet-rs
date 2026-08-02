@@ -1,6 +1,9 @@
 #![doc = "Transactional wallet persistence with per-record authenticated encryption."]
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -8,17 +11,28 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
+use hmac::{Hmac, Mac};
 use hns_wallet_types::{ApprovalId, WorkflowId, WorkflowKind};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const MAX_RECORD_ID_BYTES: usize = 128;
 pub const MAX_SECRET_BYTES: usize = 1_048_576;
 pub const MAX_STATE_BYTES: usize = 1_048_576;
 pub const MAX_REPLAY_ROWS_PER_ORIGIN: usize = 4_096;
+pub const MAX_ENTITY_LIST_RESULTS: usize = 10_000;
+pub const MAX_PROVIDER_PERMISSIONS: usize = 4_096;
+pub const MAX_PENDING_APPROVALS: usize = 4_096;
+pub const MAX_REPLAY_ORIGINS: usize = 4_096;
+pub const MAX_REPLAY_ROWS: usize = 65_536;
+pub const MAX_REPLAY_LIFETIME_SECONDS: u64 = 86_400;
+pub const MAX_APPROVAL_LIFETIME_SECONDS: u64 = 3_600;
+pub const MAX_ENTITY_BATCH_OPERATIONS: usize = 16_384;
+pub const MAX_PASSPHRASE_BYTES: usize = 1_024;
 
 const DATABASE_ID_BYTES: usize = 16;
 const SALT_BYTES: usize = 16;
@@ -26,6 +40,141 @@ const NONCE_BYTES: usize = 24;
 const KEY_BYTES: usize = 32;
 const SENTINEL: &[u8] = b"hns-wallet-store-key-check-v1";
 const AAD_DOMAIN: &[u8] = b"hns-wallet-store/record/v1";
+const ORIGIN_TOKEN_DOMAIN: &[u8] = b"hns-wallet-store/origin-token/v1";
+const CHECKPOINT_PENDING_KEY: &str = "plaintext_checkpoint_pending";
+
+/// A stable, wallet-local storage namespace. Values in every namespace are
+/// authenticated and encrypted; the kind and caller-supplied record ID are
+/// bound as associated data so ciphertext cannot be relocated.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum EntityKind {
+    WalletAccount,
+    DerivedAddress,
+    HnsUtxo,
+    HnsTransaction,
+    KnownName,
+    NameOwnerOutpoint,
+    NameTransfer,
+    Shakedex,
+    DenuoBoardObject,
+    BitcoinHeader,
+    BitcoinFilterHeader,
+    BitcoinPeer,
+    BitcoinScanState,
+    BitcoinUtxo,
+    BitcoinTransaction,
+    EthereumAccount,
+    EthereumTransaction,
+    MarketIntent,
+    FillGrant,
+    PriceRound,
+    SwapSession,
+    RefundTransaction,
+    HnsRecoveryState,
+    HnsVerifiedSettlement,
+    PendingApproval,
+    InputReservation,
+}
+
+impl EntityKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::WalletAccount => "wallet_account",
+            Self::DerivedAddress => "derived_address",
+            Self::HnsUtxo => "hns_utxo",
+            Self::HnsTransaction => "hns_transaction",
+            Self::KnownName => "known_name",
+            Self::NameOwnerOutpoint => "name_owner_outpoint",
+            Self::NameTransfer => "name_transfer",
+            Self::Shakedex => "shakedex",
+            Self::DenuoBoardObject => "denuo_board_object",
+            Self::BitcoinHeader => "bitcoin_header",
+            Self::BitcoinFilterHeader => "bitcoin_filter_header",
+            Self::BitcoinPeer => "bitcoin_peer",
+            Self::BitcoinScanState => "bitcoin_scan_state",
+            Self::BitcoinUtxo => "bitcoin_utxo",
+            Self::BitcoinTransaction => "bitcoin_transaction",
+            Self::EthereumAccount => "ethereum_account",
+            Self::EthereumTransaction => "ethereum_transaction",
+            Self::MarketIntent => "market_intent",
+            Self::FillGrant => "fill_grant",
+            Self::PriceRound => "price_round",
+            Self::SwapSession => "swap_session",
+            Self::RefundTransaction => "refund_transaction",
+            Self::HnsRecoveryState => "hns_recovery_state",
+            Self::HnsVerifiedSettlement => "hns_verified_settlement",
+            Self::PendingApproval => "pending_approval",
+            Self::InputReservation => "input_reservation",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredEntity<T> {
+    pub kind: EntityKind,
+    pub id: Vec<u8>,
+    pub revision: u64,
+    pub value: T,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntityBatchSave<T> {
+    pub id: Vec<u8>,
+    pub expected_revision: u64,
+    pub value: T,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntityBatchDelete {
+    pub id: Vec<u8>,
+    pub expected_revision: u64,
+}
+
+macro_rules! entity_crud_methods {
+    ($(($save:ident, $load:ident, $list:ident, $delete:ident, $kind:ident)),+ $(,)?) => {
+        $(
+            pub fn $save<T: Serialize>(
+                &mut self,
+                id: &[u8],
+                expected_revision: u64,
+                value: &T,
+                updated_at_unix: u64,
+            ) -> Result<u64, StoreError> {
+                self.save_entity(
+                    EntityKind::$kind,
+                    id,
+                    expected_revision,
+                    value,
+                    updated_at_unix,
+                )
+            }
+
+            pub fn $load<T: for<'de> Deserialize<'de>>(
+                &self,
+                id: &[u8],
+            ) -> Result<Option<StoredEntity<T>>, StoreError> {
+                self.load_entity(EntityKind::$kind, id)
+            }
+
+            pub fn $list<T: for<'de> Deserialize<'de>>(
+                &self,
+                limit: usize,
+            ) -> Result<Vec<StoredEntity<T>>, StoreError> {
+                self.list_entities(EntityKind::$kind, limit)
+            }
+
+            pub fn $delete(
+                &mut self,
+                id: &[u8],
+                expected_revision: u64,
+            ) -> Result<bool, StoreError> {
+                self.delete_entity(EntityKind::$kind, id, expected_revision)
+            }
+        )+
+    };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KdfConfig {
@@ -111,8 +260,13 @@ impl WalletStore {
         passphrase: &str,
         kdf: KdfConfig,
     ) -> Result<Self, StoreError> {
+        validate_passphrase(passphrase)?;
         kdf.validate()?;
-        let connection = Connection::open(path)?;
+        let path = path.as_ref();
+        validate_wallet_location(path, true)?;
+        let connection = open_wallet_connection(path, true)?;
+        harden_wallet_file(path)?;
+        validate_wallet_location(path, false)?;
         configure(&connection)?;
         migrate(&connection)?;
         if meta(&connection, "database_id")?.is_some() {
@@ -150,7 +304,9 @@ impl WalletStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let connection = Connection::open(path)?;
+        let path = path.as_ref();
+        validate_wallet_location(path, false)?;
+        let connection = open_wallet_connection(path, false)?;
         configure(&connection)?;
         migrate(&connection)?;
         let database_id =
@@ -168,6 +324,7 @@ impl WalletStore {
     }
 
     pub fn unlock(&mut self, passphrase: &str) -> Result<(), StoreError> {
+        validate_passphrase(passphrase)?;
         let key = derive_key(passphrase, &self.salt, self.kdf)?;
         let encrypted = required_meta(&self.connection, "key_check")?;
         let clear = decrypt_record(
@@ -182,6 +339,13 @@ impl WalletStore {
             return Err(StoreError::InvalidPassphrase);
         }
         self.key = Some(key);
+        if let Err(error) = self
+            .encrypt_legacy_rows()
+            .and_then(|()| self.complete_plaintext_checkpoint())
+        {
+            self.key = None;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -210,12 +374,24 @@ impl WalletStore {
         }
         let key = self.key.as_ref().ok_or(StoreError::Locked)?;
         let encrypted = encrypt_record(key, &self.database_id, kind.label(), id, cleartext)?;
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_kind: Option<String> = transaction
+            .query_row("SELECT kind FROM secrets WHERE id=?1", params![id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if current_kind.is_some_and(|current| current != kind.label()) {
+            return Err(StoreError::KindMismatch);
+        }
+        transaction.execute(
             "INSERT INTO secrets(id, kind, encrypted_value, updated_at_unix) VALUES(?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, encrypted_value=excluded.encrypted_value,
+             ON CONFLICT(id) DO UPDATE SET encrypted_value=excluded.encrypted_value,
              updated_at_unix=excluded.updated_at_unix",
             params![id, kind.label(), encrypted, updated_at_unix],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -259,6 +435,374 @@ impl WalletStore {
             == 1)
     }
 
+    /// Saves one typed entity with compare-and-swap semantics. The entity kind,
+    /// database identity, and record ID are authenticated with the ciphertext.
+    pub fn save_entity<T: Serialize>(
+        &mut self,
+        kind: EntityKind,
+        id: &[u8],
+        expected_revision: u64,
+        value: &T,
+        updated_at_unix: u64,
+    ) -> Result<u64, StoreError> {
+        validate_id(id)?;
+        let encoded = Zeroizing::new(serde_json::to_vec(value)?);
+        if encoded.is_empty() || encoded.len() > MAX_STATE_BYTES {
+            return Err(StoreError::RecordTooLarge);
+        }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let label = entity_label(kind);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(u64, Vec<u8>, u64)> = transaction
+            .query_row(
+                "SELECT revision, encrypted_value, updated_at_unix
+                 FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+                params![kind.label(), id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let actual = match current {
+            Some((revision, encrypted, current_updated_at)) => {
+                decrypt_record(
+                    key,
+                    &self.database_id,
+                    &label,
+                    &revisioned_aad_id(id, revision, current_updated_at, None)?,
+                    &encrypted,
+                )?;
+                revision
+            }
+            None => 0,
+        };
+        if actual != expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        let aad_id = revisioned_aad_id(id, next, updated_at_unix, None)?;
+        let encrypted = encrypt_record(key, &self.database_id, &label, &aad_id, &encoded)?;
+        transaction.execute(
+            "INSERT INTO encrypted_entities(
+                 entity_kind, record_id, revision, encrypted_value, updated_at_unix
+             ) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(entity_kind, record_id) DO UPDATE SET
+                 revision=excluded.revision,
+                 encrypted_value=excluded.encrypted_value,
+                 updated_at_unix=excluded.updated_at_unix",
+            params![kind.label(), id, next, encrypted, updated_at_unix],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub fn load_entity<T: for<'de> Deserialize<'de>>(
+        &self,
+        kind: EntityKind,
+        id: &[u8],
+    ) -> Result<Option<StoredEntity<T>>, StoreError> {
+        validate_id(id)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let row: Option<(u64, Vec<u8>, u64)> = self
+            .connection
+            .query_row(
+                "SELECT revision, encrypted_value, updated_at_unix
+                 FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+                params![kind.label(), id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(revision, encrypted, updated_at_unix)| {
+            let clear = decrypt_record(
+                key,
+                &self.database_id,
+                &entity_label(kind),
+                &revisioned_aad_id(id, revision, updated_at_unix, None)?,
+                &encrypted,
+            )?;
+            Ok(StoredEntity {
+                kind,
+                id: id.to_vec(),
+                revision,
+                value: serde_json::from_slice(&clear)?,
+                updated_at_unix,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn list_entities<T: for<'de> Deserialize<'de>>(
+        &self,
+        kind: EntityKind,
+        limit: usize,
+    ) -> Result<Vec<StoredEntity<T>>, StoreError> {
+        if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+            return Err(StoreError::InvalidListLimit);
+        }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidListLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT record_id, revision, encrypted_value, updated_at_unix
+             FROM encrypted_entities WHERE entity_kind=?1 ORDER BY record_id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![kind.label(), limit], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        let mut entities = Vec::new();
+        for row in rows {
+            let (id, revision, encrypted, updated_at_unix) = row?;
+            validate_id(&id)?;
+            let clear = decrypt_record(
+                key,
+                &self.database_id,
+                &entity_label(kind),
+                &revisioned_aad_id(&id, revision, updated_at_unix, None)?,
+                &encrypted,
+            )?;
+            entities.push(StoredEntity {
+                kind,
+                id,
+                revision,
+                value: serde_json::from_slice(&clear)?,
+                updated_at_unix,
+            });
+        }
+        Ok(entities)
+    }
+
+    pub fn delete_entity(
+        &mut self,
+        kind: EntityKind,
+        id: &[u8],
+        expected_revision: u64,
+    ) -> Result<bool, StoreError> {
+        validate_id(id)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        if expected_revision == 0 {
+            return Err(StoreError::InvalidRevision);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(u64, Vec<u8>, u64)> = transaction
+            .query_row(
+                "SELECT revision, encrypted_value, updated_at_unix
+                 FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+                params![kind.label(), id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((actual, encrypted, updated_at_unix)) = current else {
+            return Ok(false);
+        };
+        decrypt_record(
+            key,
+            &self.database_id,
+            &entity_label(kind),
+            &revisioned_aad_id(id, actual, updated_at_unix, None)?,
+            &encrypted,
+        )?;
+        if actual != expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        transaction.execute(
+            "DELETE FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+            params![kind.label(), id],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    entity_crud_methods!(
+        (
+            save_wallet_account,
+            wallet_account,
+            wallet_accounts,
+            delete_wallet_account,
+            WalletAccount
+        ),
+        (
+            save_derived_address,
+            derived_address,
+            derived_addresses,
+            delete_derived_address,
+            DerivedAddress
+        ),
+        (save_hns_utxo, hns_utxo, hns_utxos, delete_hns_utxo, HnsUtxo),
+        (
+            save_hns_transaction,
+            hns_transaction,
+            hns_transactions,
+            delete_hns_transaction,
+            HnsTransaction
+        ),
+        (
+            save_known_name,
+            known_name,
+            known_names,
+            delete_known_name,
+            KnownName
+        ),
+        (
+            save_name_owner_outpoint,
+            name_owner_outpoint,
+            name_owner_outpoints,
+            delete_name_owner_outpoint,
+            NameOwnerOutpoint
+        ),
+        (
+            save_name_transfer,
+            name_transfer,
+            name_transfers,
+            delete_name_transfer,
+            NameTransfer
+        ),
+        (
+            save_shakedex,
+            shakedex,
+            shakedex_records,
+            delete_shakedex,
+            Shakedex
+        ),
+        (
+            save_denuo_board_object,
+            denuo_board_object,
+            denuo_board_objects,
+            delete_denuo_board_object,
+            DenuoBoardObject
+        ),
+        (
+            save_bitcoin_header,
+            bitcoin_header,
+            bitcoin_headers,
+            delete_bitcoin_header,
+            BitcoinHeader
+        ),
+        (
+            save_bitcoin_filter_header,
+            bitcoin_filter_header,
+            bitcoin_filter_headers,
+            delete_bitcoin_filter_header,
+            BitcoinFilterHeader
+        ),
+        (
+            save_bitcoin_peer,
+            bitcoin_peer,
+            bitcoin_peers,
+            delete_bitcoin_peer,
+            BitcoinPeer
+        ),
+        (
+            save_bitcoin_scan_state,
+            bitcoin_scan_state,
+            bitcoin_scan_states,
+            delete_bitcoin_scan_state,
+            BitcoinScanState
+        ),
+        (
+            save_bitcoin_utxo,
+            bitcoin_utxo,
+            bitcoin_utxos,
+            delete_bitcoin_utxo,
+            BitcoinUtxo
+        ),
+        (
+            save_bitcoin_transaction,
+            bitcoin_transaction,
+            bitcoin_transactions,
+            delete_bitcoin_transaction,
+            BitcoinTransaction
+        ),
+        (
+            save_ethereum_account,
+            ethereum_account,
+            ethereum_accounts,
+            delete_ethereum_account,
+            EthereumAccount
+        ),
+        (
+            save_ethereum_transaction,
+            ethereum_transaction,
+            ethereum_transactions,
+            delete_ethereum_transaction,
+            EthereumTransaction
+        ),
+        (
+            save_market_intent,
+            market_intent,
+            market_intents,
+            delete_market_intent,
+            MarketIntent
+        ),
+        (
+            save_fill_grant,
+            fill_grant,
+            fill_grants,
+            delete_fill_grant,
+            FillGrant
+        ),
+        (
+            save_price_round,
+            price_round,
+            price_rounds,
+            delete_price_round,
+            PriceRound
+        ),
+        (
+            save_swap_session,
+            swap_session,
+            swap_sessions,
+            delete_swap_session,
+            SwapSession
+        ),
+        (
+            save_refund_transaction,
+            refund_transaction,
+            refund_transactions,
+            delete_refund_transaction,
+            RefundTransaction
+        ),
+        (
+            save_hns_recovery_state,
+            hns_recovery_state,
+            hns_recovery_states,
+            delete_hns_recovery_state,
+            HnsRecoveryState
+        ),
+        (
+            save_hns_verified_settlement,
+            hns_verified_settlement,
+            hns_verified_settlements,
+            delete_hns_verified_settlement,
+            HnsVerifiedSettlement
+        ),
+        (
+            save_pending_approval_entity,
+            pending_approval_entity,
+            pending_approval_entities,
+            delete_pending_approval_entity,
+            PendingApproval
+        ),
+        (
+            save_input_reservation,
+            input_reservation,
+            input_reservations,
+            delete_input_reservation,
+            InputReservation
+        ),
+    );
+
     /// Compare-and-swap a persisted workflow revision. A caller must complete
     /// this operation before broadcasting the transaction represented by
     /// `state`.
@@ -271,55 +815,19 @@ impl WalletStore {
         irreversible_broadcast_prepared: bool,
         updated_at_unix: u64,
     ) -> Result<u64, StoreError> {
-        let encoded = serde_json::to_vec(state)?;
+        let encoded = Zeroizing::new(serde_json::to_vec(state)?);
         if encoded.len() > MAX_STATE_BYTES {
             return Err(StoreError::RecordTooLarge);
         }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let label = workflow_label(kind);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<u64> = transaction
+        let current: Option<(String, u64, Vec<u8>, bool, u64, u32)> = transaction
             .query_row(
-                "SELECT revision FROM workflows WHERE id=?1",
-                params![id.as_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let actual = current.unwrap_or(0);
-        if actual != expected_revision {
-            return Err(StoreError::StaleRevision {
-                expected: expected_revision,
-                actual,
-            });
-        }
-        let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
-        transaction.execute(
-            "INSERT INTO workflows(id, kind, revision, state_json, broadcast_prepared, updated_at_unix)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, revision=excluded.revision,
-             state_json=excluded.state_json, broadcast_prepared=excluded.broadcast_prepared,
-             updated_at_unix=excluded.updated_at_unix",
-            params![
-                id.as_bytes().as_slice(),
-                workflow_kind(kind),
-                next,
-                encoded,
-                irreversible_broadcast_prepared,
-                updated_at_unix,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(next)
-    }
-
-    pub fn load_workflow<T: for<'de> Deserialize<'de>>(
-        &self,
-        id: WorkflowId,
-    ) -> Result<Option<StoredWorkflow<T>>, StoreError> {
-        let row: Option<(String, u64, Vec<u8>, bool, u64)> = self
-            .connection
-            .query_row(
-                "SELECT kind, revision, state_json, broadcast_prepared, updated_at_unix
+                "SELECT kind, revision, state_json, broadcast_prepared,
+                        updated_at_unix, encryption_version
                  FROM workflows WHERE id=?1",
                 params![id.as_bytes().as_slice()],
                 |row| {
@@ -329,23 +837,404 @@ impl WalletStore {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let actual = match current {
+            Some((stored_kind, revision, encrypted, broadcast, updated_at, version)) => {
+                let parsed_kind = parse_workflow_kind(&stored_kind)?;
+                if parsed_kind != kind {
+                    return Err(StoreError::WorkflowKindMismatch);
+                }
+                if version != 1 {
+                    return Err(StoreError::LegacyEncryptionPending);
+                }
+                decrypt_record(
+                    key,
+                    &self.database_id,
+                    &workflow_label(parsed_kind),
+                    &revisioned_aad_id(id.as_bytes(), revision, updated_at, Some(broadcast))?,
+                    &encrypted,
+                )?;
+                revision
+            }
+            None => 0,
+        };
+        if actual != expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        let aad_id = revisioned_aad_id(
+            id.as_bytes(),
+            next,
+            updated_at_unix,
+            Some(irreversible_broadcast_prepared),
+        )?;
+        let encrypted = encrypt_record(key, &self.database_id, &label, &aad_id, &encoded)?;
+        transaction.execute(
+            "INSERT INTO workflows(
+                 id, kind, revision, state_json, broadcast_prepared, updated_at_unix,
+                 encryption_version
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)
+             ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,
+             state_json=excluded.state_json, broadcast_prepared=excluded.broadcast_prepared,
+             updated_at_unix=excluded.updated_at_unix,
+             encryption_version=excluded.encryption_version",
+            params![
+                id.as_bytes().as_slice(),
+                workflow_kind(kind),
+                next,
+                encrypted,
+                irreversible_broadcast_prepared,
+                updated_at_unix,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Atomically advances a workflow and a complete same-kind entity set.
+    /// This is the funds-safety boundary used for input reservation prepare,
+    /// activation, cancellation, and terminal release.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_workflow_with_entity_batch<W: Serialize, E: Serialize>(
+        &mut self,
+        id: WorkflowId,
+        kind: WorkflowKind,
+        expected_revision: u64,
+        state: &W,
+        irreversible_broadcast_prepared: bool,
+        updated_at_unix: u64,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+    ) -> Result<u64, StoreError> {
+        let encoded_workflow = Zeroizing::new(serde_json::to_vec(state)?);
+        if encoded_workflow.is_empty() || encoded_workflow.len() > MAX_STATE_BYTES {
+            return Err(StoreError::RecordTooLarge);
+        }
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual =
+            authenticated_workflow_revision(&transaction, key, &self.database_id, id, kind)?;
+        if actual != expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        apply_entity_batch_in_transaction(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+        let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        let encrypted = encrypt_record(
+            key,
+            &self.database_id,
+            &workflow_label(kind),
+            &revisioned_aad_id(
+                id.as_bytes(),
+                next,
+                updated_at_unix,
+                Some(irreversible_broadcast_prepared),
+            )?,
+            &encoded_workflow,
+        )?;
+        transaction.execute(
+            "INSERT INTO workflows(
+                 id, kind, revision, state_json, broadcast_prepared, updated_at_unix,
+                 encryption_version
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)
+             ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,
+             state_json=excluded.state_json, broadcast_prepared=excluded.broadcast_prepared,
+             updated_at_unix=excluded.updated_at_unix,
+             encryption_version=excluded.encryption_version",
+            params![
+                id.as_bytes().as_slice(),
+                workflow_kind(kind),
+                next,
+                encrypted,
+                irreversible_broadcast_prepared,
+                updated_at_unix,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Atomically advances a workflow, its wallet-account record, and a
+    /// bounded second entity set. Every existing revision and ciphertext is
+    /// authenticated before the first write. Duplicate `(kind, id)` operations
+    /// are rejected across both entity groups.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_workflow_with_account_and_entity_batch<W: Serialize, A: Serialize, E: Serialize>(
+        &mut self,
+        id: WorkflowId,
+        kind: WorkflowKind,
+        expected_revision: u64,
+        state: &W,
+        irreversible_broadcast_prepared: bool,
+        updated_at_unix: u64,
+        account_save: &EntityBatchSave<A>,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+    ) -> Result<(u64, u64), StoreError> {
+        let operation_count = 1_usize
+            .checked_add(saves.len())
+            .and_then(|count| count.checked_add(deletes.len()))
+            .ok_or(StoreError::BatchCapacity)?;
+        if operation_count > MAX_ENTITY_BATCH_OPERATIONS {
+            return Err(StoreError::BatchCapacity);
+        }
+
+        let encoded_workflow = Zeroizing::new(serde_json::to_vec(state)?);
+        if encoded_workflow.is_empty() || encoded_workflow.len() > MAX_STATE_BYTES {
+            return Err(StoreError::RecordTooLarge);
+        }
+        let prepared_account = prepare_entity_batch(std::slice::from_ref(account_save), &[])?;
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        let mut operation_ids = BTreeSet::new();
+        for (record_id, ..) in &prepared_account {
+            operation_ids.insert((EntityKind::WalletAccount, record_id.clone()));
+        }
+        for (record_id, ..) in &prepared_entities {
+            if !operation_ids.insert((entity_kind, record_id.clone())) {
+                return Err(StoreError::DuplicateBatchEntity);
+            }
+        }
+        for delete in deletes {
+            if !operation_ids.insert((entity_kind, delete.id.clone())) {
+                return Err(StoreError::DuplicateBatchEntity);
+            }
+        }
+
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual =
+            authenticated_workflow_revision(&transaction, key, &self.database_id, id, kind)?;
+        if actual != expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let authenticated_account = authenticate_entity_batch(
+            &transaction,
+            key,
+            &self.database_id,
+            EntityKind::WalletAccount,
+            &prepared_account,
+            &[],
+        )?;
+        let authenticated_entities = authenticate_entity_batch(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+
+        let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        let account_next = authenticated_account
+            .first()
+            .map(|(_, revision, _, _)| *revision)
+            .ok_or(StoreError::CorruptMetadata)?;
+        let encrypted_workflow = encrypt_record(
+            key,
+            &self.database_id,
+            &workflow_label(kind),
+            &revisioned_aad_id(
+                id.as_bytes(),
+                next,
+                updated_at_unix,
+                Some(irreversible_broadcast_prepared),
+            )?,
+            &encoded_workflow,
+        )?;
+
+        write_entity_batch_in_transaction(
+            &transaction,
+            EntityKind::WalletAccount,
+            &authenticated_account,
+            &[],
+        )?;
+        write_entity_batch_in_transaction(
+            &transaction,
+            entity_kind,
+            &authenticated_entities,
+            deletes,
+        )?;
+        transaction.execute(
+            "INSERT INTO workflows(
+                 id, kind, revision, state_json, broadcast_prepared, updated_at_unix,
+                 encryption_version
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)
+             ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,
+             state_json=excluded.state_json, broadcast_prepared=excluded.broadcast_prepared,
+             updated_at_unix=excluded.updated_at_unix,
+             encryption_version=excluded.encryption_version",
+            params![
+                id.as_bytes().as_slice(),
+                workflow_kind(kind),
+                next,
+                encrypted_workflow,
+                irreversible_broadcast_prepared,
+                updated_at_unix,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((next, account_next))
+    }
+
+    pub fn apply_entity_batch<E: Serialize>(
+        &mut self,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+    ) -> Result<(), StoreError> {
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        apply_entity_batch_in_transaction(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_workflow<T: for<'de> Deserialize<'de>>(
+        &self,
+        id: WorkflowId,
+    ) -> Result<Option<StoredWorkflow<T>>, StoreError> {
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let row: Option<(String, u64, Vec<u8>, bool, u64, u32)> = self
+            .connection
+            .query_row(
+                "SELECT kind, revision, state_json, broadcast_prepared, updated_at_unix,
+                        encryption_version
+                 FROM workflows WHERE id=?1",
+                params![id.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
         row.map(
-            |(kind, revision, state, broadcast_prepared, updated_at_unix)| {
+            |(kind, revision, state, broadcast_prepared, updated_at_unix, encryption_version)| {
+                if encryption_version != 1 {
+                    return Err(StoreError::LegacyEncryptionPending);
+                }
+                let parsed_kind = parse_workflow_kind(&kind)?;
+                let clear = decrypt_record(
+                    key,
+                    &self.database_id,
+                    &workflow_label(parsed_kind),
+                    &revisioned_aad_id(
+                        id.as_bytes(),
+                        revision,
+                        updated_at_unix,
+                        Some(broadcast_prepared),
+                    )?,
+                    &state,
+                )?;
                 Ok(StoredWorkflow {
                     id,
-                    kind: parse_workflow_kind(&kind)?,
+                    kind: parsed_kind,
                     revision,
-                    state: serde_json::from_slice(&state)?,
+                    state: serde_json::from_slice(&clear)?,
                     irreversible_broadcast_prepared: broadcast_prepared,
                     updated_at_unix,
                 })
             },
         )
         .transpose()
+    }
+
+    pub fn list_workflows<T: for<'de> Deserialize<'de>>(
+        &self,
+        kind: WorkflowKind,
+        limit: usize,
+    ) -> Result<Vec<StoredWorkflow<T>>, StoreError> {
+        if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+            return Err(StoreError::InvalidListLimit);
+        }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidListLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, revision, state_json, broadcast_prepared, updated_at_unix,
+                    encryption_version
+             FROM workflows WHERE kind=?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![workflow_kind(kind), limit], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, u32>(5)?,
+            ))
+        })?;
+        let mut workflows = Vec::new();
+        for row in rows {
+            let (id, revision, state, broadcast_prepared, updated_at_unix, encryption_version) =
+                row?;
+            if encryption_version != 1 {
+                return Err(StoreError::LegacyEncryptionPending);
+            }
+            let id = WorkflowId::new(id.try_into().map_err(|_| StoreError::CorruptMetadata)?);
+            let clear = decrypt_record(
+                key,
+                &self.database_id,
+                &workflow_label(kind),
+                &revisioned_aad_id(
+                    id.as_bytes(),
+                    revision,
+                    updated_at_unix,
+                    Some(broadcast_prepared),
+                )?,
+                &state,
+            )?;
+            workflows.push(StoredWorkflow {
+                id,
+                kind,
+                revision,
+                state: serde_json::from_slice(&clear)?,
+                irreversible_broadcast_prepared: broadcast_prepared,
+                updated_at_unix,
+            });
+        }
+        Ok(workflows)
     }
 
     pub fn put_provider_permission(
@@ -356,37 +1245,225 @@ impl WalletStore {
         updated_at_unix: u64,
     ) -> Result<(), StoreError> {
         validate_origin(origin)?;
+        if generation == 0 {
+            return Err(StoreError::InvalidGeneration);
+        }
         if permission_json.is_empty() || permission_json.len() > MAX_STATE_BYTES {
             return Err(StoreError::RecordTooLarge);
         }
-        self.connection.execute(
-            "INSERT INTO provider_permissions(origin, generation, permission_json, updated_at_unix)
-             VALUES(?1, ?2, ?3, ?4)
-             ON CONFLICT(origin) DO UPDATE SET generation=excluded.generation,
-             permission_json=excluded.permission_json, updated_at_unix=excluded.updated_at_unix",
-            params![origin, generation, permission_json, updated_at_unix],
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let record_id = origin_lookup_token(key, &self.database_id, origin)?;
+        let clear = encode_origin_payload(origin, permission_json)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(u64, Vec<u8>, u64, bool)> = transaction
+            .query_row(
+                "SELECT generation, encrypted_record, updated_at_unix, revoked
+                 FROM private_provider_permissions WHERE origin_token=?1",
+                params![record_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let current_generation = match current.as_ref() {
+            Some((generation, encrypted, current_updated_at, revoked)) => {
+                let current_clear = decrypt_record(
+                    key,
+                    &self.database_id,
+                    "provider_permission",
+                    &permission_record_id(&record_id, *generation, *revoked, *current_updated_at),
+                    encrypted,
+                )?;
+                let (stored_origin, _) = decode_origin_payload(&current_clear)?;
+                if stored_origin != origin {
+                    return Err(StoreError::Encryption);
+                }
+                *generation
+            }
+            None => 0,
+        };
+        let expected_generation = if current.is_none() {
+            generation
+        } else {
+            current_generation
+                .checked_add(1)
+                .ok_or(StoreError::RevisionOverflow)?
+        };
+        if generation != expected_generation {
+            return Err(StoreError::StaleGeneration {
+                expected: expected_generation,
+                actual: generation,
+            });
+        }
+        let encrypted = encrypt_record(
+            key,
+            &self.database_id,
+            "provider_permission",
+            &permission_record_id(&record_id, generation, false, updated_at_unix),
+            &clear,
         )?;
+        if current.is_none() {
+            let count: usize = transaction.query_row(
+                "SELECT COUNT(*) FROM private_provider_permissions",
+                [],
+                |row| row.get(0),
+            )?;
+            if count >= MAX_PROVIDER_PERMISSIONS {
+                return Err(StoreError::ProviderCapacity);
+            }
+        }
+        transaction.execute(
+            "INSERT INTO private_provider_permissions(
+                 origin_token, generation, encrypted_record, updated_at_unix, revoked
+             ) VALUES(?1, ?2, ?3, ?4, 0)
+             ON CONFLICT(origin_token) DO UPDATE SET generation=excluded.generation,
+             encrypted_record=excluded.encrypted_record,
+             updated_at_unix=excluded.updated_at_unix, revoked=0",
+            params![record_id.as_slice(), generation, encrypted, updated_at_unix],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn provider_permission(&self, origin: &str) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
         validate_origin(origin)?;
-        self.connection
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let record_id = origin_lookup_token(key, &self.database_id, origin)?;
+        let row: Option<(u64, Vec<u8>, u64, bool)> = self
+            .connection
             .query_row(
-                "SELECT generation, permission_json FROM provider_permissions WHERE origin=?1",
-                params![origin],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT generation, encrypted_record, updated_at_unix, revoked
+                 FROM private_provider_permissions WHERE origin_token=?1",
+                params![record_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
-            .map_err(StoreError::from)
+            .map_err(StoreError::from)?;
+        row.map(|(generation, encrypted, updated_at_unix, revoked)| {
+            let clear = decrypt_record(
+                key,
+                &self.database_id,
+                "provider_permission",
+                &permission_record_id(&record_id, generation, revoked, updated_at_unix),
+                &encrypted,
+            )?;
+            let (stored_origin, permission_json) = decode_origin_payload(&clear)?;
+            if stored_origin != origin {
+                return Err(StoreError::Encryption);
+            }
+            if revoked {
+                Ok(None)
+            } else {
+                Ok(Some((generation, permission_json.to_vec())))
+            }
+        })
+        .transpose()
+        .map(Option::flatten)
     }
 
-    pub fn revoke_provider_permission(&mut self, origin: &str) -> Result<bool, StoreError> {
+    pub fn provider_permission_generation(&self, origin: &str) -> Result<Option<u64>, StoreError> {
         validate_origin(origin)?;
-        Ok(self.connection.execute(
-            "DELETE FROM provider_permissions WHERE origin=?1",
-            params![origin],
-        )? == 1)
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let record_id = origin_lookup_token(key, &self.database_id, origin)?;
+        let row: Option<(u64, Vec<u8>, u64, bool)> = self
+            .connection
+            .query_row(
+                "SELECT generation, encrypted_record, updated_at_unix, revoked
+                 FROM private_provider_permissions WHERE origin_token=?1",
+                params![record_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(generation, encrypted, updated_at_unix, revoked)| {
+            let clear = decrypt_record(
+                key,
+                &self.database_id,
+                "provider_permission",
+                &permission_record_id(&record_id, generation, revoked, updated_at_unix),
+                &encrypted,
+            )?;
+            let (stored_origin, _) = decode_origin_payload(&clear)?;
+            if stored_origin != origin {
+                return Err(StoreError::Encryption);
+            }
+            Ok(generation)
+        })
+        .transpose()
+    }
+
+    pub fn revoke_provider_permission(
+        &mut self,
+        origin: &str,
+        expected_generation: u64,
+        next_generation: u64,
+        updated_at_unix: u64,
+    ) -> Result<(), StoreError> {
+        validate_origin(origin)?;
+        if expected_generation == 0
+            || next_generation
+                != expected_generation
+                    .checked_add(1)
+                    .ok_or(StoreError::RevisionOverflow)?
+        {
+            return Err(StoreError::InvalidGeneration);
+        }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let record_id = origin_lookup_token(key, &self.database_id, origin)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(u64, Vec<u8>, u64, bool)> = transaction
+            .query_row(
+                "SELECT generation, encrypted_record, updated_at_unix, revoked
+                 FROM private_provider_permissions WHERE origin_token=?1",
+                params![record_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((generation, encrypted, current_updated_at, current_revoked)) = current else {
+            return Err(StoreError::StaleGeneration {
+                expected: expected_generation,
+                actual: 0,
+            });
+        };
+        if generation != expected_generation || current_revoked {
+            return Err(StoreError::StaleGeneration {
+                expected: expected_generation,
+                actual: generation,
+            });
+        }
+        let clear = decrypt_record(
+            key,
+            &self.database_id,
+            "provider_permission",
+            &permission_record_id(&record_id, generation, current_revoked, current_updated_at),
+            &encrypted,
+        )?;
+        let (stored_origin, _) = decode_origin_payload(&clear)?;
+        if stored_origin != origin {
+            return Err(StoreError::Encryption);
+        }
+        let tombstone = encode_origin_payload(origin, b"revoked")?;
+        let encrypted = encrypt_record(
+            key,
+            &self.database_id,
+            "provider_permission",
+            &permission_record_id(&record_id, next_generation, true, updated_at_unix),
+            &tombstone,
+        )?;
+        transaction.execute(
+            "UPDATE private_provider_permissions
+             SET generation=?1, encrypted_record=?2, updated_at_unix=?3, revoked=1
+             WHERE origin_token=?4",
+            params![
+                next_generation,
+                encrypted,
+                updated_at_unix,
+                record_id.as_slice()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn put_pending_approval(
@@ -394,23 +1471,110 @@ impl WalletStore {
         id: ApprovalId,
         origin: &str,
         request_json: &[u8],
+        now_unix: u64,
         expires_at_unix: u64,
     ) -> Result<(), StoreError> {
         validate_origin(origin)?;
+        if expires_at_unix <= now_unix || expires_at_unix - now_unix > MAX_APPROVAL_LIFETIME_SECONDS
+        {
+            return Err(StoreError::InvalidApprovalWindow);
+        }
         if request_json.is_empty() || request_json.len() > MAX_STATE_BYTES {
             return Err(StoreError::RecordTooLarge);
         }
-        self.connection.execute(
-            "INSERT INTO pending_approvals(id, origin, request_json, expires_at_unix)
-             VALUES(?1, ?2, ?3, ?4)",
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let origin_token = origin_lookup_token(key, &self.database_id, origin)?;
+        let clear = encode_origin_payload(origin, request_json)?;
+        let encrypted = encrypt_record(
+            key,
+            &self.database_id,
+            "pending_approval",
+            &approval_record_id(&id, &origin_token, expires_at_unix),
+            &clear,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_expired_approvals(&transaction, key, &self.database_id, now_unix)?;
+        let count: usize = transaction.query_row(
+            "SELECT COUNT(*) FROM private_pending_approvals",
+            [],
+            |row| row.get(0),
+        )?;
+        if count >= MAX_PENDING_APPROVALS {
+            return Err(StoreError::ApprovalCapacity);
+        }
+        transaction.execute(
+            "INSERT INTO private_pending_approvals(
+                 id, origin_token, encrypted_record, expires_at_unix
+             ) VALUES(?1, ?2, ?3, ?4)",
             params![
                 id.as_bytes().as_slice(),
-                origin,
-                request_json,
+                origin_token.as_slice(),
+                encrypted,
                 expires_at_unix
             ],
         )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// Atomically removes and decrypts a pending approval. Expired approvals
+    /// are deleted but never returned to the caller.
+    pub fn take_pending_approval(
+        &mut self,
+        id: ApprovalId,
+        now_unix: u64,
+    ) -> Result<Option<PendingApproval>, StoreError> {
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(Vec<u8>, Vec<u8>, u64)> = transaction
+            .query_row(
+                "SELECT origin_token, encrypted_record, expires_at_unix
+                 FROM private_pending_approvals WHERE id=?1",
+                params![id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((origin_token, encrypted, expires_at_unix)) = row else {
+            return Ok(None);
+        };
+        let origin_token: [u8; 32] = origin_token
+            .try_into()
+            .map_err(|_| StoreError::CorruptMetadata)?;
+        let clear = decrypt_record(
+            key,
+            &self.database_id,
+            "pending_approval",
+            &approval_record_id(&id, &origin_token, expires_at_unix),
+            &encrypted,
+        )?;
+        let (origin, request_json) = decode_origin_payload(&clear)?;
+        let expected_token = origin_lookup_token(key, &self.database_id, &origin)?;
+        if origin_token != expected_token {
+            return Err(StoreError::Encryption);
+        }
+        if expires_at_unix <= now_unix {
+            transaction.execute(
+                "DELETE FROM private_pending_approvals WHERE id=?1",
+                params![id.as_bytes().as_slice()],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        }
+        transaction.execute(
+            "DELETE FROM private_pending_approvals WHERE id=?1",
+            params![id.as_bytes().as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(Some(PendingApproval {
+            id,
+            origin,
+            request_json,
+            expires_at_unix,
+        }))
     }
 
     /// Atomically consumes a request nonce. Duplicate live nonces fail.
@@ -422,28 +1586,62 @@ impl WalletStore {
         expires_at_unix: u64,
     ) -> Result<(), StoreError> {
         validate_origin(origin)?;
-        if nonce == 0 || expires_at_unix <= now_unix {
+        if nonce == 0
+            || expires_at_unix <= now_unix
+            || expires_at_unix - now_unix > MAX_REPLAY_LIFETIME_SECONDS
+        {
             return Err(StoreError::InvalidReplayWindow);
         }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let origin_token = origin_lookup_token(key, &self.database_id, origin)?;
+        let record_id = replay_record_id(&origin_token, nonce, expires_at_unix);
+        let encrypted_origin = encrypt_record(
+            key,
+            &self.database_id,
+            "replay_origin",
+            &record_id,
+            origin.as_bytes(),
+        )?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM replay_protection WHERE expires_at_unix <= ?1",
-            params![now_unix],
-        )?;
+        prune_expired_replay(&transaction, key, &self.database_id, now_unix)?;
         let count: usize = transaction.query_row(
-            "SELECT COUNT(*) FROM replay_protection WHERE origin=?1",
-            params![origin],
+            "SELECT COUNT(*) FROM private_replay_protection WHERE origin_token=?1",
+            params![origin_token.as_slice()],
             |row| row.get(0),
         )?;
         if count >= MAX_REPLAY_ROWS_PER_ORIGIN {
             return Err(StoreError::ReplayCapacity);
         }
+        let total: usize = transaction.query_row(
+            "SELECT COUNT(*) FROM private_replay_protection",
+            [],
+            |row| row.get(0),
+        )?;
+        if total >= MAX_REPLAY_ROWS {
+            return Err(StoreError::ReplayGlobalCapacity);
+        }
+        if count == 0 {
+            let origin_count: usize = transaction.query_row(
+                "SELECT COUNT(DISTINCT origin_token) FROM private_replay_protection",
+                [],
+                |row| row.get(0),
+            )?;
+            if origin_count >= MAX_REPLAY_ORIGINS {
+                return Err(StoreError::ReplayOriginCapacity);
+            }
+        }
         let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO replay_protection(origin, nonce, expires_at_unix)
-             VALUES(?1, ?2, ?3)",
-            params![origin, nonce, expires_at_unix],
+            "INSERT OR IGNORE INTO private_replay_protection(
+                 origin_token, nonce, encrypted_origin, expires_at_unix
+             ) VALUES(?1, ?2, ?3, ?4)",
+            params![
+                origin_token.as_slice(),
+                nonce,
+                encrypted_origin,
+                expires_at_unix
+            ],
         )?;
         if inserted != 1 {
             return Err(StoreError::Replay);
@@ -452,9 +1650,172 @@ impl WalletStore {
         Ok(())
     }
 
-    pub fn connection_for_module_transaction(&mut self) -> Result<&mut Connection, StoreError> {
-        self.key.as_ref().ok_or(StoreError::Locked)?;
-        Ok(&mut self.connection)
+    fn encrypt_legacy_rows(&mut self) -> Result<(), StoreError> {
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        reject_unmigrated_legacy_entities(&transaction)?;
+
+        let workflows = {
+            let mut statement = transaction.prepare(
+                "SELECT id, kind, revision, state_json, broadcast_prepared, updated_at_unix
+                 FROM workflows
+                 WHERE encryption_version=0 ORDER BY id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, u64>(5)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let removed_plaintext = !workflows.is_empty();
+        for (id, kind, revision, clear, broadcast_prepared, updated_at_unix) in workflows {
+            let clear = Zeroizing::new(clear);
+            validate_id(&id)?;
+            let kind = parse_workflow_kind(&kind)?;
+            let encrypted = encrypt_record(
+                key,
+                &self.database_id,
+                &workflow_label(kind),
+                &revisioned_aad_id(&id, revision, updated_at_unix, Some(broadcast_prepared))?,
+                &clear,
+            )?;
+            transaction.execute(
+                "UPDATE workflows SET state_json=?1, encryption_version=1 WHERE id=?2",
+                params![encrypted, id],
+            )?;
+        }
+
+        let permissions = {
+            let mut statement = transaction.prepare(
+                "SELECT origin, generation, permission_json, updated_at_unix
+                 FROM provider_permissions ORDER BY origin",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if permissions.len() > MAX_PROVIDER_PERMISSIONS {
+            return Err(StoreError::ProviderCapacity);
+        }
+        let removed_permissions = !permissions.is_empty();
+        for (origin, generation, permission_json, updated_at_unix) in permissions {
+            let permission_json = Zeroizing::new(permission_json);
+            validate_origin(&origin)?;
+            if generation == 0 {
+                return Err(StoreError::InvalidGeneration);
+            }
+            let origin_token = origin_lookup_token(key, &self.database_id, &origin)?;
+            let clear = encode_origin_payload(&origin, &permission_json)?;
+            let encrypted = encrypt_record(
+                key,
+                &self.database_id,
+                "provider_permission",
+                &permission_record_id(&origin_token, generation, false, updated_at_unix),
+                &clear,
+            )?;
+            transaction.execute(
+                "INSERT INTO private_provider_permissions(
+                     origin_token, generation, encrypted_record, updated_at_unix, revoked
+                 ) VALUES(?1, ?2, ?3, ?4, 0)",
+                params![
+                    origin_token.as_slice(),
+                    generation,
+                    encrypted,
+                    updated_at_unix
+                ],
+            )?;
+        }
+
+        // A legacy pending approval has no authenticated creation timestamp or
+        // authority binding. It cannot be proven to satisfy the bounded window
+        // used by the current schema, so migration deliberately invalidates it.
+        let removed_approvals: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_approvals LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let replay_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT origin, nonce, expires_at_unix
+                 FROM replay_protection ORDER BY origin, nonce",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        validate_legacy_replay_capacity(&replay_rows)?;
+        let removed_replay_rows = !replay_rows.is_empty();
+        for (origin, nonce, expires_at_unix) in replay_rows {
+            validate_origin(&origin)?;
+            let origin_token = origin_lookup_token(key, &self.database_id, &origin)?;
+            let record_id = replay_record_id(&origin_token, nonce, expires_at_unix);
+            let encrypted_origin = encrypt_record(
+                key,
+                &self.database_id,
+                "replay_origin",
+                &record_id,
+                origin.as_bytes(),
+            )?;
+            transaction.execute(
+                "INSERT INTO private_replay_protection(
+                     origin_token, nonce, encrypted_origin, expires_at_unix
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    origin_token.as_slice(),
+                    nonce,
+                    encrypted_origin,
+                    expires_at_unix
+                ],
+            )?;
+        }
+
+        transaction.execute("DELETE FROM provider_permissions", [])?;
+        transaction.execute("DELETE FROM pending_approvals", [])?;
+        transaction.execute("DELETE FROM replay_protection", [])?;
+
+        let removed_plaintext =
+            removed_plaintext || removed_permissions || removed_approvals || removed_replay_rows;
+        if removed_plaintext {
+            set_meta(&transaction, CHECKPOINT_PENDING_KEY, b"1")?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn complete_plaintext_checkpoint(&mut self) -> Result<(), StoreError> {
+        // Always truncate before returning unlocked. This retries even if a
+        // prior process committed plaintext deletion but failed before it
+        // could persist or clear the checkpoint marker.
+        truncate_wal(&self.connection)?;
+        if meta(&self.connection, CHECKPOINT_PENDING_KEY)?.is_some() {
+            self.connection.execute(
+                "DELETE FROM wallet_meta WHERE key=?1",
+                params![CHECKPOINT_PENDING_KEY],
+            )?;
+            truncate_wal(&self.connection)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -471,6 +1832,293 @@ pub struct StoredWorkflow<T> {
     pub state: T,
     pub irreversible_broadcast_prepared: bool,
     pub updated_at_unix: u64,
+}
+
+pub struct PendingApproval {
+    pub id: ApprovalId,
+    pub origin: String,
+    pub request_json: Zeroizing<Vec<u8>>,
+    pub expires_at_unix: u64,
+}
+
+impl core::fmt::Debug for PendingApproval {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PendingApproval")
+            .field("id", &self.id)
+            .field("origin", &self.origin)
+            .field("request_json", &"[REDACTED]")
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
+    }
+}
+
+type PreparedEntityBatch = Vec<(Vec<u8>, u64, Zeroizing<Vec<u8>>, u64)>;
+type AuthenticatedEntityWrites = Vec<(Vec<u8>, u64, Vec<u8>, u64)>;
+
+fn prepare_entity_batch<E: Serialize>(
+    saves: &[EntityBatchSave<E>],
+    deletes: &[EntityBatchDelete],
+) -> Result<PreparedEntityBatch, StoreError> {
+    if saves
+        .len()
+        .checked_add(deletes.len())
+        .is_none_or(|count| count > MAX_ENTITY_BATCH_OPERATIONS)
+    {
+        return Err(StoreError::BatchCapacity);
+    }
+    let mut ids = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(saves.len());
+    for save in saves {
+        validate_id(&save.id)?;
+        if !ids.insert(save.id.clone()) {
+            return Err(StoreError::DuplicateBatchEntity);
+        }
+        let encoded = Zeroizing::new(serde_json::to_vec(&save.value)?);
+        if encoded.is_empty() || encoded.len() > MAX_STATE_BYTES {
+            return Err(StoreError::RecordTooLarge);
+        }
+        prepared.push((
+            save.id.clone(),
+            save.expected_revision,
+            encoded,
+            save.updated_at_unix,
+        ));
+    }
+    for delete in deletes {
+        validate_id(&delete.id)?;
+        if delete.expected_revision == 0 || !ids.insert(delete.id.clone()) {
+            return Err(StoreError::DuplicateBatchEntity);
+        }
+    }
+    Ok(prepared)
+}
+
+fn authenticated_workflow_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    id: WorkflowId,
+    expected_kind: WorkflowKind,
+) -> Result<u64, StoreError> {
+    let current: Option<(String, u64, Vec<u8>, bool, u64, u32)> = transaction
+        .query_row(
+            "SELECT kind, revision, state_json, broadcast_prepared,
+                    updated_at_unix, encryption_version
+             FROM workflows WHERE id=?1",
+            params![id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((kind, revision, encrypted, broadcast, updated_at, version)) = current else {
+        return Ok(0);
+    };
+    let kind = parse_workflow_kind(&kind)?;
+    if kind != expected_kind {
+        return Err(StoreError::WorkflowKindMismatch);
+    }
+    if version != 1 {
+        return Err(StoreError::LegacyEncryptionPending);
+    }
+    decrypt_record(
+        key,
+        database_id,
+        &workflow_label(kind),
+        &revisioned_aad_id(id.as_bytes(), revision, updated_at, Some(broadcast))?,
+        &encrypted,
+    )?;
+    Ok(revision)
+}
+
+fn authenticated_entity_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    id: &[u8],
+) -> Result<Option<u64>, StoreError> {
+    let current: Option<(u64, Vec<u8>, u64)> = transaction
+        .query_row(
+            "SELECT revision, encrypted_value, updated_at_unix
+             FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+            params![kind.label(), id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    current
+        .map(|(revision, encrypted, updated_at)| {
+            decrypt_record(
+                key,
+                database_id,
+                &entity_label(kind),
+                &revisioned_aad_id(id, revision, updated_at, None)?,
+                &encrypted,
+            )?;
+            Ok(revision)
+        })
+        .transpose()
+}
+
+fn apply_entity_batch_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    saves: &PreparedEntityBatch,
+    deletes: &[EntityBatchDelete],
+) -> Result<(), StoreError> {
+    let encrypted_saves =
+        authenticate_entity_batch(transaction, key, database_id, kind, saves, deletes)?;
+    write_entity_batch_in_transaction(transaction, kind, &encrypted_saves, deletes)
+}
+
+fn authenticate_entity_batch(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    saves: &PreparedEntityBatch,
+    deletes: &[EntityBatchDelete],
+) -> Result<AuthenticatedEntityWrites, StoreError> {
+    let mut encrypted_saves = Vec::with_capacity(saves.len());
+    for (id, expected_revision, encoded, updated_at) in saves {
+        let actual =
+            authenticated_entity_revision(transaction, key, database_id, kind, id)?.unwrap_or(0);
+        if actual != *expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: *expected_revision,
+                actual,
+            });
+        }
+        let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        let encrypted = encrypt_record(
+            key,
+            database_id,
+            &entity_label(kind),
+            &revisioned_aad_id(id, next, *updated_at, None)?,
+            encoded,
+        )?;
+        encrypted_saves.push((id, next, encrypted, *updated_at));
+    }
+    for delete in deletes {
+        let actual =
+            authenticated_entity_revision(transaction, key, database_id, kind, &delete.id)?
+                .unwrap_or(0);
+        if actual != delete.expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: delete.expected_revision,
+                actual,
+            });
+        }
+    }
+    Ok(encrypted_saves)
+}
+
+fn write_entity_batch_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    kind: EntityKind,
+    encrypted_saves: &AuthenticatedEntityWrites,
+    deletes: &[EntityBatchDelete],
+) -> Result<(), StoreError> {
+    for (id, revision, encrypted, updated_at) in encrypted_saves {
+        transaction.execute(
+            "INSERT INTO encrypted_entities(
+                 entity_kind, record_id, revision, encrypted_value, updated_at_unix
+             ) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(entity_kind, record_id) DO UPDATE SET
+                 revision=excluded.revision,
+                 encrypted_value=excluded.encrypted_value,
+                 updated_at_unix=excluded.updated_at_unix",
+            params![kind.label(), id, revision, encrypted, updated_at],
+        )?;
+    }
+    for delete in deletes {
+        transaction.execute(
+            "DELETE FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+            params![kind.label(), &delete.id],
+        )?;
+    }
+    Ok(())
+}
+
+fn is_in_memory(path: &Path) -> bool {
+    path == Path::new(":memory:")
+}
+
+fn open_wallet_connection(path: &Path, create: bool) -> Result<Connection, StoreError> {
+    if is_in_memory(path) {
+        return Connection::open_in_memory().map_err(StoreError::from);
+    }
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    if create {
+        flags |= OpenFlags::SQLITE_OPEN_CREATE;
+    }
+    Connection::open_with_flags(path, flags).map_err(StoreError::from)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_wallet_location(path: &Path, allow_missing: bool) -> Result<(), StoreError> {
+    if is_in_memory(path) {
+        return Ok(());
+    }
+    let process_uid = std::fs::metadata("/proc/self")?.uid();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.uid() != process_uid
+        || parent_metadata.mode() & 0o077 != 0
+    {
+        return Err(StoreError::UnsafeFilesystemBoundary);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && metadata.uid() == process_uid
+                && metadata.mode() & 0o077 == 0 =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(StoreError::UnsafeFilesystemBoundary),
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StoreError::Io(error)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_wallet_location(path: &Path, _: bool) -> Result<(), StoreError> {
+    if is_in_memory(path) {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedFilesystemBoundary)
+    }
+}
+
+#[cfg(unix)]
+fn harden_wallet_file(path: &Path) -> Result<(), StoreError> {
+    if !is_in_memory(path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_wallet_file(path: &Path) -> Result<(), StoreError> {
+    if is_in_memory(path) {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedFilesystemBoundary)
+    }
 }
 
 fn configure(connection: &Connection) -> Result<(), StoreError> {
@@ -491,6 +2139,12 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     }
     if current == 0 {
         connection.execute_batch(SCHEMA_V1)?;
+    }
+    if current < 2 {
+        connection.execute_batch(SCHEMA_V2)?;
+    }
+    if current < 3 {
+        connection.execute_batch(SCHEMA_V3)?;
     }
     Ok(())
 }
@@ -561,11 +2215,292 @@ PRAGMA user_version=1;
 COMMIT;
 "#;
 
+const SCHEMA_V2: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE workflows ADD COLUMN encryption_version INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE encrypted_entities(
+    entity_kind TEXT NOT NULL,
+    record_id BLOB NOT NULL,
+    revision INTEGER NOT NULL,
+    encrypted_value BLOB NOT NULL,
+    updated_at_unix INTEGER NOT NULL,
+    PRIMARY KEY(entity_kind, record_id)
+) STRICT;
+CREATE INDEX encrypted_entities_updated
+    ON encrypted_entities(entity_kind, updated_at_unix, record_id);
+CREATE TABLE private_provider_permissions(
+    origin_token BLOB PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    encrypted_record BLOB NOT NULL,
+    updated_at_unix INTEGER NOT NULL
+) STRICT;
+CREATE TABLE private_pending_approvals(
+    id BLOB PRIMARY KEY,
+    origin_token BLOB NOT NULL,
+    encrypted_record BLOB NOT NULL,
+    expires_at_unix INTEGER NOT NULL
+) STRICT;
+CREATE INDEX private_pending_approval_expiry
+    ON private_pending_approvals(expires_at_unix);
+CREATE TABLE private_replay_protection(
+    origin_token BLOB NOT NULL,
+    nonce INTEGER NOT NULL,
+    encrypted_origin BLOB NOT NULL,
+    expires_at_unix INTEGER NOT NULL,
+    PRIMARY KEY(origin_token, nonce)
+) STRICT;
+CREATE INDEX private_replay_expiry
+    ON private_replay_protection(expires_at_unix);
+PRAGMA user_version=2;
+COMMIT;
+"#;
+
+const SCHEMA_V3: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE private_provider_permissions
+    ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0;
+PRAGMA user_version=3;
+COMMIT;
+"#;
+
+const LEGACY_ENTITY_TABLES: &[&str] = &[
+    "wallet_accounts",
+    "derived_addresses",
+    "hns_utxos",
+    "hns_transactions",
+    "known_names",
+    "name_owner_outpoints",
+    "name_transfer_state",
+    "shakedex_state",
+    "denuo_board_cache",
+    "bitcoin_headers",
+    "bitcoin_filter_headers",
+    "bitcoin_peers",
+    "bitcoin_scan_state",
+    "bitcoin_utxos",
+    "bitcoin_transactions",
+    "ethereum_accounts",
+    "ethereum_transactions",
+    "market_intents",
+    "fill_grants",
+    "price_rounds",
+    "swap_sessions",
+    "htlc_secrets",
+    "refund_transactions",
+];
+
+/// Schema v1 exposed no complete, authenticated mapping for these entity rows.
+/// Refusing to unlock is safer than silently hiding or ambiguously translating
+/// funds-bearing state. An explicit import tool must consume them first.
+fn reject_unmigrated_legacy_entities(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    for table in LEGACY_ENTITY_TABLES {
+        let query = format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)");
+        let populated: bool = transaction.query_row(&query, [], |row| row.get(0))?;
+        if populated {
+            return Err(StoreError::LegacyEntityMigrationRequired(
+                (*table).to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_legacy_replay_capacity(rows: &[(String, u64, u64)]) -> Result<(), StoreError> {
+    if rows.len() > MAX_REPLAY_ROWS {
+        return Err(StoreError::ReplayGlobalCapacity);
+    }
+    let mut previous_origin: Option<&str> = None;
+    let mut origin_count = 0_usize;
+    let mut rows_for_origin = 0_usize;
+    for (origin, nonce, _) in rows {
+        validate_origin(origin)?;
+        if *nonce == 0 {
+            return Err(StoreError::InvalidReplayWindow);
+        }
+        if previous_origin != Some(origin.as_str()) {
+            origin_count = origin_count
+                .checked_add(1)
+                .ok_or(StoreError::ReplayOriginCapacity)?;
+            if origin_count > MAX_REPLAY_ORIGINS {
+                return Err(StoreError::ReplayOriginCapacity);
+            }
+            previous_origin = Some(origin);
+            rows_for_origin = 0;
+        }
+        rows_for_origin = rows_for_origin
+            .checked_add(1)
+            .ok_or(StoreError::ReplayCapacity)?;
+        if rows_for_origin > MAX_REPLAY_ROWS_PER_ORIGIN {
+            return Err(StoreError::ReplayCapacity);
+        }
+    }
+    Ok(())
+}
+
+fn truncate_wal(connection: &Connection) -> Result<(), StoreError> {
+    let busy: u32 =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(StoreError::WalCheckpointBusy);
+    }
+    Ok(())
+}
+
+fn encode_origin_payload(origin: &str, payload: &[u8]) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+    validate_origin(origin)?;
+    if payload.is_empty() {
+        return Err(StoreError::RecordTooLarge);
+    }
+    let origin_len = u16::try_from(origin.len()).map_err(|_| StoreError::InvalidOrigin)?;
+    let capacity = 2_usize
+        .checked_add(origin.len())
+        .and_then(|length| length.checked_add(payload.len()))
+        .ok_or(StoreError::RecordTooLarge)?;
+    if capacity > MAX_SECRET_BYTES {
+        return Err(StoreError::RecordTooLarge);
+    }
+    let mut encoded = Zeroizing::new(Vec::with_capacity(capacity));
+    encoded.extend_from_slice(&origin_len.to_be_bytes());
+    encoded.extend_from_slice(origin.as_bytes());
+    encoded.extend_from_slice(payload);
+    Ok(encoded)
+}
+
+fn decode_origin_payload(encoded: &[u8]) -> Result<(String, Zeroizing<Vec<u8>>), StoreError> {
+    if encoded.len() < 3 || encoded.len() > MAX_SECRET_BYTES {
+        return Err(StoreError::Encryption);
+    }
+    let origin_len = usize::from(u16::from_be_bytes([encoded[0], encoded[1]]));
+    let payload_offset = 2_usize
+        .checked_add(origin_len)
+        .ok_or(StoreError::Encryption)?;
+    if payload_offset >= encoded.len() {
+        return Err(StoreError::Encryption);
+    }
+    let origin = core::str::from_utf8(&encoded[2..payload_offset])
+        .map_err(|_| StoreError::Encryption)?
+        .to_owned();
+    validate_origin(&origin).map_err(|_| StoreError::Encryption)?;
+    Ok((origin, Zeroizing::new(encoded[payload_offset..].to_vec())))
+}
+
+fn prune_expired_approvals(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    now_unix: u64,
+) -> Result<(), StoreError> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT id, origin_token, encrypted_record, expires_at_unix
+             FROM private_pending_approvals ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if rows.len() > MAX_PENDING_APPROVALS {
+        return Err(StoreError::ApprovalCapacity);
+    }
+    for (id, origin_token, encrypted, expires_at_unix) in rows {
+        let id = ApprovalId::new(id.try_into().map_err(|_| StoreError::CorruptMetadata)?);
+        let origin_token: [u8; 32] = origin_token
+            .try_into()
+            .map_err(|_| StoreError::CorruptMetadata)?;
+        let clear = decrypt_record(
+            key,
+            database_id,
+            "pending_approval",
+            &approval_record_id(&id, &origin_token, expires_at_unix),
+            &encrypted,
+        )?;
+        let (origin, _) = decode_origin_payload(&clear)?;
+        if origin_lookup_token(key, database_id, &origin)? != origin_token {
+            return Err(StoreError::Encryption);
+        }
+        if expires_at_unix <= now_unix {
+            transaction.execute(
+                "DELETE FROM private_pending_approvals WHERE id=?1",
+                params![id.as_bytes().as_slice()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_expired_replay(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    now_unix: u64,
+) -> Result<(), StoreError> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT origin_token, nonce, encrypted_origin, expires_at_unix
+             FROM private_replay_protection ORDER BY origin_token, nonce",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if rows.len() > MAX_REPLAY_ROWS {
+        return Err(StoreError::ReplayGlobalCapacity);
+    }
+    for (origin_token, nonce, encrypted_origin, expires_at_unix) in rows {
+        let origin_token: [u8; 32] = origin_token
+            .try_into()
+            .map_err(|_| StoreError::CorruptMetadata)?;
+        let clear = decrypt_record(
+            key,
+            database_id,
+            "replay_origin",
+            &replay_record_id(&origin_token, nonce, expires_at_unix),
+            &encrypted_origin,
+        )?;
+        let origin = core::str::from_utf8(&clear).map_err(|_| StoreError::Encryption)?;
+        validate_origin(origin).map_err(|_| StoreError::Encryption)?;
+        if origin_lookup_token(key, database_id, origin)? != origin_token {
+            return Err(StoreError::Encryption);
+        }
+        if expires_at_unix <= now_unix {
+            transaction.execute(
+                "DELETE FROM private_replay_protection
+                 WHERE origin_token=?1 AND nonce=?2",
+                params![origin_token.as_slice(), nonce],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_passphrase(passphrase: &str) -> Result<(), StoreError> {
+    if passphrase.is_empty() || passphrase.len() > MAX_PASSPHRASE_BYTES {
+        Err(StoreError::InvalidPassphrase)
+    } else {
+        Ok(())
+    }
+}
+
 fn derive_key(
     passphrase: &str,
     salt: &[u8; SALT_BYTES],
     config: KdfConfig,
 ) -> Result<Zeroizing<[u8; KEY_BYTES]>, StoreError> {
+    validate_passphrase(passphrase)?;
     config.validate()?;
     let params = Params::new(
         config.memory_kib,
@@ -588,6 +2523,9 @@ fn encrypt_record(
     id: &[u8],
     cleartext: &[u8],
 ) -> Result<Vec<u8>, StoreError> {
+    if cleartext.is_empty() || cleartext.len() > MAX_SECRET_BYTES {
+        return Err(StoreError::RecordTooLarge);
+    }
     let mut nonce = [0_u8; NONCE_BYTES];
     getrandom::fill(&mut nonce).map_err(|_| StoreError::Randomness)?;
     let aad = record_aad(database_id, kind, id)?;
@@ -638,7 +2576,9 @@ fn record_aad(
     kind: &str,
     id: &[u8],
 ) -> Result<Vec<u8>, StoreError> {
-    validate_id(id)?;
+    if id.is_empty() || id.len() > MAX_RECORD_ID_BYTES + 64 {
+        return Err(StoreError::InvalidRecordId);
+    }
     if kind.is_empty() || kind.len() > 64 {
         return Err(StoreError::InvalidRecordId);
     }
@@ -649,6 +2589,74 @@ fn record_aad(
     aad.push(0);
     aad.extend_from_slice(id);
     Ok(aad)
+}
+
+fn entity_label(kind: EntityKind) -> String {
+    format!("entity/{}", kind.label())
+}
+
+fn workflow_label(kind: WorkflowKind) -> String {
+    format!("workflow/{}", workflow_kind(kind))
+}
+
+fn origin_lookup_token(
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    origin: &str,
+) -> Result<[u8; 32], StoreError> {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|_| StoreError::KeyDerivation)?;
+    Mac::update(&mut mac, ORIGIN_TOKEN_DOMAIN);
+    Mac::update(&mut mac, database_id);
+    Mac::update(&mut mac, origin.as_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn revisioned_aad_id(
+    id: &[u8],
+    revision: u64,
+    updated_at_unix: u64,
+    broadcast_prepared: Option<bool>,
+) -> Result<Vec<u8>, StoreError> {
+    validate_id(id)?;
+    let mut aad_id = Vec::with_capacity(id.len() + 17);
+    aad_id.extend_from_slice(id);
+    aad_id.extend_from_slice(&revision.to_be_bytes());
+    aad_id.extend_from_slice(&updated_at_unix.to_be_bytes());
+    if let Some(prepared) = broadcast_prepared {
+        aad_id.push(u8::from(prepared));
+    }
+    Ok(aad_id)
+}
+
+fn permission_record_id(
+    origin_token: &[u8; 32],
+    generation: u64,
+    revoked: bool,
+    updated_at_unix: u64,
+) -> [u8; 49] {
+    let mut id = [0_u8; 49];
+    id[..32].copy_from_slice(origin_token);
+    id[32..40].copy_from_slice(&generation.to_be_bytes());
+    id[40] = u8::from(revoked);
+    id[41..].copy_from_slice(&updated_at_unix.to_be_bytes());
+    id
+}
+
+fn approval_record_id(id: &ApprovalId, origin_token: &[u8; 32], expires_at_unix: u64) -> [u8; 56] {
+    let mut aad_id = [0_u8; 56];
+    aad_id[..16].copy_from_slice(id.as_bytes());
+    aad_id[16..48].copy_from_slice(origin_token);
+    aad_id[48..].copy_from_slice(&expires_at_unix.to_be_bytes());
+    aad_id
+}
+
+fn replay_record_id(origin_token: &[u8; 32], nonce: u64, expires_at_unix: u64) -> [u8; 48] {
+    let mut id = [0_u8; 48];
+    id[..32].copy_from_slice(origin_token);
+    id[32..40].copy_from_slice(&nonce.to_be_bytes());
+    id[40..].copy_from_slice(&expires_at_unix.to_be_bytes());
+    id
 }
 
 fn validate_id(id: &[u8]) -> Result<(), StoreError> {
@@ -728,6 +2736,8 @@ fn parse_workflow_kind(value: &str) -> Result<WorkflowKind, StoreError> {
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -749,6 +2759,8 @@ pub enum StoreError {
     Encryption,
     #[error("secret kind does not match the requested kind")]
     KindMismatch,
+    #[error("a workflow identifier cannot change workflow kind")]
+    WorkflowKindMismatch,
     #[error("record identifier is invalid")]
     InvalidRecordId,
     #[error("origin is invalid")]
@@ -767,8 +2779,40 @@ pub enum StoreError {
     Replay,
     #[error("request replay window is invalid")]
     InvalidReplayWindow,
+    #[error("pending approval lifetime is invalid")]
+    InvalidApprovalWindow,
     #[error("origin replay-protection capacity is exhausted")]
     ReplayCapacity,
+    #[error("global replay-protection capacity is exhausted")]
+    ReplayGlobalCapacity,
+    #[error("replay-protection origin capacity is exhausted")]
+    ReplayOriginCapacity,
+    #[error("provider permission capacity is exhausted")]
+    ProviderCapacity,
+    #[error("pending approval capacity is exhausted")]
+    ApprovalCapacity,
+    #[error("provider permission generation must be nonzero")]
+    InvalidGeneration,
+    #[error("provider permission generation mismatch: expected {expected}, got {actual}")]
+    StaleGeneration { expected: u64, actual: u64 },
+    #[error("entity or workflow list limit is invalid")]
+    InvalidListLimit,
+    #[error("record revision must be nonzero")]
+    InvalidRevision,
+    #[error("entity batch contains duplicate or invalid operations")]
+    DuplicateBatchEntity,
+    #[error("entity batch exceeds its bounded operation limit")]
+    BatchCapacity,
+    #[error("legacy sensitive rows require an unlocked migration")]
+    LegacyEncryptionPending,
+    #[error("legacy entity table `{0}` requires an explicit authenticated import")]
+    LegacyEntityMigrationRequired(String),
+    #[error("the plaintext-removal WAL checkpoint could not acquire the database")]
+    WalCheckpointBusy,
+    #[error("wallet database or parent ownership/mode is unsafe")]
+    UnsafeFilesystemBoundary,
+    #[error("wallet filesystem ownership validation is unsupported on this platform")]
+    UnsupportedFilesystemBoundary,
 }
 
 #[cfg(test)]
@@ -838,6 +2882,87 @@ mod tests {
             store.load_workflow(id).expect("load").expect("present");
         assert!(loaded.irreversible_broadcast_prepared);
         assert_eq!(loaded.revision, 1);
+        let raw: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT state_json FROM workflows WHERE id=?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("encrypted workflow row");
+        assert!(!raw.windows(12).any(|window| window == b"terms_frozen"));
+    }
+
+    #[test]
+    fn typed_entities_are_encrypted_revisioned_and_relocation_bound() {
+        let mut store = WalletStore::create_in_memory("passphrase").expect("store");
+        let id = [4_u8; 36];
+        let revision = store
+            .save_hns_utxo(&id, 0, &json!({"value":"42000000"}), 10)
+            .expect("save entity");
+        assert_eq!(revision, 1);
+        let loaded: StoredEntity<serde_json::Value> =
+            store.hns_utxo(&id).expect("load entity").expect("present");
+        assert_eq!(loaded.revision, 1);
+        assert_eq!(loaded.value["value"], "42000000");
+        assert!(matches!(
+            store.save_hns_utxo(&id, 0, &json!({"value":"1"}), 11),
+            Err(StoreError::StaleRevision { .. })
+        ));
+
+        let envelope: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT encrypted_value FROM encrypted_entities
+                 WHERE entity_kind='hns_utxo' AND record_id=?1",
+                params![id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("ciphertext");
+        store
+            .connection
+            .execute(
+                "INSERT INTO encrypted_entities(
+                     entity_kind, record_id, revision, encrypted_value, updated_at_unix
+                 ) VALUES('bitcoin_utxo', ?1, 1, ?2, 10)",
+                params![[5_u8; 36].as_slice(), envelope],
+            )
+            .expect("relocate ciphertext");
+        assert!(matches!(
+            store.bitcoin_utxo::<serde_json::Value>(&[5_u8; 36]),
+            Err(StoreError::Encryption)
+        ));
+    }
+
+    #[test]
+    fn pending_approval_is_encrypted_single_use_and_expiring() {
+        let mut store = WalletStore::create_in_memory("passphrase").expect("store");
+        let id = ApprovalId::new([9; 16]);
+        store
+            .put_pending_approval(id, "https://wallet.example", b"approval commitment", 10, 20)
+            .expect("put approval");
+        let approval = store
+            .take_pending_approval(id, 10)
+            .expect("take approval")
+            .expect("live approval");
+        assert_eq!(approval.request_json.as_slice(), b"approval commitment");
+        assert!(
+            store
+                .take_pending_approval(id, 10)
+                .expect("second take")
+                .is_none()
+        );
+
+        let expired = ApprovalId::new([8; 16]);
+        store
+            .put_pending_approval(expired, "https://wallet.example", b"expired", 20, 30)
+            .expect("put expired approval");
+        assert!(
+            store
+                .take_pending_approval(expired, 30)
+                .expect("expire approval")
+                .is_none()
+        );
     }
 
     #[test]
@@ -853,5 +2978,115 @@ mod tests {
         store
             .consume_replay_nonce("https://example", 1, 20, 30)
             .expect("expired nonce can be reused in a new bounded session");
+    }
+
+    #[test]
+    fn account_workflow_reservation_batch_is_all_or_nothing() {
+        let mut store = WalletStore::create_in_memory("passphrase").expect("store");
+        let account_id = vec![1_u8; 32];
+        store
+            .save_wallet_account(&account_id, 0, &json!({"next_change": 0}), 1)
+            .expect("initial account");
+        let workflow_id = WorkflowId::new([2; 16]);
+        let account_save = EntityBatchSave {
+            id: account_id.clone(),
+            expected_revision: 1,
+            value: json!({"next_change": 1}),
+            updated_at_unix: 2,
+        };
+        let stale_reservation = EntityBatchSave {
+            id: vec![3_u8; 36],
+            expected_revision: 1,
+            value: json!({"reserved": true}),
+            updated_at_unix: 2,
+        };
+        assert!(matches!(
+            store.save_workflow_with_account_and_entity_batch(
+                workflow_id,
+                WorkflowKind::HnsSend,
+                0,
+                &json!({"stage": "prepared"}),
+                false,
+                2,
+                &account_save,
+                EntityKind::InputReservation,
+                &[stale_reservation],
+                &[],
+            ),
+            Err(StoreError::StaleRevision { .. })
+        ));
+        let account: StoredEntity<serde_json::Value> = store
+            .wallet_account(&account_id)
+            .expect("load account")
+            .expect("account present");
+        assert_eq!(account.revision, 1);
+        assert_eq!(account.value["next_change"], 0);
+        assert!(
+            store
+                .load_workflow::<serde_json::Value>(workflow_id)
+                .expect("load workflow")
+                .is_none()
+        );
+
+        let reservation = EntityBatchSave {
+            id: vec![3_u8; 36],
+            expected_revision: 0,
+            value: json!({"reserved": true}),
+            updated_at_unix: 2,
+        };
+        let revisions = store
+            .save_workflow_with_account_and_entity_batch(
+                workflow_id,
+                WorkflowKind::HnsSend,
+                0,
+                &json!({"stage": "prepared"}),
+                false,
+                2,
+                &account_save,
+                EntityKind::InputReservation,
+                &[reservation],
+                &[],
+            )
+            .expect("atomic prepare");
+        assert_eq!(revisions, (1, 2));
+        assert_eq!(
+            store
+                .wallet_account::<serde_json::Value>(&account_id)
+                .expect("load account")
+                .expect("account present")
+                .value["next_change"],
+            1
+        );
+        assert!(
+            store
+                .load_workflow::<serde_json::Value>(workflow_id)
+                .expect("load workflow")
+                .is_some()
+        );
+        assert!(
+            store
+                .input_reservation::<serde_json::Value>(&[3_u8; 36])
+                .expect("load reservation")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn passphrases_are_bounded_at_the_store_boundary() {
+        assert!(matches!(
+            WalletStore::create_in_memory(""),
+            Err(StoreError::InvalidPassphrase)
+        ));
+        let oversized = "x".repeat(MAX_PASSPHRASE_BYTES + 1);
+        assert!(matches!(
+            WalletStore::create_in_memory(&oversized),
+            Err(StoreError::InvalidPassphrase)
+        ));
+        let mut store = WalletStore::create_in_memory("passphrase").expect("store");
+        store.lock();
+        assert!(matches!(
+            store.unlock(&oversized),
+            Err(StoreError::InvalidPassphrase)
+        ));
     }
 }

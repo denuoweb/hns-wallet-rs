@@ -1,45 +1,86 @@
 # Persistence and restart recovery
 
-Schema version 1 creates explicit tables for wallet accounts/addresses, HNS
-UTXOs and transactions, names and transfers, Shakedex, Denuo cache, Kyoto
-headers/filter headers/peers/scan progress, Bitcoin UTXOs and transactions,
-Ethereum accounts and transactions, price rounds, intents, fill grants, swap
-sessions, HTLC secrets, refunds, permissions, approvals, replays, and generic
-versioned workflows.
+Schema version 3 retains the schema-v1 table layout for forward migration and
+adds encrypted, typed entity storage plus private provider tables. Wallet
+accounts, derived addresses, HNS/Bitcoin/Ethereum state, known names, input
+reservations, settlement verification records, market state, workflows,
+permissions, approval requests, and replay records have bounded typed accessors.
 
-Sensitive record values use XChaCha20-Poly1305. Workflow rows use an immediate
-SQLite transaction and compare-and-swap revision. A caller records a prepared
-irreversible action before broadcasting it. Duplicate/stale writers fail.
+Sensitive values use XChaCha20-Poly1305 with random nonces. Associated data
+binds the database ID, record domain and identifier, plus plaintext columns that
+can affect a decision: entity/workflow revision and update time, workflow kind
+and broadcast state, permission generation/revocation state, approval origin
+token and expiry, and replay origin token/nonce/expiry. Changing one of those
+columns without the key makes the record fail authentication.
+
+Entity and workflow writes use immediate SQLite transactions and
+compare-and-swap revisions. Bounded heterogeneous preparation batches
+authenticate every current ciphertext and revision before writing, then commit
+the wallet account, workflow, and all input-reservation saves/deletes together.
+Duplicate `(entity kind, record ID)` operations and stale writers fail before a
+partial batch becomes visible. Secret record kinds are immutable.
+
+## HNS change derivations
+
+Send preparation and settlement-lock preparation commit account change-index
+advancement, the prepared workflow, and input reservations in one SQLite
+transaction. The in-memory account is updated only after commit. Concurrent
+losers and any precommit fee/build/sign failure leave all three records
+unchanged; a committed workflow cannot reuse its change key or become invisible
+behind a failed account CAS.
+
+The send request nonce and settlement session/action derive deterministic
+workflow IDs. A same-terms, nonexpired retry loads the encrypted prepared
+workflow first, verifies the exact account/request/fee terms, signed artifact,
+and complete reservation set, refreshes the committed account cache, and returns
+the persisted artifact without deriving or reserving another change address.
+Mismatched, expired, or advanced-stage retries fail closed.
 
 ## Required startup sequence
 
 The product runtime must:
 
-1. open and migrate the database, remain locked, and request platform-backed
-   unlock;
-2. load persisted workflows and the last consistent chain checkpoints;
-3. resume HNS, Kyoto, and the selected Ethereum synchronization adapter;
-4. reconcile mempools, confirmations, replacements, and reorgs;
-5. revalidate name ownership/proofs and Shakedex listings;
-6. expire price rounds, intents, fill grants, approvals, and replay rows;
-7. restore swap sessions and independently verify every recorded funding,
+1. securely open and migrate the database, remain locked, and request
+   platform-backed unlock;
+2. finish any plaintext-migration checkpoint before exposing wallet state;
+3. load persisted workflows and the last consistent chain checkpoints;
+4. resume HNS, Kyoto, and the selected Ethereum synchronization adapter;
+5. reconcile mempools, confirmations, replacements, and reorgs from atomic,
+   validated evidence;
+6. revalidate split committed-proof/current name views and Shakedex listings,
+   while leaving name ownership watch-only until canonical state decoding;
+7. expire price rounds, intents, fill grants, approvals, and replay rows only
+   after their authenticated metadata verifies;
+8. restore swap sessions and independently verify every recorded funding,
    redemption, and refund;
-8. extract an on-chain preimage only from a verified spend/event;
-9. determine refund eligibility from validated local chain time; and
-10. surface user actions without automatically moving value.
+9. extract an on-chain preimage only from the exact verified spend/event;
+10. determine refund eligibility from validated local chain time; and
+11. surface user actions without automatically moving value.
 
-The library implements schema/migration, encrypted secret records, workflow
-CAS, and state-machine journals. A complete multi-chain startup supervisor,
-transaction rebroadcast policy, all entity-specific CRUD, and every reorg
-reconciliation path are not yet implemented.
+The HNS source implements bounded snapshot/reconciliation and prepared-
+transaction recovery, but the concrete async node adapter and complete
+multi-chain product supervisor are not integrated. The runtime therefore keeps
+HNS value operations release-gated.
 
 ## Migrations and backups
 
-Opening a database with a newer schema fails. Migration 1 is transactional.
-Future migrations must be forward-only, idempotently tested from every
-supported prior version, and retain an offline backup/restore test. Copying a
-live SQLite file without its WAL is not a supported backup procedure.
+Opening a database with a newer schema fails. Schema upgrades are transactional.
+After plaintext rows are encrypted and deleted, unlock records a checkpoint,
+truncates the WAL, clears the marker, and truncates again; an interrupted
+checkpoint is retried on the next unlock before state is returned.
 
-The passphrase is not a substitute for platform device security. A production
-backup design must document whether encrypted seeds are included, how KDF
-parameters are retained, and how rollback to stale workflow state is detected.
+Legacy schema-v1 provider grants and replay records have deterministic migration
+paths. Legacy pending approvals are discarded because their creation time and
+authority binding were not authenticated. Populated legacy funds-bearing entity
+tables fail closed with `LegacyEntityMigrationRequired`; a dedicated import tool
+must map them without ambiguity before unlock.
+
+On Linux, persistent database opening requires an owner-only regular file in an
+owner-only directory and uses SQLite's no-follow flag. Non-Linux persistent
+opening intentionally fails until an equivalent native secure-open and
+ownership policy exists. In-memory stores remain available for bounded tests.
+
+Copying a live SQLite file without its WAL is not a supported backup procedure.
+The passphrase is not a substitute for platform device security. Product backup
+design must document wrapped key handling, seed inclusion, retained KDF
+parameters, and stale-state rollback detection.

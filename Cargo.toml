@@ -36,6 +36,7 @@ hns-wallet-ethereum = { version = "0.1.0", path = "crates/hns-wallet-ethereum" }
 
 argon2 = "0.5.3"
 bech32 = "0.11.0"
+blake2 = "0.10.6"
 bip32 = { version = "0.5.3", features = ["secp256k1"] }
 bip39 = { version = "2.2.0", features = ["rand", "zeroize"] }
 chacha20poly1305 = "0.10.1"

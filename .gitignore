@@ -1,4 +1,6 @@
 /target/
+dist/
+**/dist/
 **/contracts/node_modules/
 **/contracts/build/
 *.sqlite

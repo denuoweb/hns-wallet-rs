@@ -379,7 +379,13 @@ pub enum ProviderAction {
 pub trait ProviderStateStore {
     fn permission(&self, origin: &Origin) -> Result<Option<PermissionRecord>, ProviderError>;
     fn save_permission(&mut self, record: &PermissionRecord) -> Result<(), ProviderError>;
-    fn revoke_permission(&mut self, origin: &Origin) -> Result<(), ProviderError>;
+    fn revoke_permission(
+        &mut self,
+        origin: &Origin,
+        expected_generation: u64,
+        next_generation: u64,
+        now_unix: u64,
+    ) -> Result<(), ProviderError>;
     fn consume_nonce(
         &mut self,
         origin: &Origin,
@@ -387,7 +393,11 @@ pub trait ProviderStateStore {
         now_unix: u64,
         expires_at_unix: u64,
     ) -> Result<(), ProviderError>;
-    fn save_pending(&mut self, approval: &PendingApproval) -> Result<(), ProviderError>;
+    fn save_pending(
+        &mut self,
+        approval: &PendingApproval,
+        now_unix: u64,
+    ) -> Result<(), ProviderError>;
 }
 
 impl ProviderStateStore for WalletStore {
@@ -407,8 +417,19 @@ impl ProviderStateStore for WalletStore {
         Ok(())
     }
 
-    fn revoke_permission(&mut self, origin: &Origin) -> Result<(), ProviderError> {
-        self.revoke_provider_permission(origin.as_str())?;
+    fn revoke_permission(
+        &mut self,
+        origin: &Origin,
+        expected_generation: u64,
+        next_generation: u64,
+        now_unix: u64,
+    ) -> Result<(), ProviderError> {
+        self.revoke_provider_permission(
+            origin.as_str(),
+            expected_generation,
+            next_generation,
+            now_unix,
+        )?;
         Ok(())
     }
 
@@ -423,11 +444,16 @@ impl ProviderStateStore for WalletStore {
         Ok(())
     }
 
-    fn save_pending(&mut self, approval: &PendingApproval) -> Result<(), ProviderError> {
+    fn save_pending(
+        &mut self,
+        approval: &PendingApproval,
+        now_unix: u64,
+    ) -> Result<(), ProviderError> {
         self.put_pending_approval(
             approval.id,
             approval.call.origin.as_str(),
             &serde_json::to_vec(approval)?,
+            now_unix,
             approval.expires_at_unix,
         )?;
         Ok(())
@@ -437,6 +463,7 @@ impl ProviderStateStore for WalletStore {
 #[derive(Default)]
 pub struct MemoryProviderState {
     permissions: BTreeMap<Origin, PermissionRecord>,
+    permission_generations: BTreeMap<Origin, u64>,
     nonces: BTreeMap<(Origin, u64), u64>,
     pending: BTreeMap<ApprovalId, PendingApproval>,
 }
@@ -447,13 +474,38 @@ impl ProviderStateStore for MemoryProviderState {
     }
 
     fn save_permission(&mut self, record: &PermissionRecord) -> Result<(), ProviderError> {
+        let expected = match self.permission_generations.get(&record.origin).copied() {
+            Some(current) => current.checked_add(1).ok_or(ProviderError::StaleContext)?,
+            None => record.generation,
+        };
+        if record.generation != expected {
+            return Err(ProviderError::StaleContext);
+        }
+        self.permission_generations
+            .insert(record.origin.clone(), record.generation);
         self.permissions
             .insert(record.origin.clone(), record.clone());
         Ok(())
     }
 
-    fn revoke_permission(&mut self, origin: &Origin) -> Result<(), ProviderError> {
+    fn revoke_permission(
+        &mut self,
+        origin: &Origin,
+        expected_generation: u64,
+        next_generation: u64,
+        _: u64,
+    ) -> Result<(), ProviderError> {
+        if self.permission_generations.get(origin).copied() != Some(expected_generation)
+            || next_generation
+                != expected_generation
+                    .checked_add(1)
+                    .ok_or(ProviderError::StaleContext)?
+        {
+            return Err(ProviderError::StaleContext);
+        }
         self.permissions.remove(origin);
+        self.permission_generations
+            .insert(origin.clone(), next_generation);
         Ok(())
     }
 
@@ -475,7 +527,7 @@ impl ProviderStateStore for MemoryProviderState {
         Ok(())
     }
 
-    fn save_pending(&mut self, approval: &PendingApproval) -> Result<(), ProviderError> {
+    fn save_pending(&mut self, approval: &PendingApproval, _: u64) -> Result<(), ProviderError> {
         self.pending.insert(approval.id, approval.clone());
         Ok(())
     }
@@ -501,15 +553,30 @@ impl<S: ProviderStateStore> ProviderCore<S> {
 
     pub fn update_binding(&mut self, binding: AuthorityBinding) -> Result<(), ProviderError> {
         binding.validate()?;
-        if binding.origin != self.binding.origin
-            || binding.browser_authority_session != self.binding.browser_authority_session
-            || binding.browser_authority_generation < self.binding.browser_authority_generation
-            || binding.policy_generation < self.binding.policy_generation
-            || binding.wallet_session < self.binding.wallet_session
-            || binding.permission_generation < self.binding.permission_generation
-            || binding.navigation_generation < self.binding.navigation_generation
+
+        let same_authority_session = binding.origin == self.binding.origin
+            && binding.namespace == self.binding.namespace
+            && binding.browser_authority_session == self.binding.browser_authority_session
+            && binding.wallet_session == self.binding.wallet_session;
+        if same_authority_session
+            && (binding.browser_authority_generation < self.binding.browser_authority_generation
+                || binding.policy_generation < self.binding.policy_generation
+                || binding.permission_generation < self.binding.permission_generation
+                || binding.navigation_generation < self.binding.navigation_generation)
         {
+            return Err(ProviderError::StaleContext);
+        }
+
+        let context_changed = binding != self.binding;
+        let session_changed = binding.origin != self.binding.origin
+            || binding.namespace != self.binding.namespace
+            || binding.browser_authority_session != self.binding.browser_authority_session
+            || binding.wallet_session != self.binding.wallet_session;
+        if context_changed {
             self.pending.clear();
+        }
+        if session_changed {
+            self.rate.clear();
         }
         self.binding = binding;
         Ok(())
@@ -577,7 +644,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
             navigation_generation: context.navigation_generation,
             expires_at_unix: replay_expiry,
         };
-        self.state.save_pending(&approval)?;
+        self.state.save_pending(&approval, context.now_unix)?;
         self.pending.insert(approval.id, approval.clone());
         Ok(ProviderAction::ApprovalRequired(approval))
     }
@@ -640,17 +707,22 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         Ok(record)
     }
 
-    pub fn revoke_permissions(&mut self, origin: &Origin) -> Result<(), ProviderError> {
+    pub fn revoke_permissions(
+        &mut self,
+        origin: &Origin,
+        now_unix: u64,
+    ) -> Result<(), ProviderError> {
         if origin != &self.binding.origin {
             return Err(ProviderError::Unauthorized);
         }
-        self.state.revoke_permission(origin)?;
-        self.pending.clear();
-        self.binding.permission_generation = self
-            .binding
-            .permission_generation
+        let expected_generation = self.binding.permission_generation;
+        let next_generation = expected_generation
             .checked_add(1)
             .ok_or(ProviderError::StaleContext)?;
+        self.state
+            .revoke_permission(origin, expected_generation, next_generation, now_unix)?;
+        self.pending.clear();
+        self.binding.permission_generation = next_generation;
         Ok(())
     }
 
@@ -923,5 +995,55 @@ mod tests {
             ),
             Err(ProviderError::InvalidParams)
         ));
+    }
+
+    #[test]
+    fn binding_generations_cannot_regress_within_one_session() {
+        let mut provider =
+            ProviderCore::new(binding(), MemoryProviderState::default()).expect("core");
+        let mut regressed = binding();
+        regressed.navigation_generation -= 1;
+        assert!(matches!(
+            provider.update_binding(regressed),
+            Err(ProviderError::StaleContext)
+        ));
+
+        let mut replacement_session = binding();
+        replacement_session.browser_authority_session = 100;
+        replacement_session.wallet_session = 200;
+        replacement_session.browser_authority_generation = 1;
+        replacement_session.policy_generation = 1;
+        replacement_session.permission_generation = 1;
+        replacement_session.navigation_generation = 1;
+        provider
+            .update_binding(replacement_session)
+            .expect("random session identities are not ordinal counters");
+    }
+
+    #[test]
+    fn permission_tombstone_prevents_generation_reset() {
+        let mut state = MemoryProviderState::default();
+        let record = PermissionRecord {
+            origin: origin(),
+            generation: 5,
+            capabilities: BTreeSet::from([PermissionCapability::Send]),
+            approved_names: BTreeSet::new(),
+            created_at_unix: 1,
+            expires_at_unix: None,
+        };
+        state.save_permission(&record).expect("trusted bootstrap");
+        state
+            .revoke_permission(&record.origin, 5, 6, 2)
+            .expect("revoke");
+        let mut reset = record.clone();
+        reset.generation = 6;
+        assert!(matches!(
+            state.save_permission(&reset),
+            Err(ProviderError::StaleContext)
+        ));
+        reset.generation = 7;
+        state
+            .save_permission(&reset)
+            .expect("next monotonic generation");
     }
 }

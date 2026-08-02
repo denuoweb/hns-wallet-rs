@@ -2,32 +2,75 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bech32::{Hrp, segwit};
 use bip39::{Language, Mnemonic};
+use blake2::Blake2bVar;
+use blake2::digest::{Update as BlakeUpdate, VariableOutput};
 use hkdf::Hkdf;
-use hns_covenants::{hash_name, validate_name};
-use hns_primitives::{NameHash, TreeRoot};
-use hns_urkel_proof::{ProofKind, UrkelProof};
-use hns_wallet_store::{SecretKind, StoreError, WalletStore};
-use hns_wallet_types::{
-    BaseUnits, DerivationReference, KeyRole, ObjectHash, TransactionHash, WalletId, WorkflowId,
-    WorkflowKind,
+use hns_covenants::{Covenant, hash_name, validate_name};
+use hns_primitives::{
+    Dollarydoos, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
 };
-use k256::ecdsa::{SigningKey, VerifyingKey};
-use ripemd::Ripemd160;
+use hns_script::{
+    OP_BLAKE160, OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF,
+    OP_EQUALVERIFY, OP_IF, OP_SHA256, SIGHASH_ALL, signature_hash,
+};
+use hns_transaction::{Address, Input, Outpoint, Output, Transaction, Witness};
+use hns_urkel_proof::{ProofKind, UrkelProof};
+use hns_wallet_chain_api::{
+    AtomicSettlement, AuthorizeSend, AuthorizedSend, BroadcastReceipt, BroadcastSend, ChainError,
+    ChainModule, HtlcLockRequest, HtlcRedeemRequest, HtlcRefundRequest, ModuleRegistry,
+    ObservePreimageRequest, ObserveSecretRequest, Preimage, PreparedArtifact, PreparedHtlcLock,
+    PreparedHtlcRedeem, PreparedHtlcRefund, PreparedSend, PreparedSettlementLock,
+    PreparedSettlementRedeem, PreparedSettlementRefund, RegistryError, SendRequest,
+    SettlementCapabilities, SettlementLockExpectation, SettlementLockRequest,
+    SettlementRedeemRequest, SettlementRefundRequest, Utxo, UtxoChainModule, UtxoFeePolicy,
+    VerifiedHtlcLock, VerifiedLock, VerifiedSettlementLock, VerifyHtlcLockRequest,
+    VerifySettlementLockRequest,
+};
+use hns_wallet_store::{
+    EntityBatchDelete, EntityBatchSave, EntityKind, SecretKind, StoreError, StoredEntity,
+    WalletStore,
+};
+use hns_wallet_types::{
+    AccountId, Amount, ApprovalId, BaseUnits, ChainCapabilities, DerivationReference, FeeModel,
+    FinalityModel, HashAlgorithm, KeyRole, LocalTransactionStatus, LocktimeModel, ModuleId,
+    ObjectHash, ReceiveTarget, SessionId, SignedBaseUnits, SyncPhase, SyncStatus, TransactionHash,
+    TransactionSummary, WalletAsset, WalletId, WorkflowId, WorkflowKind,
+};
+use k256::ecdsa::signature::hazmat::PrehashSigner;
+use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sha3::Sha3_256;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const HNS_DERIVATION_DOMAIN: &[u8] = b"hns-wallet-rs/hns-role-key/v1";
+pub const HNS_SETTLEMENT_KEY_DOMAIN: &[u8] = b"hns-wallet-rs/hns-settlement-key/v1";
 pub const MAX_RESTORE_LOOKAHEAD: u32 = 10_000;
+pub const MAX_RESTORE_SCRIPTS_PER_QUERY: usize = 10_000;
 pub const DEFAULT_RESTORE_LOOKAHEAD: u32 = 100;
 pub const MAX_WALLET_COINS: usize = 10_000;
 pub const MAX_HISTORY_RESULTS: usize = 10_000;
+pub const MAX_RECOVERY_CHECKPOINTS: usize = 288;
+pub const MAX_TRANSACTION_INPUTS: usize = 10_000;
+pub const PREPARED_ARTIFACT_LIFETIME_SECONDS: u64 = 300;
+pub const DEFAULT_DUST_THRESHOLD: u128 = 546;
+pub const HNS_LOCKTIME_THRESHOLD: u64 = 500_000_000;
+pub const MAX_SCAN_PAGE_RESULTS: usize = 1_000;
+pub const MAX_SCAN_CURSOR_BYTES: usize = 256;
+pub const MAX_SCAN_PAGES: usize = 128;
+pub const MAX_SNAPSHOT_RESTARTS: usize = 3;
+/// Release gate: value operations stay unavailable until the concrete atomic
+/// node-evidence adapter and the complete runtime qualification suite land.
+pub const HNS_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HnsNetwork {
     Mainnet,
@@ -189,8 +232,7 @@ pub fn receive_address(
     network: HnsNetwork,
     compressed_public_key: &[u8; 33],
 ) -> Result<String, HnsWalletError> {
-    let sha = Sha256::digest(compressed_public_key);
-    let program = Ripemd160::digest(sha);
+    let program = public_key_hash(compressed_public_key)?;
     let hrp = Hrp::parse(network.hrp()).map_err(|_| HnsWalletError::Address)?;
     segwit::encode_v0(hrp, &program).map_err(|_| HnsWalletError::Address)
 }
@@ -257,30 +299,41 @@ pub struct CoinSelection {
 
 pub trait HnsBackend {
     fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError>;
-    fn get_raw_transaction(&self, txid: TransactionHash)
-    -> Result<Option<Vec<u8>>, HnsWalletError>;
-    fn get_transaction_status(
+    fn get_block_hash(&self, height: u64) -> Result<Option<[u8; 32]>, HnsWalletError>;
+    /// Pages confirmed history and UTXOs over the complete sorted script set.
+    /// The adapter must reject a stale epoch/cursor with `StaleNodeSnapshot`.
+    fn get_confirmed_wallet_page(
+        &self,
+        request: ConfirmedWalletPageRequest<'_>,
+    ) -> Result<ConfirmedWalletPage, HnsWalletError>;
+    /// Pages mempool history at one node-instance/generation pair, also tied
+    /// to the confirmed chain binding and exact script set. The adapter must
+    /// reject a stale instance, generation, script set, or cursor.
+    fn get_mempool_wallet_page(
+        &self,
+        request: MempoolWalletPageRequest<'_>,
+    ) -> Result<MempoolWalletPage, HnsWalletError>;
+    /// Returns raw bytes, status, and inclusion from one canonical snapshot.
+    /// A pruned node may omit raw bytes, but not the other fields.
+    fn get_transaction_evidence(
         &self,
         txid: TransactionHash,
-    ) -> Result<TransactionStatus, HnsWalletError>;
-    fn get_transaction_inclusion(
+        binding: SnapshotBinding,
+    ) -> Result<TransactionEvidence, HnsWalletError>;
+    fn get_outpoint_spend_evidence(
         &self,
-        txid: TransactionHash,
-    ) -> Result<Option<TransactionInclusion>, HnsWalletError>;
-    fn get_script_history(&self, scripts: &[Vec<u8>]) -> Result<Vec<HistoryEntry>, HnsWalletError>;
-    fn get_script_utxos(&self, scripts: &[Vec<u8>]) -> Result<Vec<WalletCoin>, HnsWalletError>;
-    fn get_spending_transaction(
-        &self,
-        outpoint: HnsOutpoint,
-    ) -> Result<Option<TransactionHash>, HnsWalletError>;
+        outpoints: &[HnsOutpoint],
+        binding: SnapshotBinding,
+    ) -> Result<OutpointSpendEvidence, HnsWalletError>;
     fn broadcast_transaction(&self, raw: &[u8]) -> Result<TransactionHash, HnsWalletError>;
     fn estimate_fee_rate(&self, target_blocks: u16) -> Result<BaseUnits, HnsWalletError>;
-    fn get_name_state(&self, name_hash: [u8; 32]) -> Result<Option<Vec<u8>>, HnsWalletError>;
-    fn get_name_proof(&self, name_hash: [u8; 32]) -> Result<NameProofResponse, HnsWalletError>;
-    fn get_name_owner_transaction(
+    /// Returns the interval-committed proof view and current name view without
+    /// collapsing them. Every field is tied to the supplied snapshot binding.
+    fn get_name_evidence(
         &self,
         name_hash: [u8; 32],
-    ) -> Result<Option<Vec<u8>>, HnsWalletError>;
+        binding: SnapshotBinding,
+    ) -> Result<NameEvidence, HnsWalletError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -288,6 +341,12 @@ pub struct ChainTip {
     pub height: u64,
     pub block_hash: [u8; 32],
     pub tree_root: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotBinding {
+    pub tip: ChainTip,
+    pub chain_epoch: ObjectHash,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -309,6 +368,86 @@ pub struct HistoryEntry {
     pub txid: TransactionHash,
     pub height: Option<u64>,
     pub spent: bool,
+    pub first_seen_unix: u64,
+    pub script_index: u32,
+}
+
+/// One backend UTXO tied to the index of the requested script. Returning the
+/// index instead of wallet derivation data keeps the node boundary watch-only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexedWalletCoin {
+    pub coin: WalletCoin,
+    pub script_index: u32,
+    /// Canonical output address observed by the node. It must equal the exact
+    /// requested version/hash pair, not merely its hash bytes.
+    pub output_address: WalletAddressKey,
+}
+
+/// Exact canonical Handshake address input for the node's ScriptId conversion.
+/// The current wallet derives version-0 public-key-hash addresses only.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct WalletAddressKey {
+    pub version: u8,
+    pub hash: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfirmedWalletPageRequest<'a> {
+    pub scripts: &'a [WalletAddressKey],
+    pub expected_tip: ChainTip,
+    pub expected_epoch: Option<ObjectHash>,
+    pub cursor: Option<&'a [u8]>,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfirmedWalletPage {
+    pub binding: SnapshotBinding,
+    pub next_cursor: Option<Vec<u8>>,
+    pub history: Vec<HistoryEntry>,
+    pub utxos: Vec<IndexedWalletCoin>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MempoolWalletPageRequest<'a> {
+    pub scripts: &'a [WalletAddressKey],
+    pub binding: SnapshotBinding,
+    /// The adapter must bind this instance/generation pair, the exact sorted
+    /// script set, and the cursor into one page query.
+    pub expected_mempool: Option<MempoolSnapshotBinding>,
+    pub cursor: Option<&'a [u8]>,
+    pub limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MempoolSnapshotBinding {
+    /// Nonpersistent node-process identity. It prevents a generation counter
+    /// reset after restart from being mistaken for the prior mempool view.
+    pub instance_nonce: [u8; 32],
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MempoolWalletPage {
+    pub binding: SnapshotBinding,
+    pub mempool: MempoolSnapshotBinding,
+    pub next_cursor: Option<Vec<u8>>,
+    pub history: Vec<HistoryEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransactionEvidence {
+    pub binding: SnapshotBinding,
+    pub raw: Option<Vec<u8>>,
+    pub status: TransactionStatus,
+    pub inclusion: Option<TransactionInclusion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutpointSpendEvidence {
+    pub binding: SnapshotBinding,
+    /// Exactly one entry per requested outpoint, in request order.
+    pub spenders: Vec<Option<TransactionHash>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -317,8 +456,43 @@ pub struct NameProofResponse {
     pub tree_root: [u8; 32],
     pub proof: Vec<u8>,
     pub proof_height: u64,
-    pub raw_resource: Vec<u8>,
-    pub owner_outpoint: Option<HnsOutpoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameEvidence {
+    pub binding: SnapshotBinding,
+    pub proof: NameProofResponse,
+    /// The interval-committed state bytes. These must exactly equal the bytes
+    /// recovered by strict Urkel proof verification.
+    pub proof_state: Option<Vec<u8>>,
+    /// Node-decoded hint, not independently linked to `proof_state` until a
+    /// released canonical NameState decoder is available.
+    pub proof_owner_outpoint: Option<HnsOutpoint>,
+    pub proof_owner_transaction: Option<Vec<u8>>,
+    /// The node's current canonical view at `binding`. It may differ from the
+    /// most recently committed name-tree proof view.
+    pub current_state: Option<Vec<u8>>,
+    /// Node-decoded hint, not independently linked to `current_state` yet.
+    pub current_owner_outpoint: Option<HnsOutpoint>,
+    pub current_owner_transaction: Option<Vec<u8>>,
+    /// Resource bytes cannot yet be parsed from and bound to canonical name
+    /// state by a released `hns-rs` API. Callers must not display these as
+    /// proof-authenticated.
+    pub untrusted_current_raw_resource: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameResourceStatus {
+    UnavailableCanonicalBinding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameOwnershipStatus {
+    /// The released protocol crates cannot yet decode canonical NameState and
+    /// bind its owner fields to the separately returned owner transaction.
+    WatchOnlyCanonicalStateDecoderUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -326,14 +500,26 @@ pub struct KnownName {
     pub name: Vec<u8>,
     pub name_hash: [u8; 32],
     pub proof_height: u64,
-    pub owner_outpoint: Option<HnsOutpoint>,
-    pub raw_state: Option<Vec<u8>>,
-    pub raw_resource: Vec<u8>,
+    pub unbound_proof_owner_outpoint: Option<HnsOutpoint>,
+    pub unbound_current_owner_outpoint: Option<HnsOutpoint>,
+    pub proof_state: Option<Vec<u8>>,
+    pub current_state: Option<Vec<u8>>,
+    pub resource_status: NameResourceStatus,
+    pub ownership_status: NameOwnershipStatus,
 }
 
 pub fn import_known_name<B: HnsBackend>(
     backend: &B,
     name: &[u8],
+    binding: SnapshotBinding,
+) -> Result<KnownName, HnsWalletError> {
+    validated_name_evidence(backend, name, binding)
+}
+
+fn validated_name_evidence<B: HnsBackend>(
+    backend: &B,
+    name: &[u8],
+    binding: SnapshotBinding,
 ) -> Result<KnownName, HnsWalletError> {
     if !validate_name(name) {
         return Err(HnsWalletError::InvalidName);
@@ -341,33 +527,74 @@ pub fn import_known_name<B: HnsBackend>(
     let name_hash = hash_name(name)
         .map_err(|_| HnsWalletError::InvalidName)?
         .into_bytes();
-    let response = backend.get_name_proof(name_hash)?;
-    if response.name_hash != name_hash {
+    let evidence = backend.get_name_evidence(name_hash, binding)?;
+    if evidence.binding != binding {
+        return Err(HnsWalletError::StaleNodeSnapshot);
+    }
+    let response = &evidence.proof;
+    if response.name_hash != name_hash
+        || response.tree_root != binding.tip.tree_root
+        || response.proof_height != binding.tip.height
+    {
         return Err(HnsWalletError::InvalidEvidence);
     }
     let proof = UrkelProof {
         name_hash: NameHash::new(name_hash),
-        kind: if response.owner_outpoint.is_some() {
+        kind: if evidence.proof_state.is_some() {
             ProofKind::Inclusion
         } else {
             ProofKind::NonInclusion
         },
-        raw: response.proof,
+        raw: response.proof.clone(),
     };
-    let raw_state = proof
+    let proof_state = proof
         .verify_strict(TreeRoot::new(response.tree_root))
         .map_err(|_| HnsWalletError::InvalidEvidence)?;
-    if response.owner_outpoint.is_some() != raw_state.is_some() {
+    if proof_state != evidence.proof_state
+        || (evidence.proof_state.is_none() && evidence.proof_owner_outpoint.is_some())
+        || (evidence.current_state.is_none() && evidence.current_owner_outpoint.is_some())
+        || evidence.proof_owner_outpoint.is_some() != evidence.proof_owner_transaction.is_some()
+        || evidence.current_owner_outpoint.is_some() != evidence.current_owner_transaction.is_some()
+    {
         return Err(HnsWalletError::InvalidEvidence);
     }
+    validate_name_owner_transaction(
+        evidence.proof_owner_outpoint,
+        evidence.proof_owner_transaction.as_deref(),
+    )?;
+    validate_name_owner_transaction(
+        evidence.current_owner_outpoint,
+        evidence.current_owner_transaction.as_deref(),
+    )?;
     Ok(KnownName {
         name: name.to_vec(),
         name_hash,
         proof_height: response.proof_height,
-        owner_outpoint: response.owner_outpoint,
-        raw_state,
-        raw_resource: response.raw_resource,
+        unbound_proof_owner_outpoint: evidence.proof_owner_outpoint,
+        unbound_current_owner_outpoint: evidence.current_owner_outpoint,
+        proof_state,
+        current_state: evidence.current_state,
+        resource_status: NameResourceStatus::UnavailableCanonicalBinding,
+        ownership_status: NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable,
     })
+}
+
+fn validate_name_owner_transaction(
+    owner: Option<HnsOutpoint>,
+    raw: Option<&[u8]>,
+) -> Result<(), HnsWalletError> {
+    match (owner, raw) {
+        (None, None) => Ok(()),
+        (Some(owner), Some(raw)) => {
+            let transaction = decode_transaction_for_id(raw, owner.transaction)?;
+            transaction
+                .outputs
+                .get(owner.output_index as usize)
+                .ok_or(HnsWalletError::InvalidEvidence)?;
+            Ok(())
+        }
+        _ => Err(HnsWalletError::InvalidEvidence),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -421,6 +648,3934 @@ impl NameOperation {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HnsRuntimeConfig {
+    pub wallet_id: WalletId,
+    pub account_id: AccountId,
+    /// Stable HD account component. It is deliberately independent of the
+    /// random wallet-local `AccountId` and must be backed up with the profile.
+    pub account_derivation_index: u32,
+    pub network: HnsNetwork,
+    pub birthday_height: u64,
+    pub restore_lookahead: u32,
+    pub minimum_confirmations: u32,
+    pub dust_threshold: BaseUnits,
+    /// This is an application release-policy switch, not a test-network check.
+    pub value_operations_enabled: bool,
+    pub settlement_enabled: bool,
+}
+
+impl HnsRuntimeConfig {
+    pub fn validate(&self) -> Result<(), HnsWalletError> {
+        if self.restore_lookahead == 0
+            || self.restore_lookahead > MAX_RESTORE_LOOKAHEAD
+            || self.restore_lookahead as usize * 2 > MAX_RESTORE_SCRIPTS_PER_QUERY
+        {
+            return Err(HnsWalletError::InvalidLookahead);
+        }
+        if self.minimum_confirmations == 0 || self.dust_threshold.is_zero() {
+            return Err(HnsWalletError::InvalidRuntimeConfiguration);
+        }
+        if self.network == HnsNetwork::Mainnet
+            && (self.value_operations_enabled || self.settlement_enabled)
+        {
+            return Err(HnsWalletError::MainnetDisabled);
+        }
+        if !HNS_VALUE_RUNTIME_RELEASE_QUALIFIED
+            && (self.value_operations_enabled || self.settlement_enabled)
+        {
+            return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HnsAccountRecord {
+    pub config: HnsRuntimeConfig,
+    pub next_receive_index: u32,
+    pub next_change_index: u32,
+    pub external_scan_end: u32,
+    pub internal_scan_end: u32,
+    pub last_used_external: Option<u32>,
+    pub last_used_internal: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DerivedHnsAddress {
+    pub account_id: AccountId,
+    pub derivation: DerivationReference,
+    pub address: String,
+    pub program: Vec<u8>,
+    pub used: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrackedHnsCoin {
+    pub coin: WalletCoin,
+    pub derivation: DerivationReference,
+    pub address_program: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HnsTransactionRecord {
+    pub summary: TransactionSummary,
+    pub raw: Vec<u8>,
+    pub inclusion: Option<TransactionInclusion>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HnsChainCheckpoint {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HnsRecoveryState {
+    pub checkpoints: Vec<HnsChainCheckpoint>,
+    pub last_tip: Option<ChainTip>,
+    pub last_common_ancestor: Option<u64>,
+    pub last_reconciled_unix: u64,
+}
+
+impl Default for HnsRecoveryState {
+    fn default() -> Self {
+        Self {
+            checkpoints: Vec::new(),
+            last_tip: None,
+            last_common_ancestor: None,
+            last_reconciled_unix: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HnsReconciliationReport {
+    pub tip: ChainTip,
+    pub common_ancestor: Option<u64>,
+    pub reorg_detected: bool,
+    pub restored_utxos: usize,
+    pub reconciled_transactions: usize,
+    pub revalidated_names: usize,
+    pub pending_user_actions: Vec<WorkflowId>,
+}
+
+pub trait HnsClock: Send + Sync {
+    fn now_unix(&self) -> Result<u64, HnsWalletError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl HnsClock for SystemClock {
+    fn now_unix(&self) -> Result<u64, HnsWalletError> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| HnsWalletError::Clock)
+            .map(|duration| duration.as_secs())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HnsRuntimeCache {
+    account: HnsAccountRecord,
+    account_revision: u64,
+    sync: SyncStatus,
+    coins: Vec<TrackedHnsCoin>,
+    transactions: Vec<HnsTransactionRecord>,
+    binding: Option<SnapshotBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HnsSendStage {
+    Prepared,
+    Authorized,
+    Broadcast,
+    Mempool,
+    Confirmed,
+    Conflicted,
+    RequiresRebroadcast,
+    Expired,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct HnsSpendPlan {
+    wallet_id: WalletId,
+    account_id: AccountId,
+    workflow_id: WorkflowId,
+    request_nonce: u64,
+    unsigned_transaction: Vec<u8>,
+    inputs: Vec<TrackedHnsCoin>,
+    amount: BaseUnits,
+    fee: BaseUnits,
+    maximum_fee: BaseUnits,
+    destination: String,
+    expires_at_unix: u64,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct HnsSendWorkflow {
+    plan: HnsSpendPlan,
+    stage: HnsSendStage,
+    transaction: Option<TransactionHash>,
+    signed_transaction: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for HnsSendWorkflow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HnsSendWorkflow")
+            .field("workflow_id", &self.plan.workflow_id)
+            .field("stage", &self.stage)
+            .field("transaction", &self.transaction)
+            .field(
+                "signed_transaction",
+                &self.signed_transaction.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct HnsSendApproval {
+    workflow_id: WorkflowId,
+    commitment: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct HnsInputReservation {
+    wallet_id: WalletId,
+    account_id: AccountId,
+    outpoint: HnsOutpoint,
+    workflow_id: WorkflowId,
+    expires_at_unix: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HnsSettlementAction {
+    Lock,
+    Redeem,
+    Refund,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HnsSettlementStage {
+    Prepared,
+    Broadcast,
+    Mempool,
+    Confirmed,
+    Conflicted,
+    RequiresRebroadcast,
+    Expired,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "action")]
+enum HnsSettlementTerms {
+    Lock { request: SettlementLockRequest },
+    Redeem { lock: VerifiedLock },
+    Refund { lock: VerifiedLock },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct HnsVerifiedSettlementRecord {
+    expected: SettlementLockExpectation,
+    verified: VerifiedLock,
+    output_index: u32,
+    script: Vec<u8>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct HnsPreparedSettlement {
+    wallet_id: WalletId,
+    account_id: AccountId,
+    workflow_id: WorkflowId,
+    session_id: SessionId,
+    action: HnsSettlementAction,
+    stage: HnsSettlementStage,
+    transaction: TransactionHash,
+    signed_transaction: Vec<u8>,
+    fee: BaseUnits,
+    expires_at_unix: u64,
+    terms: HnsSettlementTerms,
+}
+
+impl fmt::Debug for HnsPreparedSettlement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HnsPreparedSettlement")
+            .field("workflow_id", &self.workflow_id)
+            .field("session_id", &self.session_id)
+            .field("action", &self.action)
+            .field("stage", &self.stage)
+            .field("transaction", &self.transaction)
+            .field("fee", &self.fee)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("terms", &self.terms)
+            .field("signed_transaction", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub struct HnsWalletRuntime<B, C = SystemClock> {
+    backend: B,
+    clock: C,
+    store: Mutex<WalletStore>,
+    cache: RwLock<HnsRuntimeCache>,
+}
+
+impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
+    pub fn open(
+        backend: B,
+        mut store: WalletStore,
+        config: HnsRuntimeConfig,
+        clock: C,
+    ) -> Result<Self, HnsWalletError> {
+        config.validate()?;
+        if store.is_locked() {
+            return Err(HnsWalletError::StoreLocked);
+        }
+        if store
+            .wallet_accounts::<HnsAccountRecord>(MAX_HISTORY_RESULTS)?
+            .into_iter()
+            .any(|stored| {
+                stored.value.config.wallet_id == config.wallet_id
+                    && stored.value.config.account_id != config.account_id
+                    && stored.value.config.account_derivation_index
+                        == config.account_derivation_index
+            })
+        {
+            return Err(HnsWalletError::DuplicateAccountDerivation);
+        }
+        let existing: Option<StoredEntity<HnsAccountRecord>> =
+            store.wallet_account(&account_entity_id(&config))?;
+        let (account, account_revision) = match existing {
+            Some(mut stored) => {
+                if !same_account_identity(&stored.value.config, &config) {
+                    return Err(HnsWalletError::AccountConfigurationMismatch);
+                }
+                if stored.value.config != config {
+                    stored.value.config = config;
+                    stored.revision = store.save_wallet_account(
+                        &account_entity_id(&stored.value.config),
+                        stored.revision,
+                        &stored.value,
+                        clock.now_unix()?,
+                    )?;
+                }
+                (stored.value, stored.revision)
+            }
+            None => {
+                let external_scan_end = config.restore_lookahead - 1;
+                let account = HnsAccountRecord {
+                    config,
+                    next_receive_index: 0,
+                    next_change_index: 0,
+                    external_scan_end,
+                    internal_scan_end: external_scan_end,
+                    last_used_external: None,
+                    last_used_internal: None,
+                };
+                let revision = store.save_wallet_account(
+                    &account_entity_id(&account.config),
+                    0,
+                    &account,
+                    clock.now_unix()?,
+                )?;
+                (account, revision)
+            }
+        };
+        let coins = store
+            .hns_utxos::<TrackedHnsCoin>(MAX_HISTORY_RESULTS)?
+            .into_iter()
+            .filter(|entity| {
+                entity
+                    .id
+                    .starts_with(&account_entity_prefix(&account.config))
+            })
+            .map(|entity| entity.value)
+            .collect();
+        let transactions = store
+            .hns_transactions::<HnsTransactionRecord>(MAX_HISTORY_RESULTS)?
+            .into_iter()
+            .filter(|entity| {
+                entity
+                    .id
+                    .starts_with(&account_entity_prefix(&account.config))
+            })
+            .map(|entity| entity.value)
+            .collect();
+        Ok(Self {
+            backend,
+            clock,
+            store: Mutex::new(store),
+            cache: RwLock::new(HnsRuntimeCache {
+                account,
+                account_revision,
+                sync: SyncStatus {
+                    phase: SyncPhase::Starting,
+                    validated_height: 0,
+                    scanned_height: 0,
+                    target_height: None,
+                    last_error: None,
+                },
+                coins,
+                transactions,
+                binding: None,
+            }),
+        })
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn register<'a>(&'a self, registry: &mut ModuleRegistry<'a>) -> Result<(), RegistryError> {
+        registry.register_utxo_settlement(self)
+    }
+
+    /// Called only after the trusted approval UI has compared the complete
+    /// prepared artifact. The stored commitment is encrypted and single-use.
+    pub fn register_send_approval(
+        &self,
+        approval_id: ApprovalId,
+        origin: &str,
+        prepared: &PreparedSend,
+        expires_at_unix: u64,
+    ) -> Result<(), HnsWalletError> {
+        let now = self.clock.now_unix()?;
+        let plan: HnsSpendPlan = serde_json::from_slice(prepared.authorization_commitment())
+            .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+        if prepared.module != ModuleId::Handshake
+            || plan.expires_at_unix != prepared.expires_at_unix
+            || plan.amount != prepared.amount.base_units
+            || plan.fee != prepared.fee
+            || plan.destination != prepared.destination
+            || expires_at_unix > plan.expires_at_unix
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let approval = HnsSendApproval {
+            workflow_id: plan.workflow_id,
+            commitment: Sha256::digest(prepared.authorization_commitment()).into(),
+        };
+        let encoded = Zeroizing::new(serde_json::to_vec(&approval)?);
+        self.store_lock()?.put_pending_approval(
+            approval_id,
+            origin,
+            &encoded,
+            now,
+            expires_at_unix,
+        )?;
+        Ok(())
+    }
+
+    pub fn rebroadcast_pending_send(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<BroadcastReceipt, HnsWalletError> {
+        let now = self.clock.now_unix()?;
+        let mut store = self.store_lock()?;
+        let stored = store
+            .load_workflow::<HnsSendWorkflow>(workflow_id)?
+            .ok_or(HnsWalletError::InvalidWorkflow)?;
+        if !matches!(
+            stored.state.stage,
+            HnsSendStage::Authorized
+                | HnsSendStage::Broadcast
+                | HnsSendStage::Mempool
+                | HnsSendStage::RequiresRebroadcast
+        ) {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
+        let raw = stored
+            .state
+            .signed_transaction
+            .clone()
+            .ok_or(HnsWalletError::InvalidWorkflow)?;
+        let expected = stored
+            .state
+            .transaction
+            .ok_or(HnsWalletError::InvalidWorkflow)?;
+        let actual = self.backend.broadcast_transaction(&raw)?;
+        if actual != expected {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let mut state = stored.state;
+        state.stage = HnsSendStage::Broadcast;
+        store.save_workflow(
+            workflow_id,
+            WorkflowKind::HnsSend,
+            stored.revision,
+            &state,
+            true,
+            now,
+        )?;
+        Ok(BroadcastReceipt {
+            module: ModuleId::Handshake,
+            txid: actual,
+            accepted_at_unix: now,
+        })
+    }
+
+    pub fn import_name(&self, name: &[u8]) -> Result<KnownName, HnsWalletError> {
+        let now = self.clock.now_unix()?;
+        let cache = self.cache_read()?;
+        let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        let current = import_known_name(&self.backend, name, binding)?;
+        let id = namespaced_name_id(&config, current.name_hash);
+        let mut store = self.store_lock()?;
+        let revision = store
+            .known_name::<KnownName>(&id)?
+            .map_or(0, |stored| stored.revision);
+        store.save_known_name(&id, revision, &current, now)?;
+        Ok(current)
+    }
+
+    pub fn cancel_prepared_send(&self, workflow_id: WorkflowId) -> Result<(), HnsWalletError> {
+        let now = self.clock.now_unix()?;
+        let config = self.cache_read()?.account.config.clone();
+        let mut store = self.store_lock()?;
+        let stored = store
+            .load_workflow::<HnsSendWorkflow>(workflow_id)?
+            .ok_or(HnsWalletError::InvalidWorkflow)?;
+        if stored.state.plan.wallet_id != config.wallet_id
+            || stored.state.plan.account_id != config.account_id
+            || stored.state.stage != HnsSendStage::Prepared
+        {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
+        let mut state = stored.state;
+        state.stage = HnsSendStage::Cancelled;
+        let deletes = reservation_deletes(&store, &config, workflow_id)?;
+        store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+            workflow_id,
+            WorkflowKind::HnsSend,
+            stored.revision,
+            &state,
+            false,
+            now,
+            EntityKind::InputReservation,
+            &[],
+            &deletes,
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_prepared_settlement(
+        &self,
+        artifact: &PreparedArtifact,
+    ) -> Result<(), HnsWalletError> {
+        if artifact.module != ModuleId::Handshake {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let prepared: HnsPreparedSettlement = serde_json::from_slice(artifact.commitment_bytes())?;
+        if prepared.stage != HnsSettlementStage::Prepared
+            || prepared.session_id != artifact.session_id
+            || prepared.fee != artifact.fee
+            || prepared.expires_at_unix != artifact.expires_at_unix
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let now = self.clock.now_unix()?;
+        let config = self.cache_read()?.account.config.clone();
+        let kind = settlement_workflow_kind(prepared.action);
+        let mut store = self.store_lock()?;
+        let mut stored = store
+            .load_workflow::<HnsPreparedSettlement>(prepared.workflow_id)?
+            .ok_or(HnsWalletError::InvalidWorkflow)?;
+        if stored.kind != kind
+            || stored.state.stage != HnsSettlementStage::Prepared
+            || !same_prepared_settlement(&stored.state, &prepared)
+        {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
+        stored.state.stage = HnsSettlementStage::Cancelled;
+        let deletes = if stored.state.action == HnsSettlementAction::Lock {
+            reservation_deletes(&store, &config, stored.id)?
+        } else {
+            Vec::new()
+        };
+        store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+            stored.id,
+            kind,
+            stored.revision,
+            &stored.state,
+            false,
+            now,
+            EntityKind::InputReservation,
+            &[],
+            &deletes,
+        )?;
+        Ok(())
+    }
+
+    pub fn settlement_key_target(
+        &self,
+        session_id: SessionId,
+        refund: bool,
+    ) -> Result<String, HnsWalletError> {
+        let account = self.cache_read()?.account.clone();
+        derive_settlement_public_key(&self.store_lock()?, &account, session_id, refund)
+            .map(hex::encode)
+    }
+
+    pub fn broadcast_prepared_settlement(
+        &self,
+        artifact: &PreparedArtifact,
+    ) -> Result<BroadcastReceipt, HnsWalletError> {
+        if artifact.module != ModuleId::Handshake {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let prepared: HnsPreparedSettlement = serde_json::from_slice(artifact.commitment_bytes())?;
+        if prepared.session_id != artifact.session_id
+            || prepared.stage != HnsSettlementStage::Prepared
+            || prepared.fee != artifact.fee
+            || prepared.expires_at_unix != artifact.expires_at_unix
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let transaction =
+            decode_transaction_for_id(&prepared.signed_transaction, prepared.transaction)?;
+        let transaction_id = wallet_transaction_hash(&transaction)?;
+        if transaction_id != prepared.transaction {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let now = self.clock.now_unix()?;
+        let config = self.cache_read()?.account.config.clone();
+        if prepared.wallet_id != config.wallet_id || prepared.account_id != config.account_id {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let mut store = self.store_lock()?;
+        let kind = settlement_workflow_kind(prepared.action);
+        let mut stored = store
+            .load_workflow::<HnsPreparedSettlement>(prepared.workflow_id)?
+            .ok_or(HnsWalletError::InvalidWorkflow)?;
+        if stored.kind != kind || !same_prepared_settlement(&stored.state, &prepared) {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
+        if stored.state.stage == HnsSettlementStage::Confirmed {
+            return Ok(BroadcastReceipt {
+                module: ModuleId::Handshake,
+                txid: stored.state.transaction,
+                accepted_at_unix: now,
+            });
+        }
+        if now >= stored.state.expires_at_unix {
+            if stored.state.stage == HnsSettlementStage::Prepared {
+                stored.state.stage = HnsSettlementStage::Expired;
+                let deletes = if stored.state.action == HnsSettlementAction::Lock {
+                    reservation_deletes(&store, &config, stored.id)?
+                } else {
+                    Vec::new()
+                };
+                store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+                    stored.id,
+                    kind,
+                    stored.revision,
+                    &stored.state,
+                    false,
+                    now,
+                    EntityKind::InputReservation,
+                    &[],
+                    &deletes,
+                )?;
+            }
+            return Err(HnsWalletError::PreparedArtifactExpired);
+        }
+        if !matches!(
+            stored.state.stage,
+            HnsSettlementStage::Prepared
+                | HnsSettlementStage::Broadcast
+                | HnsSettlementStage::Mempool
+                | HnsSettlementStage::RequiresRebroadcast
+        ) {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
+        let accepted = self
+            .backend
+            .broadcast_transaction(&prepared.signed_transaction)?;
+        if accepted != prepared.transaction {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        stored.state.stage = HnsSettlementStage::Broadcast;
+        let activation_saves = if stored.state.action == HnsSettlementAction::Lock {
+            reservation_activation_saves(&store, &config, stored.id, now)?
+        } else {
+            Vec::new()
+        };
+        store.save_workflow_with_entity_batch(
+            stored.id,
+            kind,
+            stored.revision,
+            &stored.state,
+            true,
+            now,
+            EntityKind::InputReservation,
+            &activation_saves,
+            &[],
+        )?;
+        Ok(BroadcastReceipt {
+            module: ModuleId::Handshake,
+            txid: accepted,
+            accepted_at_unix: now,
+        })
+    }
+
+    fn persist_prepared_settlement(
+        &self,
+        session_id: SessionId,
+        action: HnsSettlementAction,
+        signed_transaction: Vec<u8>,
+        fee: BaseUnits,
+        terms: HnsSettlementTerms,
+        reservation_saves: &[EntityBatchSave<HnsInputReservation>],
+        account_save: Option<&EntityBatchSave<HnsAccountRecord>>,
+        now_unix: u64,
+    ) -> Result<PreparedArtifact, HnsWalletError> {
+        let account = self.cache_read()?.account.clone();
+        let transaction = Transaction::decode(&signed_transaction)
+            .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+        let transaction = wallet_transaction_hash(&transaction)?;
+        let workflow_id = settlement_workflow_id(&account.config, session_id, action);
+        let expires_at_unix = now_unix
+            .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
+            .ok_or(HnsWalletError::Arithmetic)?;
+        let prepared = HnsPreparedSettlement {
+            wallet_id: account.config.wallet_id,
+            account_id: account.config.account_id,
+            workflow_id,
+            session_id,
+            action,
+            stage: HnsSettlementStage::Prepared,
+            transaction,
+            signed_transaction,
+            fee,
+            expires_at_unix,
+            terms,
+        };
+        let kind = settlement_workflow_kind(action);
+        let artifact = Self::prepared_settlement_artifact(&prepared)?;
+        let mut store = self.store_lock()?;
+        match store.load_workflow::<HnsPreparedSettlement>(workflow_id)? {
+            Some(stored) if stored.state == prepared && stored.kind == kind => {}
+            Some(_) => return Err(HnsWalletError::InvalidWorkflow),
+            None => {
+                if let Some(account_save) = account_save {
+                    let (_, next_account_revision) = store
+                        .save_workflow_with_account_and_entity_batch(
+                            workflow_id,
+                            kind,
+                            0,
+                            &prepared,
+                            true,
+                            now_unix,
+                            account_save,
+                            EntityKind::InputReservation,
+                            reservation_saves,
+                            &[],
+                        )?;
+                    self.install_committed_account(
+                        account_save.expected_revision,
+                        next_account_revision,
+                        account_save.value.clone(),
+                    )?;
+                } else {
+                    store.save_workflow_with_entity_batch(
+                        workflow_id,
+                        kind,
+                        0,
+                        &prepared,
+                        true,
+                        now_unix,
+                        EntityKind::InputReservation,
+                        reservation_saves,
+                        &[],
+                    )?;
+                }
+            }
+        }
+        Ok(artifact)
+    }
+
+    fn prepare_settlement_spend(
+        &self,
+        session_id: SessionId,
+        lock: VerifiedLock,
+        preimage: Option<Preimage>,
+        maximum_fee: BaseUnits,
+        current_height: Option<u64>,
+        action: HnsSettlementAction,
+    ) -> Result<PreparedArtifact, ChainError> {
+        if lock.module != ModuleId::Handshake
+            || lock.session_id != session_id
+            || maximum_fee.is_zero()
+        {
+            return Err(ChainError::InvalidRequest(
+                "invalid Handshake settlement spend",
+            ));
+        }
+        let now = self.clock.now_unix().map_err(map_chain_error)?;
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_settlement_ready(&cache)?;
+        if action == HnsSettlementAction::Refund
+            && (current_height != Some(cache.sync.validated_height)
+                || cache.sync.validated_height < lock.absolute_timelock)
+        {
+            return Err(ChainError::InvalidRequest(
+                "refund height is not current or mature",
+            ));
+        }
+        let account = cache.account.clone();
+        drop(cache);
+        let config = account.config.clone();
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        let record = store
+            .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
+                &config, session_id,
+            ))
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::InvalidEvidence)?
+            .value;
+        if record.verified != lock {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let refund = action == HnsSettlementAction::Refund;
+        let public = derive_settlement_public_key(&store, &account, session_id, refund)
+            .map_err(map_chain_error)?;
+        let expected_key = if refund {
+            decode_compressed_key(&record.expected.refund_target)?
+        } else {
+            decode_compressed_key(&record.expected.receiver)?
+        };
+        if public != expected_key {
+            return Err(ChainError::InvalidRequest(
+                "settlement target is not controlled by this wallet",
+            ));
+        }
+        let receive_derivation = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: account_number(&account),
+            change: 0,
+            index: account.next_receive_index,
+        };
+        let receive_public = derive_hns_public_key(&store, config.wallet_id, receive_derivation)
+            .map_err(map_chain_error)?;
+        let destination = Address::new(
+            0,
+            public_key_hash(&receive_public)
+                .map_err(map_chain_error)?
+                .to_vec(),
+        )
+        .map_err(|_| ChainError::InvalidEvidence)?;
+        let previous_value =
+            u64::try_from(lock.amount.base_units.get()).map_err(|_| ChainError::InvalidEvidence)?;
+        let sequence = if refund { u32::MAX - 1 } else { u32::MAX };
+        let locktime = if refund {
+            u32::try_from(lock.absolute_timelock).map_err(|_| ChainError::InvalidEvidence)?
+        } else {
+            0
+        };
+        let mut transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    transaction_hash: CanonicalTransactionHash::new(lock.funding_id.into_bytes()),
+                    index: record.output_index,
+                },
+                sequence,
+                witness: Witness {
+                    items: if refund {
+                        vec![vec![0; 65], Vec::new(), record.script.clone()]
+                    } else {
+                        vec![
+                            vec![0; 65],
+                            vec![0; Preimage::LENGTH],
+                            vec![1],
+                            record.script.clone(),
+                        ]
+                    },
+                },
+            }],
+            outputs: vec![Output {
+                value: Dollarydoos::new(previous_value),
+                address: destination,
+                covenant: Covenant::default(),
+            }],
+            locktime,
+        };
+        let fee_rate = self.backend.estimate_fee_rate(6).map_err(map_chain_error)?;
+        let fee = transaction_fee(&transaction, fee_rate).map_err(map_chain_error)?;
+        if fee > maximum_fee
+            || fee.get() >= u128::from(previous_value)
+            || u128::from(previous_value) - fee.get() < config.dust_threshold.get()
+        {
+            return Err(ChainError::FeeLimit);
+        }
+        transaction.outputs[0].value = Dollarydoos::new(
+            previous_value - u64::try_from(fee.get()).map_err(|_| ChainError::Overflow)?,
+        );
+        let signed = sign_htlc_spend(
+            &store,
+            &account,
+            transaction,
+            session_id,
+            &record.script,
+            previous_value,
+            preimage.as_ref(),
+            refund,
+        )
+        .map_err(map_chain_error)?;
+        drop(store);
+        let terms = match action {
+            HnsSettlementAction::Redeem => HnsSettlementTerms::Redeem { lock },
+            HnsSettlementAction::Refund => HnsSettlementTerms::Refund { lock },
+            HnsSettlementAction::Lock => {
+                return Err(ChainError::InvalidRequest(
+                    "invalid settlement spend action",
+                ));
+            }
+        };
+        self.persist_prepared_settlement(session_id, action, signed, fee, terms, &[], None, now)
+            .map_err(map_chain_error)
+    }
+
+    pub fn reconcile(&self) -> Result<HnsReconciliationReport, HnsWalletError> {
+        let now = self.clock.now_unix()?;
+        self.set_sync_phase(SyncPhase::Headers, None)?;
+        let tip = self.backend.get_chain_tip()?;
+        let account = self.cache_read()?.account.clone();
+        let mut store = self.store_lock()?;
+        let stored_recovery: Option<StoredEntity<HnsRecoveryState>> =
+            store.hns_recovery_state(&recovery_entity_id(&account.config))?;
+        let (mut recovery, recovery_revision) = stored_recovery
+            .map_or((HnsRecoveryState::default(), 0), |stored| {
+                (stored.value, stored.revision)
+            });
+        let common_ancestor = self.find_common_ancestor(&recovery, tip)?;
+        let reorg_detected = recovery.last_tip.is_some()
+            && common_ancestor
+                != recovery
+                    .last_tip
+                    .map(|old_tip| old_tip.height.min(tip.height));
+
+        self.set_sync_phase(SyncPhase::WalletScan, None)?;
+        let (account, account_revision, binding, addresses, history, indexed_coins) =
+            self.restore_scan(&mut store, account, tip, now)?;
+        let coins = reconcile_coins(indexed_coins, &addresses)?;
+        let transactions =
+            self.reconcile_transactions(&history, &addresses, binding, common_ancestor)?;
+        let revalidated_names = self.revalidate_names(&mut store, binding, now)?;
+        persist_reconciled_entities(&mut store, &account.config, &coins, &transactions, now)?;
+        let mut pending_user_actions = self.reconcile_send_workflows(&mut store, binding, now)?;
+        pending_user_actions.extend(self.reconcile_settlement_workflows(&mut store, binding, now)?);
+        pending_user_actions.sort();
+        pending_user_actions.dedup();
+        self.cleanup_input_reservations(&mut store, &account.config, &coins, binding, now)?;
+
+        recovery.checkpoints = self.refresh_checkpoints(tip)?;
+        recovery.last_tip = Some(tip);
+        recovery.last_common_ancestor = common_ancestor;
+        recovery.last_reconciled_unix = now;
+        store.save_hns_recovery_state(
+            &recovery_entity_id(&account.config),
+            recovery_revision,
+            &recovery,
+            now,
+        )?;
+        drop(store);
+
+        {
+            let mut cache = self.cache_write()?;
+            // A prepared workflow may have atomically advanced the account
+            // after this scan released the store lock. Never overwrite that
+            // newer committed derivation with the scan's older snapshot.
+            if cache.account_revision <= account_revision {
+                cache.account = account;
+                cache.account_revision = account_revision;
+            }
+            cache.sync = SyncStatus {
+                phase: SyncPhase::Ready,
+                validated_height: tip.height,
+                scanned_height: tip.height,
+                target_height: Some(tip.height),
+                last_error: None,
+            };
+            cache.coins = coins.clone();
+            cache.transactions = transactions.clone();
+            cache.binding = Some(binding);
+        }
+        Ok(HnsReconciliationReport {
+            tip,
+            common_ancestor,
+            reorg_detected,
+            restored_utxos: coins.len(),
+            reconciled_transactions: transactions.len(),
+            revalidated_names,
+            pending_user_actions,
+        })
+    }
+
+    fn find_common_ancestor(
+        &self,
+        recovery: &HnsRecoveryState,
+        tip: ChainTip,
+    ) -> Result<Option<u64>, HnsWalletError> {
+        if recovery.last_tip.is_none() {
+            return Ok(None);
+        }
+        for checkpoint in recovery.checkpoints.iter().rev() {
+            if checkpoint.height > tip.height {
+                continue;
+            }
+            if self.backend.get_block_hash(checkpoint.height)? == Some(checkpoint.block_hash) {
+                return Ok(Some(checkpoint.height));
+            }
+        }
+        Ok(account_birthday_ancestor(
+            self.cache_read()?.account.config.birthday_height,
+        ))
+    }
+
+    fn refresh_checkpoints(
+        &self,
+        tip: ChainTip,
+    ) -> Result<Vec<HnsChainCheckpoint>, HnsWalletError> {
+        let birthday = self.cache_read()?.account.config.birthday_height;
+        let start = tip
+            .height
+            .saturating_sub((MAX_RECOVERY_CHECKPOINTS - 1) as u64)
+            .max(birthday);
+        let mut checkpoints = Vec::new();
+        for height in start..=tip.height {
+            let block_hash = if height == tip.height {
+                Some(tip.block_hash)
+            } else {
+                self.backend.get_block_hash(height)?
+            };
+            let block_hash = block_hash.ok_or(HnsWalletError::InvalidEvidence)?;
+            checkpoints.push(HnsChainCheckpoint { height, block_hash });
+        }
+        Ok(checkpoints)
+    }
+
+    fn set_sync_phase(
+        &self,
+        phase: SyncPhase,
+        last_error: Option<String>,
+    ) -> Result<(), HnsWalletError> {
+        let mut cache = self.cache_write()?;
+        cache.sync.phase = phase;
+        cache.sync.last_error = last_error;
+        Ok(())
+    }
+
+    fn change_account_save(
+        account: &HnsAccountRecord,
+        account_revision: u64,
+        used_index: u32,
+        now_unix: u64,
+    ) -> Result<EntityBatchSave<HnsAccountRecord>, HnsWalletError> {
+        if account.next_change_index != used_index {
+            return Err(HnsWalletError::StaleAddressReservation);
+        }
+        let next = used_index
+            .checked_add(1)
+            .ok_or(HnsWalletError::ScanCapacityExhausted)?;
+        ensure_trailing_gap(Some(used_index), account.config.restore_lookahead)?;
+        let mut next_account = account.clone();
+        next_account.next_change_index = next;
+        next_account.internal_scan_end = next_account.internal_scan_end.max(required_scan_end(
+            Some(used_index),
+            next_account.internal_scan_end,
+            next_account.config.restore_lookahead,
+        ));
+        Ok(EntityBatchSave {
+            id: account_entity_id(&next_account.config).to_vec(),
+            expected_revision: account_revision,
+            value: next_account,
+            updated_at_unix: now_unix,
+        })
+    }
+
+    fn install_committed_account(
+        &self,
+        expected_revision: u64,
+        next_revision: u64,
+        next_account: HnsAccountRecord,
+    ) -> Result<(), HnsWalletError> {
+        let mut cache = self.cache_write()?;
+        if cache.account_revision != expected_revision {
+            if cache.account_revision == next_revision && cache.account == next_account {
+                return Ok(());
+            }
+            return Err(HnsWalletError::StaleAddressReservation);
+        }
+        cache.account = next_account;
+        cache.account_revision = next_revision;
+        Ok(())
+    }
+
+    fn install_loaded_account(
+        &self,
+        loaded: StoredEntity<HnsAccountRecord>,
+    ) -> Result<(), HnsWalletError> {
+        let mut cache = self.cache_write()?;
+        if !same_account_identity(&cache.account.config, &loaded.value.config) {
+            return Err(HnsWalletError::AccountConfigurationMismatch);
+        }
+        if loaded.revision < cache.account_revision {
+            return Ok(());
+        }
+        if loaded.revision == cache.account_revision && loaded.value != cache.account {
+            return Err(HnsWalletError::AccountConfigurationMismatch);
+        }
+        cache.account = loaded.value;
+        cache.account_revision = loaded.revision;
+        Ok(())
+    }
+
+    fn prepared_send_from_plan(plan: &HnsSpendPlan) -> Result<PreparedSend, ChainError> {
+        let payload = serde_json::to_vec(plan)
+            .map_err(|_| ChainError::Backend("prepared send encoding failed".to_owned()))?;
+        PreparedSend::new(
+            ModuleId::Handshake,
+            Amount {
+                asset: WalletAsset::Hns,
+                base_units: plan.amount,
+            },
+            plan.fee,
+            plan.destination.clone(),
+            plan.expires_at_unix,
+            payload,
+        )
+    }
+
+    fn recover_prepared_send(
+        stored: &StoredWorkflow<HnsSendWorkflow>,
+        request: &SendRequest,
+        config: &HnsRuntimeConfig,
+        workflow_id: WorkflowId,
+        now_unix: u64,
+    ) -> Result<PreparedSend, ChainError> {
+        let state = &stored.state;
+        if stored.kind != WorkflowKind::HnsSend
+            || state.stage != HnsSendStage::Prepared
+            || state.transaction.is_some()
+            || state.signed_transaction.is_some()
+            || state.plan.wallet_id != config.wallet_id
+            || state.plan.account_id != config.account_id
+            || state.plan.workflow_id != workflow_id
+            || state.plan.request_nonce != request.request_nonce
+            || state.plan.amount != request.amount.base_units
+            || state.plan.maximum_fee != request.maximum_fee
+            || state.plan.fee > state.plan.maximum_fee
+            || state.plan.destination != request.destination
+            || state.plan.inputs.is_empty()
+            || state.plan.expires_at_unix <= now_unix
+        {
+            return Err(ChainError::InvalidRequest(
+                "persisted Handshake send does not match retry",
+            ));
+        }
+        Self::prepared_send_from_plan(&state.plan)
+    }
+
+    fn prepared_settlement_artifact(
+        prepared: &HnsPreparedSettlement,
+    ) -> Result<PreparedArtifact, HnsWalletError> {
+        let decoded = Transaction::decode(&prepared.signed_transaction)
+            .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+        if wallet_transaction_hash(&decoded)? != prepared.transaction {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let payload = serde_json::to_vec(prepared)?;
+        PreparedArtifact::new(
+            ModuleId::Handshake,
+            prepared.session_id,
+            prepared.fee,
+            prepared.expires_at_unix,
+            payload,
+        )
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)
+    }
+
+    fn restore_scan(
+        &self,
+        store: &mut WalletStore,
+        mut account: HnsAccountRecord,
+        expected_tip: ChainTip,
+        now_unix: u64,
+    ) -> Result<
+        (
+            HnsAccountRecord,
+            u64,
+            SnapshotBinding,
+            Vec<DerivedHnsAddress>,
+            Vec<HistoryEntry>,
+            Vec<IndexedWalletCoin>,
+        ),
+        HnsWalletError,
+    > {
+        if account.external_scan_end >= MAX_RESTORE_LOOKAHEAD
+            || account.internal_scan_end >= MAX_RESTORE_LOOKAHEAD
+            || account.next_receive_index >= MAX_RESTORE_LOOKAHEAD
+            || account.next_change_index >= MAX_RESTORE_LOOKAHEAD
+        {
+            return Err(HnsWalletError::InvalidLookahead);
+        }
+        let gap = account.config.restore_lookahead;
+        let minimum_external_end = account
+            .next_receive_index
+            .saturating_add(gap - 1)
+            .min(MAX_RESTORE_LOOKAHEAD - 1);
+        let minimum_internal_end = account
+            .next_change_index
+            .saturating_add(gap - 1)
+            .min(MAX_RESTORE_LOOKAHEAD - 1);
+        account.external_scan_end = account.external_scan_end.max(minimum_external_end);
+        account.internal_scan_end = account.internal_scan_end.max(minimum_internal_end);
+
+        let mut expected_binding = None;
+        let (mut addresses, mut history, indexed_coins, binding) = loop {
+            let addresses = derive_restore_addresses(store, &account)?;
+            let (scripts, index_remap) = sorted_restore_scripts(&addresses)?;
+            let (binding, history, indexed_coins) =
+                load_wallet_snapshot(&self.backend, &scripts, &index_remap, expected_tip)?;
+            if expected_binding.is_some_and(|expected| expected != binding) {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            expected_binding = Some(binding);
+            let mut last_external = None;
+            let mut last_internal = None;
+            for entry in &history {
+                let derivation = addresses
+                    .get(entry.script_index as usize)
+                    .ok_or(HnsWalletError::InvalidEvidence)?
+                    .derivation;
+                match derivation.change {
+                    0 => {
+                        last_external = Some(
+                            last_external
+                                .map_or(derivation.index, |last: u32| last.max(derivation.index)),
+                        )
+                    }
+                    1 => {
+                        last_internal = Some(
+                            last_internal
+                                .map_or(derivation.index, |last: u32| last.max(derivation.index)),
+                        )
+                    }
+                    _ => return Err(HnsWalletError::InvalidEvidence),
+                }
+            }
+            ensure_trailing_gap(last_external, gap)?;
+            ensure_trailing_gap(last_internal, gap)?;
+            let required_external =
+                required_scan_end(last_external, account.external_scan_end, gap);
+            let required_internal =
+                required_scan_end(last_internal, account.internal_scan_end, gap);
+            let required_count = required_external as usize + required_internal as usize + 2;
+            if required_count > MAX_RESTORE_SCRIPTS_PER_QUERY {
+                return Err(HnsWalletError::ScanCapacityExhausted);
+            }
+            if required_external <= account.external_scan_end
+                && required_internal <= account.internal_scan_end
+            {
+                break (addresses, history, indexed_coins, binding);
+            }
+            account.external_scan_end = required_external;
+            account.internal_scan_end = required_internal;
+        };
+
+        let used: BTreeSet<(u32, u32)> = history
+            .iter()
+            .map(|entry| {
+                let derivation = addresses[entry.script_index as usize].derivation;
+                (derivation.change, derivation.index)
+            })
+            .collect();
+        for address in &mut addresses {
+            address.used = used.contains(&(address.derivation.change, address.derivation.index));
+        }
+        account.last_used_external = used
+            .iter()
+            .filter(|(change, _)| *change == 0)
+            .map(|(_, index)| *index)
+            .max();
+        account.last_used_internal = used
+            .iter()
+            .filter(|(change, _)| *change == 1)
+            .map(|(_, index)| *index)
+            .max();
+        if let Some(last_used) = account.last_used_external {
+            account.next_receive_index = account
+                .next_receive_index
+                .max(last_used.saturating_add(1))
+                .min(MAX_RESTORE_LOOKAHEAD - 1);
+        }
+        if let Some(last_used) = account.last_used_internal {
+            account.next_change_index = account
+                .next_change_index
+                .max(last_used.saturating_add(1))
+                .min(MAX_RESTORE_LOOKAHEAD - 1);
+        }
+        persist_derived_addresses(store, &account.config, &addresses, now_unix)?;
+        let expected_revision = store
+            .wallet_account::<HnsAccountRecord>(&account_entity_id(&account.config))?
+            .ok_or(HnsWalletError::InvalidEvidence)?
+            .revision;
+        let account_revision = store.save_wallet_account(
+            &account_entity_id(&account.config),
+            expected_revision,
+            &account,
+            now_unix,
+        )?;
+        history.sort_by_key(|entry| (entry.txid, entry.script_index));
+        Ok((
+            account,
+            account_revision,
+            binding,
+            addresses,
+            history,
+            indexed_coins,
+        ))
+    }
+
+    fn cache_read(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, HnsRuntimeCache>, HnsWalletError> {
+        self.cache
+            .read()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)
+    }
+
+    fn cache_write(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, HnsRuntimeCache>, HnsWalletError> {
+        self.cache
+            .write()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)
+    }
+
+    fn store_lock(&self) -> Result<std::sync::MutexGuard<'_, WalletStore>, HnsWalletError> {
+        self.store
+            .lock()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)
+    }
+}
+
+impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
+    fn reconcile_transactions(
+        &self,
+        history: &[HistoryEntry],
+        addresses: &[DerivedHnsAddress],
+        binding: SnapshotBinding,
+        common_ancestor: Option<u64>,
+    ) -> Result<Vec<HnsTransactionRecord>, HnsWalletError> {
+        let mut history = coalesce_transaction_history(history)?;
+        let observed_txids: BTreeSet<TransactionHash> =
+            history.iter().map(|entry| entry.txid).collect();
+        let programs: BTreeSet<Vec<u8>> = addresses
+            .iter()
+            .filter(|address| address.derivation.role == KeyRole::HnsCoin)
+            .map(|address| address.program.clone())
+            .collect();
+        if programs.len() != addresses.len() || programs.iter().any(|program| program.len() != 20) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let previous: BTreeMap<TransactionHash, TransactionSummary> = self
+            .cache_read()?
+            .transactions
+            .iter()
+            .map(|record| (record.summary.txid, record.summary.clone()))
+            .collect();
+        for summary in previous.values() {
+            if !observed_txids.contains(&summary.txid) {
+                history.push(HistoryEntry {
+                    txid: summary.txid,
+                    height: summary.block_height,
+                    spent: false,
+                    first_seen_unix: summary.first_seen_unix,
+                    script_index: 0,
+                });
+            }
+        }
+        let mut raw_cache = BTreeMap::new();
+        let mut records = Vec::with_capacity(history.len());
+        let persisted_raw: BTreeMap<TransactionHash, Vec<u8>> = self
+            .cache_read()?
+            .transactions
+            .iter()
+            .map(|record| (record.summary.txid, record.raw.clone()))
+            .collect();
+        for entry in &history {
+            let evidence = self.backend.get_transaction_evidence(entry.txid, binding)?;
+            if evidence.binding != binding {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            let raw = match evidence.raw {
+                Some(raw) => raw,
+                None => persisted_raw
+                    .get(&entry.txid)
+                    .cloned()
+                    .ok_or(HnsWalletError::InvalidEvidence)?,
+            };
+            let transaction = decode_transaction_for_id(&raw, entry.txid)?;
+            raw_cache.insert(entry.txid, transaction.clone());
+            let status = evidence.status;
+            let competing_spender =
+                self.has_competing_spender(entry.txid, &transaction, binding)?;
+            let inclusion = evidence.inclusion;
+            validate_inclusion(
+                entry,
+                status,
+                inclusion,
+                binding.tip,
+                observed_txids.contains(&entry.txid),
+            )?;
+            let (net_amount, fee) = transaction_value_effect(
+                &self.backend,
+                &transaction,
+                &programs,
+                &mut raw_cache,
+                &persisted_raw,
+                binding,
+            )?;
+            let current_status = if status.conflicted || competing_spender {
+                LocalTransactionStatus::Conflicted
+            } else if status.confirmation_count > 0 {
+                LocalTransactionStatus::Confirmed
+            } else if status.in_mempool {
+                LocalTransactionStatus::Mempool
+            } else if previous.get(&entry.txid).is_some_and(|old| {
+                old.status == LocalTransactionStatus::Confirmed
+                    && old.block_height.is_some_and(|height| {
+                        common_ancestor.is_none_or(|ancestor| height > ancestor)
+                    })
+            }) {
+                LocalTransactionStatus::Reorged
+            } else {
+                LocalTransactionStatus::Dropped
+            };
+            records.push(HnsTransactionRecord {
+                summary: TransactionSummary {
+                    module: ModuleId::Handshake,
+                    txid: entry.txid,
+                    status: current_status,
+                    net_amount,
+                    fee,
+                    block_height: inclusion.map(|value| value.height),
+                    first_seen_unix: entry.first_seen_unix,
+                    confirmation_count: status.confirmation_count,
+                },
+                raw,
+                inclusion,
+            });
+        }
+        records.sort_by(|left, right| {
+            right
+                .summary
+                .block_height
+                .cmp(&left.summary.block_height)
+                .then_with(|| {
+                    right
+                        .summary
+                        .first_seen_unix
+                        .cmp(&left.summary.first_seen_unix)
+                })
+                .then_with(|| left.summary.txid.cmp(&right.summary.txid))
+        });
+        Ok(records)
+    }
+
+    fn revalidate_names(
+        &self,
+        store: &mut WalletStore,
+        binding: SnapshotBinding,
+        now_unix: u64,
+    ) -> Result<usize, HnsWalletError> {
+        let config = self.cache_read()?.account.config.clone();
+        let names = store
+            .known_names::<KnownName>(MAX_HISTORY_RESULTS)?
+            .into_iter()
+            .filter(|entity| entity.id.starts_with(&account_entity_prefix(&config)))
+            .collect::<Vec<_>>();
+        let mut count = 0;
+        for stored in names {
+            let current = validated_name_evidence(&self.backend, &stored.value.name, binding)?;
+            if current.proof_height != binding.tip.height {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            store.save_known_name(
+                &namespaced_name_id(&config, current.name_hash),
+                stored.revision,
+                &current,
+                now_unix,
+            )?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn reconcile_send_workflows(
+        &self,
+        store: &mut WalletStore,
+        binding: SnapshotBinding,
+        now_unix: u64,
+    ) -> Result<Vec<WorkflowId>, HnsWalletError> {
+        let workflows =
+            store.list_workflows::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)?;
+        let config = self.cache_read()?.account.config.clone();
+        let mut pending = Vec::new();
+        for stored in workflows {
+            if stored.state.plan.wallet_id != config.wallet_id
+                || stored.state.plan.account_id != config.account_id
+            {
+                continue;
+            }
+            if stored.state.stage == HnsSendStage::Prepared
+                && stored.state.plan.expires_at_unix <= now_unix
+            {
+                let mut state = stored.state;
+                state.stage = HnsSendStage::Expired;
+                let deletes = reservation_deletes(store, &config, stored.id)?;
+                store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+                    stored.id,
+                    WorkflowKind::HnsSend,
+                    stored.revision,
+                    &state,
+                    false,
+                    now_unix,
+                    EntityKind::InputReservation,
+                    &[],
+                    &deletes,
+                )?;
+                continue;
+            }
+            let Some(txid) = stored.state.transaction else {
+                continue;
+            };
+            let evidence = self.backend.get_transaction_evidence(txid, binding)?;
+            if evidence.binding != binding {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            let chain_status = evidence.status;
+            let outpoints: Vec<HnsOutpoint> = stored
+                .state
+                .plan
+                .inputs
+                .iter()
+                .map(|input| input.coin.outpoint)
+                .collect();
+            let spend_evidence = self
+                .backend
+                .get_outpoint_spend_evidence(&outpoints, binding)?;
+            validate_spend_evidence(&spend_evidence, binding, outpoints.len())?;
+            let competing_spender = spend_evidence
+                .spenders
+                .iter()
+                .any(|spender| spender.is_some_and(|spender| spender != txid));
+            let next_stage = if chain_status.conflicted || competing_spender {
+                HnsSendStage::Conflicted
+            } else if chain_status.confirmation_count > 0 {
+                HnsSendStage::Confirmed
+            } else if chain_status.in_mempool {
+                HnsSendStage::Mempool
+            } else if matches!(
+                stored.state.stage,
+                HnsSendStage::Authorized | HnsSendStage::Broadcast | HnsSendStage::Mempool
+            ) {
+                pending.push(stored.id);
+                HnsSendStage::RequiresRebroadcast
+            } else {
+                stored.state.stage
+            };
+            if next_stage != stored.state.stage {
+                let mut state = stored.state;
+                state.stage = next_stage;
+                let deletes = if matches!(
+                    next_stage,
+                    HnsSendStage::Confirmed | HnsSendStage::Conflicted
+                ) {
+                    reservation_deletes(store, &config, stored.id)?
+                } else {
+                    Vec::new()
+                };
+                store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+                    stored.id,
+                    WorkflowKind::HnsSend,
+                    stored.revision,
+                    &state,
+                    state.signed_transaction.is_some(),
+                    now_unix,
+                    EntityKind::InputReservation,
+                    &[],
+                    &deletes,
+                )?;
+            }
+        }
+        Ok(pending)
+    }
+
+    fn has_competing_spender(
+        &self,
+        transaction_id: TransactionHash,
+        transaction: &Transaction,
+        binding: SnapshotBinding,
+    ) -> Result<bool, HnsWalletError> {
+        let mut outpoints = Vec::new();
+        for input in &transaction.inputs {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let outpoint = HnsOutpoint {
+                transaction: TransactionHash::new(
+                    input.previous_output.transaction_hash.into_bytes(),
+                ),
+                output_index: input.previous_output.index,
+            };
+            outpoints.push(outpoint);
+        }
+        let evidence = self
+            .backend
+            .get_outpoint_spend_evidence(&outpoints, binding)?;
+        validate_spend_evidence(&evidence, binding, outpoints.len())?;
+        Ok(evidence
+            .spenders
+            .into_iter()
+            .any(|spender| spender.is_some_and(|spender| spender != transaction_id)))
+    }
+
+    fn cleanup_input_reservations(
+        &self,
+        store: &mut WalletStore,
+        config: &HnsRuntimeConfig,
+        coins: &[TrackedHnsCoin],
+        binding: SnapshotBinding,
+        now_unix: u64,
+    ) -> Result<(), HnsWalletError> {
+        let unspent: BTreeSet<HnsOutpoint> = coins.iter().map(|coin| coin.coin.outpoint).collect();
+        let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+        let mut deletes = Vec::new();
+        for stored in reservations {
+            if stored.value.wallet_id != config.wallet_id
+                || stored.value.account_id != config.account_id
+            {
+                continue;
+            }
+            let expired = stored
+                .value
+                .expires_at_unix
+                .is_some_and(|expiry| expiry <= now_unix);
+            let spent = !unspent.contains(&stored.value.outpoint);
+            let conflicted = if stored.value.expires_at_unix.is_none() {
+                match store.load_workflow::<HnsPreparedSettlement>(stored.value.workflow_id) {
+                    Ok(Some(workflow)) => {
+                        let evidence = self
+                            .backend
+                            .get_transaction_evidence(workflow.state.transaction, binding)?;
+                        if evidence.binding != binding {
+                            return Err(HnsWalletError::StaleNodeSnapshot);
+                        }
+                        evidence.status.conflicted
+                    }
+                    Ok(None) => true,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            if expired || spent || conflicted {
+                deletes.push(EntityBatchDelete {
+                    id: stored.id,
+                    expected_revision: stored.revision,
+                });
+            }
+        }
+        if !deletes.is_empty() {
+            store.apply_entity_batch::<HnsInputReservation>(
+                EntityKind::InputReservation,
+                &[],
+                &deletes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_settlement_workflows(
+        &self,
+        store: &mut WalletStore,
+        binding: SnapshotBinding,
+        now_unix: u64,
+    ) -> Result<Vec<WorkflowId>, HnsWalletError> {
+        let config = self.cache_read()?.account.config.clone();
+        let mut pending = Vec::new();
+        for kind in [WorkflowKind::AtomicSwap, WorkflowKind::Refund] {
+            let workflows =
+                store.list_workflows::<HnsPreparedSettlement>(kind, MAX_HISTORY_RESULTS)?;
+            for mut stored in workflows {
+                if stored.state.wallet_id != config.wallet_id
+                    || stored.state.account_id != config.account_id
+                    || settlement_workflow_kind(stored.state.action) != kind
+                {
+                    continue;
+                }
+                let previous_stage = stored.state.stage;
+                let next_stage = if previous_stage == HnsSettlementStage::Prepared {
+                    let evidence = self
+                        .backend
+                        .get_transaction_evidence(stored.state.transaction, binding)?;
+                    if evidence.binding != binding {
+                        return Err(HnsWalletError::StaleNodeSnapshot);
+                    }
+                    if evidence.status.conflicted {
+                        HnsSettlementStage::Conflicted
+                    } else if evidence.status.confirmation_count > 0 {
+                        HnsSettlementStage::Confirmed
+                    } else if evidence.status.in_mempool {
+                        HnsSettlementStage::Mempool
+                    } else if stored.state.expires_at_unix <= now_unix {
+                        HnsSettlementStage::Expired
+                    } else {
+                        previous_stage
+                    }
+                } else if matches!(
+                    previous_stage,
+                    HnsSettlementStage::Broadcast
+                        | HnsSettlementStage::Mempool
+                        | HnsSettlementStage::RequiresRebroadcast
+                ) {
+                    let evidence = self
+                        .backend
+                        .get_transaction_evidence(stored.state.transaction, binding)?;
+                    if evidence.binding != binding {
+                        return Err(HnsWalletError::StaleNodeSnapshot);
+                    }
+                    if evidence.status.conflicted {
+                        HnsSettlementStage::Conflicted
+                    } else if evidence.status.confirmation_count > 0 {
+                        HnsSettlementStage::Confirmed
+                    } else if evidence.status.in_mempool {
+                        HnsSettlementStage::Mempool
+                    } else if stored.state.expires_at_unix <= now_unix {
+                        HnsSettlementStage::Expired
+                    } else {
+                        pending.push(stored.id);
+                        HnsSettlementStage::RequiresRebroadcast
+                    }
+                } else {
+                    previous_stage
+                };
+                let terminal_lock = stored.state.action == HnsSettlementAction::Lock
+                    && matches!(
+                        next_stage,
+                        HnsSettlementStage::Confirmed
+                            | HnsSettlementStage::Conflicted
+                            | HnsSettlementStage::Expired
+                            | HnsSettlementStage::Cancelled
+                    );
+                if next_stage != previous_stage {
+                    stored.state.stage = next_stage;
+                    let deletes = if terminal_lock {
+                        reservation_deletes(store, &config, stored.id)?
+                    } else {
+                        Vec::new()
+                    };
+                    let saves = if stored.state.action == HnsSettlementAction::Lock
+                        && previous_stage == HnsSettlementStage::Prepared
+                        && next_stage == HnsSettlementStage::Mempool
+                    {
+                        reservation_activation_saves(store, &config, stored.id, now_unix)?
+                    } else {
+                        Vec::new()
+                    };
+                    store.save_workflow_with_entity_batch(
+                        stored.id,
+                        kind,
+                        stored.revision,
+                        &stored.state,
+                        !matches!(
+                            next_stage,
+                            HnsSettlementStage::Prepared
+                                | HnsSettlementStage::Expired
+                                | HnsSettlementStage::Cancelled
+                        ),
+                        now_unix,
+                        EntityKind::InputReservation,
+                        &saves,
+                        &deletes,
+                    )?;
+                } else if terminal_lock {
+                    release_reservations(store, &config, stored.id)?;
+                }
+            }
+        }
+        Ok(pending)
+    }
+}
+
+fn account_number(account: &HnsAccountRecord) -> u32 {
+    account.config.account_derivation_index
+}
+
+fn same_account_identity(left: &HnsRuntimeConfig, right: &HnsRuntimeConfig) -> bool {
+    left.wallet_id == right.wallet_id
+        && left.account_id == right.account_id
+        && left.account_derivation_index == right.account_derivation_index
+        && left.network == right.network
+        && left.birthday_height == right.birthday_height
+}
+
+fn account_birthday_ancestor(birthday_height: u64) -> Option<u64> {
+    birthday_height.checked_sub(1)
+}
+
+fn ensure_trailing_gap(last_used: Option<u32>, gap: u32) -> Result<(), HnsWalletError> {
+    if last_used.is_some_and(|index| index.saturating_add(gap) >= MAX_RESTORE_LOOKAHEAD) {
+        Err(HnsWalletError::ScanCapacityExhausted)
+    } else {
+        Ok(())
+    }
+}
+
+fn required_scan_end(last_used: Option<u32>, current: u32, gap: u32) -> u32 {
+    last_used.map_or(current, |index| index.saturating_add(gap))
+}
+
+fn derive_restore_addresses(
+    store: &WalletStore,
+    account: &HnsAccountRecord,
+) -> Result<Vec<DerivedHnsAddress>, HnsWalletError> {
+    let existing: BTreeMap<(u32, u32), DerivedHnsAddress> = store
+        .derived_addresses::<DerivedHnsAddress>(MAX_RESTORE_LOOKAHEAD as usize)?
+        .into_iter()
+        .filter(|entity| {
+            entity
+                .id
+                .starts_with(&account_entity_prefix(&account.config))
+        })
+        .map(|entity| {
+            (
+                (
+                    entity.value.derivation.change,
+                    entity.value.derivation.index,
+                ),
+                entity.value,
+            )
+        })
+        .collect();
+    let address_count = account.external_scan_end as usize + account.internal_scan_end as usize + 2;
+    if address_count > MAX_RESTORE_SCRIPTS_PER_QUERY {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
+    let mut addresses = Vec::with_capacity(address_count);
+    for (change, scan_end) in [
+        (0, account.external_scan_end),
+        (1, account.internal_scan_end),
+    ] {
+        for index in 0..=scan_end {
+            let derivation = DerivationReference {
+                role: KeyRole::HnsCoin,
+                account: account_number(account),
+                change,
+                index,
+            };
+            let public_key = derive_hns_public_key(store, account.config.wallet_id, derivation)?;
+            let program = public_key_hash(&public_key)?.to_vec();
+            let derived = DerivedHnsAddress {
+                account_id: account.config.account_id,
+                derivation,
+                address: receive_address(account.config.network, &public_key)?,
+                program,
+                used: existing
+                    .get(&(change, index))
+                    .is_some_and(|address| address.used),
+            };
+            if let Some(persisted) = existing.get(&(change, index))
+                && (persisted.account_id != derived.account_id
+                    || persisted.derivation != derived.derivation
+                    || persisted.address != derived.address
+                    || persisted.program != derived.program)
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            addresses.push(derived);
+        }
+    }
+    Ok(addresses)
+}
+
+fn sorted_restore_scripts(
+    addresses: &[DerivedHnsAddress],
+) -> Result<(Vec<WalletAddressKey>, Vec<u32>), HnsWalletError> {
+    let mut indexed: Vec<(WalletAddressKey, u32)> = addresses
+        .iter()
+        .enumerate()
+        .map(|(index, address)| {
+            u32::try_from(index)
+                .map(|index| {
+                    (
+                        WalletAddressKey {
+                            version: 0,
+                            hash: address.program.clone(),
+                        },
+                        index,
+                    )
+                })
+                .map_err(|_| HnsWalletError::ScanCapacityExhausted)
+        })
+        .collect::<Result<_, _>>()?;
+    indexed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if indexed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let scripts = indexed.iter().map(|(script, _)| script.clone()).collect();
+    let remap = indexed.into_iter().map(|(_, index)| index).collect();
+    Ok((scripts, remap))
+}
+
+fn load_wallet_snapshot<B: HnsBackend>(
+    backend: &B,
+    scripts: &[WalletAddressKey],
+    index_remap: &[u32],
+    expected_tip: ChainTip,
+) -> Result<(SnapshotBinding, Vec<HistoryEntry>, Vec<IndexedWalletCoin>), HnsWalletError> {
+    for attempt in 0..MAX_SNAPSHOT_RESTARTS {
+        match load_wallet_snapshot_once(backend, scripts, index_remap, expected_tip) {
+            Err(HnsWalletError::StaleNodeSnapshot) if attempt + 1 < MAX_SNAPSHOT_RESTARTS => {}
+            result => return result,
+        }
+    }
+    Err(HnsWalletError::StaleNodeSnapshot)
+}
+
+fn load_wallet_snapshot_once<B: HnsBackend>(
+    backend: &B,
+    scripts: &[WalletAddressKey],
+    index_remap: &[u32],
+    expected_tip: ChainTip,
+) -> Result<(SnapshotBinding, Vec<HistoryEntry>, Vec<IndexedWalletCoin>), HnsWalletError> {
+    if scripts.is_empty()
+        || scripts.len() != index_remap.len()
+        || scripts.len() > MAX_RESTORE_SCRIPTS_PER_QUERY
+        || !scripts.windows(2).all(|pair| pair[0] < pair[1])
+        || scripts
+            .iter()
+            .any(|script| script.version != 0 || script.hash.len() != 20)
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let limit =
+        u32::try_from(MAX_SCAN_PAGE_RESULTS).map_err(|_| HnsWalletError::ScanCapacityExhausted)?;
+    let mut confirmed_cursor: Option<Vec<u8>> = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut binding = None;
+    let mut history = Vec::new();
+    let mut utxos = Vec::new();
+    for _ in 0..MAX_SCAN_PAGES {
+        let page = backend.get_confirmed_wallet_page(ConfirmedWalletPageRequest {
+            scripts,
+            expected_tip,
+            expected_epoch: binding.map(|value: SnapshotBinding| value.chain_epoch),
+            cursor: confirmed_cursor.as_deref(),
+            limit,
+        })?;
+        if page.binding.tip != expected_tip
+            || binding.is_some_and(|expected| expected != page.binding)
+            || page.history.len() > MAX_SCAN_PAGE_RESULTS
+            || page.utxos.len() > MAX_SCAN_PAGE_RESULTS
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        binding = Some(page.binding);
+        append_remapped_history(&mut history, page.history, index_remap, true)?;
+        append_remapped_utxos(&mut utxos, page.utxos, scripts, index_remap)?;
+        confirmed_cursor = validated_next_cursor(page.next_cursor, &mut seen_cursors)?;
+        if confirmed_cursor.is_none() {
+            break;
+        }
+    }
+    if confirmed_cursor.is_some() {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
+    let binding = binding.ok_or(HnsWalletError::InvalidEvidence)?;
+
+    let mut mempool_cursor: Option<Vec<u8>> = None;
+    let mut mempool_binding = None;
+    seen_cursors.clear();
+    for _ in 0..MAX_SCAN_PAGES {
+        let page = backend.get_mempool_wallet_page(MempoolWalletPageRequest {
+            scripts,
+            binding,
+            expected_mempool: mempool_binding,
+            cursor: mempool_cursor.as_deref(),
+            limit,
+        })?;
+        if page.binding != binding
+            || page.mempool.instance_nonce == [0; 32]
+            || mempool_binding.is_some_and(|expected| expected != page.mempool)
+            || page.history.len() > MAX_SCAN_PAGE_RESULTS
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        mempool_binding = Some(page.mempool);
+        append_remapped_history(&mut history, page.history, index_remap, false)?;
+        mempool_cursor = validated_next_cursor(page.next_cursor, &mut seen_cursors)?;
+        if mempool_cursor.is_none() {
+            break;
+        }
+    }
+    if mempool_cursor.is_some() {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
+    Ok((binding, bounded_history(history, index_remap.len())?, utxos))
+}
+
+fn validated_next_cursor(
+    cursor: Option<Vec<u8>>,
+    seen: &mut BTreeSet<Vec<u8>>,
+) -> Result<Option<Vec<u8>>, HnsWalletError> {
+    match cursor {
+        Some(cursor)
+            if cursor.is_empty()
+                || cursor.len() > MAX_SCAN_CURSOR_BYTES
+                || !seen.insert(cursor.clone()) =>
+        {
+            Err(HnsWalletError::StaleNodeSnapshot)
+        }
+        value => Ok(value),
+    }
+}
+
+fn append_remapped_history(
+    output: &mut Vec<HistoryEntry>,
+    entries: Vec<HistoryEntry>,
+    index_remap: &[u32],
+    confirmed: bool,
+) -> Result<(), HnsWalletError> {
+    if output.len().saturating_add(entries.len()) > MAX_HISTORY_RESULTS {
+        return Err(HnsWalletError::HistoryLimit);
+    }
+    for mut entry in entries {
+        if entry.height.is_some() != confirmed {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        entry.script_index = *index_remap
+            .get(entry.script_index as usize)
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        output.push(entry);
+    }
+    Ok(())
+}
+
+fn append_remapped_utxos(
+    output: &mut Vec<IndexedWalletCoin>,
+    entries: Vec<IndexedWalletCoin>,
+    scripts: &[WalletAddressKey],
+    index_remap: &[u32],
+) -> Result<(), HnsWalletError> {
+    if output.len().saturating_add(entries.len()) > MAX_WALLET_COINS {
+        return Err(HnsWalletError::InvalidAmount);
+    }
+    for mut entry in entries {
+        let expected_script = scripts
+            .get(entry.script_index as usize)
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        if &entry.output_address != expected_script {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        entry.script_index = *index_remap
+            .get(entry.script_index as usize)
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        output.push(entry);
+    }
+    Ok(())
+}
+
+fn validate_spend_evidence(
+    evidence: &OutpointSpendEvidence,
+    binding: SnapshotBinding,
+    expected_len: usize,
+) -> Result<(), HnsWalletError> {
+    if evidence.binding != binding || evidence.spenders.len() != expected_len {
+        return Err(HnsWalletError::StaleNodeSnapshot);
+    }
+    Ok(())
+}
+
+fn public_key_hash(public_key: &[u8; 33]) -> Result<[u8; 20], HnsWalletError> {
+    let mut hasher = Blake2bVar::new(20).map_err(|_| HnsWalletError::KeyDerivation)?;
+    BlakeUpdate::update(&mut hasher, public_key);
+    let mut output = [0_u8; 20];
+    hasher
+        .finalize_variable(&mut output)
+        .map_err(|_| HnsWalletError::KeyDerivation)?;
+    Ok(output)
+}
+
+fn bounded_history(
+    history: Vec<HistoryEntry>,
+    script_count: usize,
+) -> Result<Vec<HistoryEntry>, HnsWalletError> {
+    if history.len() > MAX_HISTORY_RESULTS {
+        return Err(HnsWalletError::HistoryLimit);
+    }
+    let mut unique = BTreeMap::new();
+    for entry in history {
+        if entry.script_index as usize >= script_count {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let key = (entry.txid, entry.script_index);
+        if let Some(previous) = unique.insert(key, entry.clone())
+            && previous != entry
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
+    Ok(unique.into_values().collect())
+}
+
+fn coalesce_transaction_history(
+    history: &[HistoryEntry],
+) -> Result<Vec<HistoryEntry>, HnsWalletError> {
+    let mut transactions = BTreeMap::new();
+    for entry in history {
+        match transactions.get_mut(&entry.txid) {
+            Some(previous) => {
+                if previous.height != entry.height
+                    || previous.first_seen_unix != entry.first_seen_unix
+                {
+                    return Err(HnsWalletError::InvalidEvidence);
+                }
+                previous.spent |= entry.spent;
+                previous.script_index = previous.script_index.min(entry.script_index);
+            }
+            None => {
+                transactions.insert(entry.txid, entry.clone());
+            }
+        }
+    }
+    Ok(transactions.into_values().collect())
+}
+
+fn reconcile_coins(
+    indexed: Vec<IndexedWalletCoin>,
+    addresses: &[DerivedHnsAddress],
+) -> Result<Vec<TrackedHnsCoin>, HnsWalletError> {
+    if indexed.len() > MAX_WALLET_COINS {
+        return Err(HnsWalletError::InvalidAmount);
+    }
+    let mut outpoints = BTreeSet::new();
+    let mut coins = Vec::with_capacity(indexed.len());
+    for indexed_coin in indexed {
+        if !outpoints.insert(indexed_coin.coin.outpoint) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let address = addresses
+            .get(indexed_coin.script_index as usize)
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        if indexed_coin.coin.value.is_zero()
+            || indexed_coin.output_address.version != 0
+            || indexed_coin.output_address.hash.as_slice() != address.program.as_slice()
+            || address.derivation.role != KeyRole::HnsCoin
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        coins.push(TrackedHnsCoin {
+            coin: indexed_coin.coin,
+            derivation: address.derivation,
+            address_program: address.program.clone(),
+        });
+    }
+    coins.sort_by_key(|coin| coin.coin.outpoint);
+    Ok(coins)
+}
+
+fn decode_transaction_for_id(
+    raw: &[u8],
+    expected: TransactionHash,
+) -> Result<Transaction, HnsWalletError> {
+    let transaction = Transaction::decode(raw).map_err(|_| HnsWalletError::InvalidEvidence)?;
+    let actual = transaction
+        .transaction_hash()
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    if actual.as_bytes() != expected.as_bytes() {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(transaction)
+}
+
+fn validate_inclusion(
+    entry: &HistoryEntry,
+    status: TransactionStatus,
+    inclusion: Option<TransactionInclusion>,
+    tip: ChainTip,
+    observed_in_current_history: bool,
+) -> Result<(), HnsWalletError> {
+    if status.conflicted && (status.in_mempool || status.confirmation_count > 0) {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    match inclusion {
+        Some(inclusion) => {
+            if inclusion.height > tip.height
+                || (observed_in_current_history && entry.height != Some(inclusion.height))
+                || status.confirmation_count == 0
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            let expected_confirmations = tip.height - inclusion.height + 1;
+            if u64::from(status.confirmation_count) != expected_confirmations {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+        }
+        None => {
+            if (observed_in_current_history && entry.height.is_some())
+                || status.confirmation_count > 0
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn transaction_value_effect<B: HnsBackend>(
+    backend: &B,
+    transaction: &Transaction,
+    programs: &BTreeSet<Vec<u8>>,
+    raw_cache: &mut BTreeMap<TransactionHash, Transaction>,
+    persisted_raw: &BTreeMap<TransactionHash, Vec<u8>>,
+    binding: SnapshotBinding,
+) -> Result<(SignedBaseUnits, Option<BaseUnits>), HnsWalletError> {
+    if transaction.inputs.len() > MAX_TRANSACTION_INPUTS {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let mut received = 0_u128;
+    let mut sent = 0_u128;
+    let mut total_inputs = 0_u128;
+    let mut all_inputs_known = true;
+    for output in &transaction.outputs {
+        if output.address.version == 0 && programs.contains(&output.address.hash) {
+            received = received
+                .checked_add(u128::from(output.value.get()))
+                .ok_or(HnsWalletError::Arithmetic)?;
+        }
+    }
+    for input in &transaction.inputs {
+        if input.previous_output.is_null() {
+            all_inputs_known = false;
+            continue;
+        }
+        let parent_id = TransactionHash::new(input.previous_output.transaction_hash.into_bytes());
+        if !raw_cache.contains_key(&parent_id) {
+            let evidence = backend.get_transaction_evidence(parent_id, binding)?;
+            if evidence.binding != binding {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            let raw = match evidence.raw {
+                Some(raw) => raw,
+                None => match persisted_raw.get(&parent_id) {
+                    Some(raw) => raw.clone(),
+                    None => {
+                        all_inputs_known = false;
+                        continue;
+                    }
+                },
+            };
+            let parent = decode_transaction_for_id(&raw, parent_id)?;
+            raw_cache.insert(parent_id, parent);
+        }
+        let parent = raw_cache
+            .get(&parent_id)
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        let Some(previous_output) = parent.outputs.get(input.previous_output.index as usize) else {
+            return Err(HnsWalletError::InvalidEvidence);
+        };
+        total_inputs = total_inputs
+            .checked_add(u128::from(previous_output.value.get()))
+            .ok_or(HnsWalletError::Arithmetic)?;
+        if previous_output.address.version == 0 && programs.contains(&previous_output.address.hash)
+        {
+            sent = sent
+                .checked_add(u128::from(previous_output.value.get()))
+                .ok_or(HnsWalletError::Arithmetic)?;
+        }
+    }
+    let (negative, magnitude) = if sent > received {
+        (true, sent - received)
+    } else {
+        (false, received - sent)
+    };
+    let total_outputs = transaction
+        .outputs
+        .iter()
+        .try_fold(0_u128, |total, output| {
+            total
+                .checked_add(u128::from(output.value.get()))
+                .ok_or(HnsWalletError::Arithmetic)
+        })?;
+    let fee = if all_inputs_known && total_inputs >= total_outputs {
+        Some(BaseUnits::new(total_inputs - total_outputs))
+    } else {
+        None
+    };
+    Ok((
+        SignedBaseUnits {
+            negative,
+            magnitude: BaseUnits::new(magnitude),
+        },
+        fee,
+    ))
+}
+
+fn persist_reconciled_entities(
+    store: &mut WalletStore,
+    config: &HnsRuntimeConfig,
+    coins: &[TrackedHnsCoin],
+    transactions: &[HnsTransactionRecord],
+    now_unix: u64,
+) -> Result<(), HnsWalletError> {
+    let existing_coins = store.hns_utxos::<TrackedHnsCoin>(MAX_HISTORY_RESULTS)?;
+    let mut revisions: BTreeMap<Vec<u8>, u64> = existing_coins
+        .iter()
+        .filter(|entity| entity.id.starts_with(&account_entity_prefix(config)))
+        .map(|entity| (entity.id.clone(), entity.revision))
+        .collect();
+    for coin in coins {
+        let id = namespaced_outpoint_id(config, coin.coin.outpoint);
+        let revision = revisions.remove(id.as_slice()).unwrap_or(0);
+        store.save_hns_utxo(&id, revision, coin, now_unix)?;
+    }
+    for (id, revision) in revisions {
+        store.delete_hns_utxo(&id, revision)?;
+    }
+
+    let existing_transactions =
+        store.hns_transactions::<HnsTransactionRecord>(MAX_HISTORY_RESULTS)?;
+    let mut revisions: BTreeMap<Vec<u8>, u64> = existing_transactions
+        .iter()
+        .filter(|entity| entity.id.starts_with(&account_entity_prefix(config)))
+        .map(|entity| (entity.id.clone(), entity.revision))
+        .collect();
+    for transaction in transactions {
+        let id = namespaced_transaction_id(config, transaction.summary.txid);
+        let revision = revisions.remove(id.as_slice()).unwrap_or(0);
+        store.save_hns_transaction(&id, revision, transaction, now_unix)?;
+    }
+    for (id, revision) in revisions {
+        store.delete_hns_transaction(&id, revision)?;
+    }
+    Ok(())
+}
+
+fn account_entity_prefix(config: &HnsRuntimeConfig) -> [u8; 32] {
+    let mut prefix = [0_u8; 32];
+    prefix[..16].copy_from_slice(config.wallet_id.as_bytes());
+    prefix[16..].copy_from_slice(config.account_id.as_bytes());
+    prefix
+}
+
+fn account_entity_id(config: &HnsRuntimeConfig) -> [u8; 32] {
+    account_entity_prefix(config)
+}
+
+fn recovery_entity_id(config: &HnsRuntimeConfig) -> [u8; 33] {
+    let mut id = [0_u8; 33];
+    id[..32].copy_from_slice(&account_entity_prefix(config));
+    id[32] = 1;
+    id
+}
+
+fn derived_address_id(config: &HnsRuntimeConfig, change: u32, index: u32) -> [u8; 40] {
+    let mut id = [0_u8; 40];
+    id[..32].copy_from_slice(&account_entity_prefix(config));
+    id[32..36].copy_from_slice(&change.to_be_bytes());
+    id[36..].copy_from_slice(&index.to_be_bytes());
+    id
+}
+
+fn namespaced_outpoint_id(config: &HnsRuntimeConfig, outpoint: HnsOutpoint) -> [u8; 68] {
+    let mut id = [0_u8; 68];
+    id[..32].copy_from_slice(&account_entity_prefix(config));
+    id[32..64].copy_from_slice(outpoint.transaction.as_bytes());
+    id[64..].copy_from_slice(&outpoint.output_index.to_le_bytes());
+    id
+}
+
+fn namespaced_transaction_id(config: &HnsRuntimeConfig, transaction: TransactionHash) -> [u8; 64] {
+    let mut id = [0_u8; 64];
+    id[..32].copy_from_slice(&account_entity_prefix(config));
+    id[32..].copy_from_slice(transaction.as_bytes());
+    id
+}
+
+fn namespaced_name_id(config: &HnsRuntimeConfig, name_hash: [u8; 32]) -> [u8; 64] {
+    let mut id = [0_u8; 64];
+    id[..32].copy_from_slice(&account_entity_prefix(config));
+    id[32..].copy_from_slice(&name_hash);
+    id
+}
+
+fn persist_derived_addresses(
+    store: &mut WalletStore,
+    config: &HnsRuntimeConfig,
+    addresses: &[DerivedHnsAddress],
+    now_unix: u64,
+) -> Result<(), HnsWalletError> {
+    let existing: BTreeMap<Vec<u8>, u64> = store
+        .derived_addresses::<DerivedHnsAddress>(MAX_RESTORE_LOOKAHEAD as usize)?
+        .into_iter()
+        .filter(|entity| entity.id.starts_with(&account_entity_prefix(config)))
+        .map(|entity| (entity.id, entity.revision))
+        .collect();
+    for address in addresses {
+        let id = derived_address_id(config, address.derivation.change, address.derivation.index);
+        let revision = existing.get(id.as_slice()).copied().unwrap_or(0);
+        store.save_derived_address(&id, revision, address, now_unix)?;
+    }
+    Ok(())
+}
+
+fn available_unreserved_coins(
+    store: &mut WalletStore,
+    config: &HnsRuntimeConfig,
+    coins: Vec<TrackedHnsCoin>,
+    now_unix: u64,
+) -> Result<Vec<TrackedHnsCoin>, HnsWalletError> {
+    let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+    let mut reserved = BTreeSet::new();
+    let mut expired = Vec::new();
+    for stored in reservations {
+        if stored.value.wallet_id != config.wallet_id
+            || stored.value.account_id != config.account_id
+        {
+            continue;
+        }
+        if stored
+            .value
+            .expires_at_unix
+            .is_some_and(|expiry| expiry <= now_unix)
+        {
+            expired.push(EntityBatchDelete {
+                id: stored.id,
+                expected_revision: stored.revision,
+            });
+        } else {
+            reserved.insert(stored.value.outpoint);
+        }
+    }
+    if !expired.is_empty() {
+        store.apply_entity_batch::<HnsInputReservation>(
+            EntityKind::InputReservation,
+            &[],
+            &expired,
+        )?;
+    }
+    Ok(coins
+        .into_iter()
+        .filter(|coin| !reserved.contains(&coin.coin.outpoint))
+        .collect())
+}
+
+fn reservation_saves(
+    config: &HnsRuntimeConfig,
+    workflow_id: WorkflowId,
+    inputs: &[TrackedHnsCoin],
+    expires_at_unix: u64,
+    now_unix: u64,
+) -> Result<Vec<EntityBatchSave<HnsInputReservation>>, HnsWalletError> {
+    let mut saves = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let reservation = HnsInputReservation {
+            wallet_id: config.wallet_id,
+            account_id: config.account_id,
+            outpoint: input.coin.outpoint,
+            workflow_id,
+            expires_at_unix: Some(expires_at_unix),
+        };
+        saves.push(EntityBatchSave {
+            id: namespaced_outpoint_id(config, input.coin.outpoint).to_vec(),
+            expected_revision: 0,
+            value: reservation,
+            updated_at_unix: now_unix,
+        });
+    }
+    Ok(saves)
+}
+
+fn validate_prepared_reservations(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+    workflow_id: WorkflowId,
+    outpoints: &[HnsOutpoint],
+    expires_at_unix: u64,
+) -> Result<(), HnsWalletError> {
+    if outpoints.is_empty() || outpoints.len() > MAX_WALLET_COINS {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
+    let expected: BTreeSet<HnsOutpoint> = outpoints.iter().copied().collect();
+    if expected.len() != outpoints.len() {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
+    let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+    let matching: Vec<_> = reservations
+        .into_iter()
+        .filter(|stored| {
+            stored.value.wallet_id == config.wallet_id
+                && stored.value.account_id == config.account_id
+                && stored.value.workflow_id == workflow_id
+        })
+        .collect();
+    if matching.len() != expected.len() {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
+    for stored in matching {
+        let expected_id = namespaced_outpoint_id(config, stored.value.outpoint);
+        if !expected.contains(&stored.value.outpoint)
+            || stored.id.as_slice() != expected_id.as_slice()
+            || stored.value.expires_at_unix != Some(expires_at_unix)
+        {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
+    }
+    Ok(())
+}
+
+fn reservation_activation_saves(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+    workflow_id: WorkflowId,
+    now_unix: u64,
+) -> Result<Vec<EntityBatchSave<HnsInputReservation>>, HnsWalletError> {
+    let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+    let mut saves = Vec::new();
+    for stored in reservations {
+        if stored.value.wallet_id != config.wallet_id
+            || stored.value.account_id != config.account_id
+            || stored.value.workflow_id != workflow_id
+        {
+            continue;
+        }
+        let mut reservation = stored.value;
+        reservation.expires_at_unix = None;
+        saves.push(EntityBatchSave {
+            id: stored.id,
+            expected_revision: stored.revision,
+            value: reservation,
+            updated_at_unix: now_unix,
+        });
+    }
+    Ok(saves)
+}
+
+fn reservation_deletes(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+    workflow_id: WorkflowId,
+) -> Result<Vec<EntityBatchDelete>, HnsWalletError> {
+    let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+    let mut deletes = Vec::new();
+    for stored in reservations {
+        if stored.value.wallet_id == config.wallet_id
+            && stored.value.account_id == config.account_id
+            && stored.value.workflow_id == workflow_id
+        {
+            deletes.push(EntityBatchDelete {
+                id: stored.id,
+                expected_revision: stored.revision,
+            });
+        }
+    }
+    Ok(deletes)
+}
+
+fn release_reservations(
+    store: &mut WalletStore,
+    config: &HnsRuntimeConfig,
+    workflow_id: WorkflowId,
+) -> Result<(), HnsWalletError> {
+    let deletes = reservation_deletes(store, config, workflow_id)?;
+    if !deletes.is_empty() {
+        store.apply_entity_batch::<HnsInputReservation>(
+            EntityKind::InputReservation,
+            &[],
+            &deletes,
+        )?;
+    }
+    Ok(())
+}
+
+impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
+    fn module_id(&self) -> ModuleId {
+        ModuleId::Handshake
+    }
+
+    fn capabilities(&self) -> ChainCapabilities {
+        let config = self
+            .cache_read()
+            .map(|cache| cache.account.config.clone())
+            .ok();
+        ChainCapabilities {
+            receive: true,
+            send: config.as_ref().is_some_and(|config| {
+                HNS_VALUE_RUNTIME_RELEASE_QUALIFIED && config.value_operations_enabled
+            }),
+            history: true,
+            atomic_settlement: config.as_ref().is_some_and(|config| {
+                HNS_VALUE_RUNTIME_RELEASE_QUALIFIED && config.settlement_enabled
+            }),
+            hash_algorithm: HashAlgorithm::Sha256,
+            locktime_model: LocktimeModel::BlockHeight,
+            finality_model: FinalityModel::ProofOfWorkConfirmations,
+            fee_model: FeeModel::WeightRate,
+        }
+    }
+
+    fn sync_status(&self) -> SyncStatus {
+        self.cache_read().map_or(
+            SyncStatus {
+                phase: SyncPhase::Degraded,
+                validated_height: 0,
+                scanned_height: 0,
+                target_height: None,
+                last_error: Some("wallet runtime lock is unavailable".to_owned()),
+            },
+            |cache| cache.sync.clone(),
+        )
+    }
+
+    fn balance(&self) -> Result<Amount, ChainError> {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_ready(&cache)?;
+        let total = cache
+            .coins
+            .iter()
+            .try_fold(BaseUnits::ZERO, |total, coin| {
+                if coin.coin.name_locked {
+                    Ok(total)
+                } else {
+                    total
+                        .checked_add(coin.coin.value)
+                        .map_err(|_| ChainError::Overflow)
+                }
+            })?;
+        Ok(Amount {
+            asset: WalletAsset::Hns,
+            base_units: total,
+        })
+    }
+
+    fn transaction_history(&self) -> Result<Vec<TransactionSummary>, ChainError> {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_ready(&cache)?;
+        Ok(cache
+            .transactions
+            .iter()
+            .map(|record| record.summary.clone())
+            .collect())
+    }
+
+    fn receive_target(&self) -> Result<ReceiveTarget, ChainError> {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_ready(&cache)?;
+        let account = cache.account.clone();
+        drop(cache);
+        let derivation = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: account_number(&account),
+            change: 0,
+            index: account.next_receive_index,
+        };
+        let public_key = derive_hns_public_key(
+            &self.store_lock().map_err(map_chain_error)?,
+            account.config.wallet_id,
+            derivation,
+        )
+        .map_err(map_chain_error)?;
+        Ok(ReceiveTarget {
+            module: ModuleId::Handshake,
+            account: account.config.account_id,
+            display: receive_address(account.config.network, &public_key)
+                .map_err(map_chain_error)?,
+            derivation_index: derivation.index,
+        })
+    }
+
+    fn prepare_send(&self, request: SendRequest) -> Result<PreparedSend, ChainError> {
+        request.validate()?;
+        if request.request_nonce == 0
+            || request.amount.asset != WalletAsset::Hns
+            || request.maximum_fee.is_zero()
+        {
+            return Err(ChainError::InvalidRequest("invalid Handshake send terms"));
+        }
+        let now = self.clock.now_unix().map_err(map_chain_error)?;
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_ready(&cache)?;
+        if !cache.account.config.value_operations_enabled {
+            return Err(ChainError::Disabled);
+        }
+        if request.account != cache.account.config.account_id {
+            return Err(ChainError::InvalidRequest("account does not match runtime"));
+        }
+        let account = cache.account.clone();
+        let account_revision = cache.account_revision;
+        let coins = cache.coins.clone();
+        drop(cache);
+        let workflow_id = send_workflow_id(&account.config, request.request_nonce);
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        if let Some(stored) = store
+            .load_workflow::<HnsSendWorkflow>(workflow_id)
+            .map_err(map_chain_error)?
+        {
+            let prepared =
+                Self::recover_prepared_send(&stored, &request, &account.config, workflow_id, now)?;
+            let outpoints: Vec<HnsOutpoint> = stored
+                .state
+                .plan
+                .inputs
+                .iter()
+                .map(|input| input.coin.outpoint)
+                .collect();
+            validate_prepared_reservations(
+                &store,
+                &account.config,
+                workflow_id,
+                &outpoints,
+                stored.state.plan.expires_at_unix,
+            )
+            .map_err(map_chain_error)?;
+            let committed_account = store
+                .wallet_account::<HnsAccountRecord>(&account_entity_id(&account.config))
+                .map_err(map_chain_error)?
+                .ok_or(ChainError::InvalidEvidence)?;
+            self.install_loaded_account(committed_account)
+                .map_err(map_chain_error)?;
+            return Ok(prepared);
+        }
+        let coins = available_unreserved_coins(&mut store, &account.config, coins, now)
+            .map_err(map_chain_error)?;
+        let destination = decode_hns_address(account.config.network, &request.destination)
+            .map_err(map_chain_error)?;
+        let change_derivation = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: account_number(&account),
+            change: 1,
+            index: account.next_change_index,
+        };
+        let change_public =
+            derive_hns_public_key(&store, account.config.wallet_id, change_derivation)
+                .map_err(map_chain_error)?;
+        let change = Address::new(
+            0,
+            public_key_hash(&change_public)
+                .map_err(map_chain_error)?
+                .to_vec(),
+        )
+        .map_err(|_| ChainError::InvalidRequest("invalid change address"))?;
+        let fee_rate = self.backend.estimate_fee_rate(6).map_err(map_chain_error)?;
+        let (transaction, selected, fee) = build_unsigned_payment(
+            coins,
+            destination,
+            change,
+            request.amount.base_units,
+            fee_rate,
+            request.maximum_fee,
+            account.config.dust_threshold,
+        )
+        .map_err(map_chain_error)?;
+        let expires_at_unix = now
+            .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
+            .ok_or(ChainError::Overflow)?;
+        let plan = HnsSpendPlan {
+            wallet_id: account.config.wallet_id,
+            account_id: account.config.account_id,
+            workflow_id,
+            request_nonce: request.request_nonce,
+            unsigned_transaction: transaction
+                .encode()
+                .map_err(|_| ChainError::InvalidTransactionSize)?,
+            inputs: selected,
+            amount: request.amount.base_units,
+            fee,
+            maximum_fee: request.maximum_fee,
+            destination: request.destination.clone(),
+            expires_at_unix,
+        };
+        let workflow = HnsSendWorkflow {
+            plan: plan.clone(),
+            stage: HnsSendStage::Prepared,
+            transaction: None,
+            signed_transaction: None,
+        };
+        let reservation_saves = reservation_saves(
+            &account.config,
+            workflow_id,
+            &workflow.plan.inputs,
+            expires_at_unix,
+            now,
+        )
+        .map_err(map_chain_error)?;
+        let account_save =
+            Self::change_account_save(&account, account_revision, change_derivation.index, now)
+                .map_err(map_chain_error)?;
+        let prepared = Self::prepared_send_from_plan(&plan)?;
+        let (_, next_account_revision) = store
+            .save_workflow_with_account_and_entity_batch(
+                workflow_id,
+                WorkflowKind::HnsSend,
+                0,
+                &workflow,
+                false,
+                now,
+                &account_save,
+                EntityKind::InputReservation,
+                &reservation_saves,
+                &[],
+            )
+            .map_err(map_chain_error)?;
+        self.install_committed_account(account_revision, next_account_revision, account_save.value)
+            .map_err(map_chain_error)?;
+        Ok(prepared)
+    }
+
+    fn authorize_send(&self, request: AuthorizeSend) -> Result<AuthorizedSend, ChainError> {
+        let now = self.clock.now_unix().map_err(map_chain_error)?;
+        if request.prepared.module != ModuleId::Handshake
+            || now > request.prepared.expires_at_unix
+            || request.approved_at_unix > now
+        {
+            return Err(ChainError::ApprovalRequired);
+        }
+        let plan: HnsSpendPlan =
+            serde_json::from_slice(request.prepared.authorization_commitment())
+                .map_err(|_| ChainError::InvalidRequest("invalid prepared Handshake send"))?;
+        if plan.expires_at_unix != request.prepared.expires_at_unix
+            || plan.amount != request.prepared.amount.base_units
+            || plan.fee != request.prepared.fee
+            || plan.destination != request.prepared.destination
+        {
+            return Err(ChainError::InvalidRequest("prepared send mismatch"));
+        }
+        let account = self.cache_read().map_err(map_chain_error)?.account.clone();
+        if plan.wallet_id != account.config.wallet_id
+            || plan.account_id != account.config.account_id
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        let approval = store
+            .take_pending_approval(request.approval_id, now)
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::ApprovalRequired)?;
+        let approval: HnsSendApproval = serde_json::from_slice(&approval.request_json)
+            .map_err(|_| ChainError::ApprovalRequired)?;
+        let commitment: [u8; 32] =
+            Sha256::digest(request.prepared.authorization_commitment()).into();
+        if approval.workflow_id != plan.workflow_id || approval.commitment != commitment {
+            return Err(ChainError::ApprovalRequired);
+        }
+        let signed = sign_payment_plan(&store, &account, &plan).map_err(map_chain_error)?;
+        let transaction =
+            Transaction::decode(&signed).map_err(|_| ChainError::InvalidTransactionSize)?;
+        let txid = wallet_transaction_hash(&transaction).map_err(map_chain_error)?;
+        let stored = store
+            .load_workflow::<HnsSendWorkflow>(plan.workflow_id)
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::InvalidEvidence)?;
+        if stored.state.plan != plan || stored.state.stage != HnsSendStage::Prepared {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let workflow = HnsSendWorkflow {
+            plan,
+            stage: HnsSendStage::Authorized,
+            transaction: Some(txid),
+            signed_transaction: Some(signed.clone()),
+        };
+        let reservation_saves =
+            reservation_activation_saves(&store, &account.config, workflow.plan.workflow_id, now)
+                .map_err(map_chain_error)?;
+        store
+            .save_workflow_with_entity_batch(
+                workflow.plan.workflow_id,
+                WorkflowKind::HnsSend,
+                stored.revision,
+                &workflow,
+                true,
+                now,
+                EntityKind::InputReservation,
+                &reservation_saves,
+                &[],
+            )
+            .map_err(map_chain_error)?;
+        AuthorizedSend::new(ModuleId::Handshake, request.approval_id, signed)
+    }
+
+    fn broadcast_send(&self, request: BroadcastSend) -> Result<BroadcastReceipt, ChainError> {
+        let raw = request.into_transaction();
+        let transaction =
+            Transaction::decode(&raw).map_err(|_| ChainError::InvalidTransactionSize)?;
+        let txid = wallet_transaction_hash(&transaction).map_err(map_chain_error)?;
+        let now = self.clock.now_unix().map_err(map_chain_error)?;
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        let workflows = store
+            .list_workflows::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)
+            .map_err(map_chain_error)?;
+        let stored = workflows
+            .into_iter()
+            .find(|workflow| {
+                workflow.state.transaction == Some(txid)
+                    && workflow.state.signed_transaction.as_deref() == Some(raw.as_slice())
+            })
+            .ok_or(ChainError::InvalidEvidence)?;
+        if stored.state.stage != HnsSendStage::Authorized {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let accepted = self
+            .backend
+            .broadcast_transaction(&raw)
+            .map_err(map_chain_error)?;
+        if accepted != txid {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let mut state = stored.state;
+        state.stage = HnsSendStage::Broadcast;
+        store
+            .save_workflow(
+                stored.id,
+                WorkflowKind::HnsSend,
+                stored.revision,
+                &state,
+                true,
+                now,
+            )
+            .map_err(map_chain_error)?;
+        Ok(BroadcastReceipt {
+            module: ModuleId::Handshake,
+            txid,
+            accepted_at_unix: now,
+        })
+    }
+}
+
+impl<B: HnsBackend, C: HnsClock> UtxoChainModule for HnsWalletRuntime<B, C> {
+    fn list_utxos(&self) -> Result<Vec<Utxo>, ChainError> {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_ready(&cache)?;
+        Ok(cache
+            .coins
+            .iter()
+            .map(|coin| Utxo {
+                txid: coin.coin.outpoint.transaction,
+                output_index: coin.coin.outpoint.output_index,
+                value: Amount {
+                    asset: WalletAsset::Hns,
+                    base_units: coin.coin.value,
+                },
+                confirmation_count: coin.coin.confirmation_count,
+                spendable: !coin.coin.name_locked,
+            })
+            .collect())
+    }
+
+    fn fee_policy(&self) -> Result<UtxoFeePolicy, ChainError> {
+        let rate = self.backend.estimate_fee_rate(6).map_err(map_chain_error)?;
+        let dust = self
+            .cache_read()
+            .map_err(map_chain_error)?
+            .account
+            .config
+            .dust_threshold;
+        Ok(UtxoFeePolicy {
+            base_units_per_kweight: rate,
+            minimum_relay: rate,
+            dust_threshold: dust,
+        })
+    }
+
+    fn prepare_htlc_lock(&self, request: HtlcLockRequest) -> Result<PreparedHtlcLock, ChainError> {
+        self.prepare_lock(SettlementLockRequest {
+            session_id: request.session_id,
+            module: ModuleId::Handshake,
+            amount: request.amount,
+            hashlock: request.hashlock,
+            receiver: hex::encode(request.receiver_key),
+            refund_target: hex::encode(request.refund_key),
+            absolute_timelock: request.absolute_timelock,
+            maximum_fee: request.maximum_fee,
+        })
+        .map(|prepared| PreparedHtlcLock(prepared.0))
+    }
+
+    fn verify_htlc_lock(
+        &self,
+        request: VerifyHtlcLockRequest,
+    ) -> Result<VerifiedHtlcLock, ChainError> {
+        self.verify_lock(VerifySettlementLockRequest {
+            expected: request.expected,
+            transaction_or_receipt: request.funding_transaction,
+            confirmation_count: request.confirmation_count,
+        })
+        .map(|verified| VerifiedHtlcLock(verified.0))
+    }
+
+    fn prepare_htlc_redeem(
+        &self,
+        request: HtlcRedeemRequest,
+    ) -> Result<PreparedHtlcRedeem, ChainError> {
+        self.prepare_redeem(SettlementRedeemRequest {
+            session_id: request.session_id,
+            lock: request.lock,
+            preimage: request.preimage,
+            maximum_fee: request.maximum_fee,
+        })
+        .map(|prepared| PreparedHtlcRedeem(prepared.0))
+    }
+
+    fn prepare_htlc_refund(
+        &self,
+        request: HtlcRefundRequest,
+    ) -> Result<PreparedHtlcRefund, ChainError> {
+        self.prepare_refund(SettlementRefundRequest {
+            session_id: request.session_id,
+            lock: request.lock,
+            current_chain_time: request.current_chain_time,
+            maximum_fee: request.maximum_fee,
+        })
+        .map(|prepared| PreparedHtlcRefund(prepared.0))
+    }
+
+    fn observe_preimage(
+        &self,
+        request: ObservePreimageRequest,
+    ) -> Result<Option<Preimage>, ChainError> {
+        self.observe_secret(request)
+    }
+}
+
+impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
+    fn settlement_capabilities(&self) -> SettlementCapabilities {
+        let enabled = self.cache_read().is_ok_and(|cache| {
+            HNS_VALUE_RUNTIME_RELEASE_QUALIFIED && cache.account.config.settlement_enabled
+        });
+        let minimum_confirmations = self
+            .cache_read()
+            .map_or(0, |cache| cache.account.config.minimum_confirmations);
+        SettlementCapabilities {
+            module: ModuleId::Handshake,
+            supported: enabled,
+            minimum_confirmations,
+            maximum_lock_bytes: 256,
+        }
+    }
+
+    fn prepare_lock(
+        &self,
+        request: SettlementLockRequest,
+    ) -> Result<PreparedSettlementLock, ChainError> {
+        validate_settlement_request(&request)?;
+        let now = self.clock.now_unix().map_err(map_chain_error)?;
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_settlement_ready(&cache)?;
+        let account = cache.account.clone();
+        let account_revision = cache.account_revision;
+        let coins = cache.coins.clone();
+        drop(cache);
+        let workflow_id = settlement_workflow_id(
+            &account.config,
+            request.session_id,
+            HnsSettlementAction::Lock,
+        );
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        if let Some(stored) = store
+            .load_workflow::<HnsPreparedSettlement>(workflow_id)
+            .map_err(map_chain_error)?
+        {
+            let expected_terms = HnsSettlementTerms::Lock {
+                request: request.clone(),
+            };
+            if stored.kind != settlement_workflow_kind(HnsSettlementAction::Lock)
+                || stored.state.wallet_id != account.config.wallet_id
+                || stored.state.account_id != account.config.account_id
+                || stored.state.workflow_id != workflow_id
+                || stored.state.session_id != request.session_id
+                || stored.state.action != HnsSettlementAction::Lock
+                || stored.state.stage != HnsSettlementStage::Prepared
+                || stored.state.terms != expected_terms
+                || stored.state.fee > request.maximum_fee
+                || stored.state.expires_at_unix <= now
+            {
+                return Err(ChainError::InvalidRequest(
+                    "persisted Handshake settlement does not match retry",
+                ));
+            }
+            let artifact =
+                Self::prepared_settlement_artifact(&stored.state).map_err(map_chain_error)?;
+            let transaction = Transaction::decode(&stored.state.signed_transaction)
+                .map_err(|_| ChainError::InvalidEvidence)?;
+            let outpoints: Vec<HnsOutpoint> = transaction
+                .inputs
+                .iter()
+                .map(|input| {
+                    if input.previous_output.is_null() {
+                        return Err(ChainError::InvalidEvidence);
+                    }
+                    Ok(HnsOutpoint {
+                        transaction: TransactionHash::new(
+                            input.previous_output.transaction_hash.into_bytes(),
+                        ),
+                        output_index: input.previous_output.index,
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            validate_prepared_reservations(
+                &store,
+                &account.config,
+                workflow_id,
+                &outpoints,
+                stored.state.expires_at_unix,
+            )
+            .map_err(map_chain_error)?;
+            let committed_account = store
+                .wallet_account::<HnsAccountRecord>(&account_entity_id(&account.config))
+                .map_err(map_chain_error)?
+                .ok_or(ChainError::InvalidEvidence)?;
+            self.install_loaded_account(committed_account)
+                .map_err(map_chain_error)?;
+            return Ok(PreparedSettlementLock(artifact));
+        }
+        let receiver = decode_compressed_key(&request.receiver)?;
+        let refund = decode_compressed_key(&request.refund_target)?;
+        let script = hns_htlc_script(
+            request.hashlock,
+            &receiver,
+            &refund,
+            request.absolute_timelock,
+        )?;
+        let lock_address = Address::new(0, Sha3_256::digest(&script).to_vec())
+            .map_err(|_| ChainError::InvalidRequest("invalid Handshake HTLC address"))?;
+        let change_derivation = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: account_number(&account),
+            change: 1,
+            index: account.next_change_index,
+        };
+        let coins = available_unreserved_coins(&mut store, &account.config, coins, now)
+            .map_err(map_chain_error)?;
+        let change_public =
+            derive_hns_public_key(&store, account.config.wallet_id, change_derivation)
+                .map_err(map_chain_error)?;
+        let change = Address::new(
+            0,
+            public_key_hash(&change_public)
+                .map_err(map_chain_error)?
+                .to_vec(),
+        )
+        .map_err(|_| ChainError::InvalidRequest("invalid change address"))?;
+        let fee_rate = self.backend.estimate_fee_rate(6).map_err(map_chain_error)?;
+        let (transaction, selected, fee) = build_unsigned_payment(
+            coins,
+            lock_address,
+            change,
+            request.amount.base_units,
+            fee_rate,
+            request.maximum_fee,
+            account.config.dust_threshold,
+        )
+        .map_err(map_chain_error)?;
+        let plan = HnsSpendPlan {
+            wallet_id: account.config.wallet_id,
+            account_id: account.config.account_id,
+            workflow_id,
+            request_nonce: 0,
+            unsigned_transaction: transaction
+                .encode()
+                .map_err(|_| ChainError::InvalidTransactionSize)?,
+            inputs: selected,
+            amount: request.amount.base_units,
+            fee,
+            maximum_fee: request.maximum_fee,
+            destination: hex::encode(Sha3_256::digest(&script)),
+            expires_at_unix: now
+                .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
+                .ok_or(ChainError::Overflow)?,
+        };
+        let reservation_saves = reservation_saves(
+            &account.config,
+            workflow_id,
+            &plan.inputs,
+            plan.expires_at_unix,
+            now,
+        )
+        .map_err(map_chain_error)?;
+        let signed = sign_payment_plan(&store, &account, &plan).map_err(map_chain_error)?;
+        let account_save =
+            Self::change_account_save(&account, account_revision, change_derivation.index, now)
+                .map_err(map_chain_error)?;
+        drop(store);
+        let artifact = self
+            .persist_prepared_settlement(
+                request.session_id,
+                HnsSettlementAction::Lock,
+                signed,
+                fee,
+                HnsSettlementTerms::Lock {
+                    request: request.clone(),
+                },
+                &reservation_saves,
+                Some(&account_save),
+                now,
+            )
+            .map_err(map_chain_error)?;
+        Ok(PreparedSettlementLock(artifact))
+    }
+
+    fn verify_lock(
+        &self,
+        request: VerifySettlementLockRequest,
+    ) -> Result<VerifiedSettlementLock, ChainError> {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_settlement_ready(&cache)?;
+        let configured_minimum = cache.account.config.minimum_confirmations;
+        let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        if request.expected.module != ModuleId::Handshake
+            || request.expected.amount.asset != WalletAsset::Hns
+            || request.expected.absolute_timelock == 0
+            || request.expected.absolute_timelock >= HNS_LOCKTIME_THRESHOLD
+            || request.expected.minimum_confirmations < configured_minimum
+            || request.confirmation_count < request.expected.minimum_confirmations
+            || request.confirmation_count < configured_minimum
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let receiver = decode_compressed_key(&request.expected.receiver)?;
+        let refund = decode_compressed_key(&request.expected.refund_target)?;
+        let script = hns_htlc_script(
+            request.expected.hashlock,
+            &receiver,
+            &refund,
+            request.expected.absolute_timelock,
+        )?;
+        let program = Sha3_256::digest(&script).to_vec();
+        let transaction = Transaction::decode(&request.transaction_or_receipt)
+            .map_err(|_| ChainError::InvalidEvidence)?;
+        let txid = wallet_transaction_hash(&transaction).map_err(map_chain_error)?;
+        let evidence = self
+            .backend
+            .get_transaction_evidence(txid, binding)
+            .map_err(map_chain_error)?;
+        if evidence.binding != binding
+            || evidence.raw.as_deref() != Some(request.transaction_or_receipt.as_slice())
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let status = evidence.status;
+        if status.conflicted || status.confirmation_count != request.confirmation_count {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let inclusion = evidence.inclusion.ok_or(ChainError::InvalidEvidence)?;
+        if inclusion.height > binding.tip.height
+            || u64::from(status.confirmation_count) != binding.tip.height - inclusion.height + 1
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let amount = u64::try_from(request.expected.amount.base_units.get())
+            .map_err(|_| ChainError::InvalidEvidence)?;
+        let matches: Vec<usize> = transaction
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| {
+                output.value.get() == amount
+                    && output.address.version == 0
+                    && output.address.hash == program
+                    && output.covenant == Covenant::default()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if matches.len() != 1 {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let output_index = u32::try_from(matches[0]).map_err(|_| ChainError::InvalidEvidence)?;
+        let terms =
+            serde_json::to_vec(&request.expected).map_err(|_| ChainError::InvalidEvidence)?;
+        let mut evidence_hasher = Sha256::new();
+        evidence_hasher.update(b"hns-wallet-rs/hns-verified-lock/v1");
+        evidence_hasher.update(&request.transaction_or_receipt);
+        evidence_hasher.update(inclusion.block_hash);
+        evidence_hasher.update(inclusion.height.to_be_bytes());
+        evidence_hasher.update(output_index.to_be_bytes());
+        evidence_hasher.update(
+            u64::try_from(terms.len())
+                .map_err(|_| ChainError::InvalidEvidence)?
+                .to_be_bytes(),
+        );
+        evidence_hasher.update(&terms);
+        evidence_hasher.update(&script);
+        let evidence_hash: [u8; 32] = evidence_hasher.finalize().into();
+        let verified = VerifiedLock {
+            module: ModuleId::Handshake,
+            session_id: request.expected.session_id,
+            funding_id: txid,
+            amount: request.expected.amount,
+            hashlock: request.expected.hashlock,
+            absolute_timelock: request.expected.absolute_timelock,
+            confirmation_count: request.confirmation_count,
+            evidence_hash: ObjectHash::new(evidence_hash),
+        };
+        let record = HnsVerifiedSettlementRecord {
+            expected: request.expected,
+            verified: verified.clone(),
+            output_index,
+            script,
+        };
+        let now = self.clock.now_unix().map_err(map_chain_error)?;
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        let id = settlement_entity_id(&config, record.expected.session_id);
+        match store
+            .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&id)
+            .map_err(map_chain_error)?
+        {
+            Some(stored) if stored.value == record => {
+                return Ok(VerifiedSettlementLock(stored.value.verified));
+            }
+            Some(stored)
+                if same_verified_settlement_binding(&stored.value, &record)
+                    && record.verified.confirmation_count
+                        >= stored.value.verified.confirmation_count =>
+            {
+                store
+                    .save_hns_verified_settlement(&id, stored.revision, &record, now)
+                    .map_err(map_chain_error)?;
+            }
+            Some(_) => return Err(ChainError::InvalidEvidence),
+            None => {
+                store
+                    .save_hns_verified_settlement(&id, 0, &record, now)
+                    .map_err(map_chain_error)?;
+            }
+        }
+        Ok(VerifiedSettlementLock(verified))
+    }
+
+    fn prepare_redeem(
+        &self,
+        request: SettlementRedeemRequest,
+    ) -> Result<PreparedSettlementRedeem, ChainError> {
+        let expected_hash: [u8; 32] =
+            Sha256::digest(request.preimage.expose_for_settlement()).into();
+        if expected_hash != *request.lock.hashlock.as_bytes() {
+            return Err(ChainError::InvalidEvidence);
+        }
+        self.prepare_settlement_spend(
+            request.session_id,
+            request.lock,
+            Some(request.preimage),
+            request.maximum_fee,
+            None,
+            HnsSettlementAction::Redeem,
+        )
+        .map(PreparedSettlementRedeem)
+    }
+
+    fn prepare_refund(
+        &self,
+        request: SettlementRefundRequest,
+    ) -> Result<PreparedSettlementRefund, ChainError> {
+        if request.current_chain_time >= HNS_LOCKTIME_THRESHOLD
+            || request.lock.absolute_timelock >= HNS_LOCKTIME_THRESHOLD
+            || request.current_chain_time < request.lock.absolute_timelock
+        {
+            return Err(ChainError::InvalidRequest("refund timelock is not mature"));
+        }
+        self.prepare_settlement_spend(
+            request.session_id,
+            request.lock,
+            None,
+            request.maximum_fee,
+            Some(request.current_chain_time),
+            HnsSettlementAction::Refund,
+        )
+        .map(PreparedSettlementRefund)
+    }
+
+    fn observe_secret(
+        &self,
+        request: ObserveSecretRequest,
+    ) -> Result<Option<Preimage>, ChainError> {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_settlement_ready(&cache)?;
+        let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        let record = self
+            .store_lock()
+            .map_err(map_chain_error)?
+            .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
+                &config,
+                request.session_id,
+            ))
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::InvalidEvidence)?
+            .value;
+        if record.expected.session_id != request.session_id
+            || record.expected.hashlock != request.hashlock
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let evidence = self
+            .backend
+            .get_transaction_evidence(request.spending_transaction, binding)
+            .map_err(map_chain_error)?;
+        if evidence.binding != binding {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let status = evidence.status;
+        if status.conflicted || (!status.in_mempool && status.confirmation_count == 0) {
+            return Ok(None);
+        }
+        let raw = evidence.raw.ok_or(ChainError::InvalidEvidence)?;
+        let transaction = decode_transaction_for_id(&raw, request.spending_transaction)
+            .map_err(map_chain_error)?;
+        let expected_outpoint = Outpoint {
+            transaction_hash: CanonicalTransactionHash::new(
+                record.verified.funding_id.into_bytes(),
+            ),
+            index: record.output_index,
+        };
+        let mut matching_input = None;
+        for input in &transaction.inputs {
+            if input.previous_output != expected_outpoint {
+                continue;
+            }
+            if matching_input.replace(input).is_some() {
+                return Err(ChainError::InvalidEvidence);
+            }
+        }
+        let Some(input) = matching_input else {
+            return Err(ChainError::InvalidEvidence);
+        };
+        if input.witness.items.len() != 4
+            || input.witness.items[0].len() != 65
+            || input.witness.items[1].len() != Preimage::LENGTH
+            || input.witness.items[2].is_empty()
+            || input.witness.items[3] != record.script
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let digest: [u8; 32] = Sha256::digest(&input.witness.items[1]).into();
+        if digest != *record.expected.hashlock.as_bytes() {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let bytes: [u8; 32] = input.witness.items[1]
+            .as_slice()
+            .try_into()
+            .map_err(|_| ChainError::InvalidEvidence)?;
+        Ok(Some(Preimage::new(bytes)))
+    }
+}
+
+fn ensure_ready(cache: &HnsRuntimeCache) -> Result<(), ChainError> {
+    if cache.sync.phase == SyncPhase::Ready
+        && cache.sync.validated_height == cache.sync.scanned_height
+    {
+        Ok(())
+    } else {
+        Err(ChainError::NotSynchronized)
+    }
+}
+
+fn map_chain_error(error: HnsWalletError) -> ChainError {
+    match error {
+        HnsWalletError::StoreLocked | HnsWalletError::MissingSeed => ChainError::Locked,
+        HnsWalletError::MainnetDisabled | HnsWalletError::RuntimeIntegrationUnavailable => {
+            ChainError::Disabled
+        }
+        HnsWalletError::InvalidAmount
+        | HnsWalletError::InvalidAddress
+        | HnsWalletError::InvalidPreparedArtifact
+        | HnsWalletError::PreparedArtifactExpired
+        | HnsWalletError::InvalidRuntimeConfiguration => {
+            ChainError::InvalidRequest("invalid Handshake wallet request")
+        }
+        HnsWalletError::Arithmetic => ChainError::Overflow,
+        HnsWalletError::FeeLimit => ChainError::FeeLimit,
+        HnsWalletError::InsufficientFunds => {
+            ChainError::InvalidRequest("insufficient Handshake funds")
+        }
+        HnsWalletError::InvalidEvidence
+        | HnsWalletError::NameNotOwned
+        | HnsWalletError::StaleNodeSnapshot => ChainError::InvalidEvidence,
+        HnsWalletError::Store => ChainError::Backend("wallet store failed".to_owned()),
+        _ => ChainError::Backend("Handshake wallet runtime failed".to_owned()),
+    }
+}
+
+fn decode_hns_address(network: HnsNetwork, value: &str) -> Result<Address, HnsWalletError> {
+    let (hrp, version, program) =
+        segwit::decode(value).map_err(|_| HnsWalletError::InvalidAddress)?;
+    let expected = Hrp::parse(network.hrp()).map_err(|_| HnsWalletError::InvalidAddress)?;
+    if hrp != expected {
+        return Err(HnsWalletError::InvalidAddress);
+    }
+    Address::new(version.to_u8(), program).map_err(|_| HnsWalletError::InvalidAddress)
+}
+
+fn build_unsigned_payment(
+    mut coins: Vec<TrackedHnsCoin>,
+    destination: Address,
+    change: Address,
+    amount: BaseUnits,
+    fee_rate: BaseUnits,
+    maximum_fee: BaseUnits,
+    dust_threshold: BaseUnits,
+) -> Result<(Transaction, Vec<TrackedHnsCoin>, BaseUnits), HnsWalletError> {
+    let amount = u64::try_from(amount.get()).map_err(|_| HnsWalletError::InvalidAmount)?;
+    if amount == 0 || fee_rate.is_zero() || maximum_fee.is_zero() {
+        return Err(HnsWalletError::InvalidAmount);
+    }
+    coins.retain(|coin| !coin.coin.name_locked && coin.coin.confirmation_count > 0);
+    coins.sort_by(|left, right| {
+        left.coin
+            .value
+            .cmp(&right.coin.value)
+            .then_with(|| left.coin.outpoint.cmp(&right.coin.outpoint))
+    });
+    let mut selected = Vec::new();
+    let mut total = 0_u128;
+    for coin in coins {
+        total = total
+            .checked_add(coin.coin.value.get())
+            .ok_or(HnsWalletError::Arithmetic)?;
+        selected.push(coin);
+        let provisional = unsigned_payment_transaction(
+            &selected,
+            destination.clone(),
+            Some((change.clone(), 1)),
+            amount,
+        )?;
+        let change_fee = transaction_fee(&provisional, fee_rate)?;
+        let required = u128::from(amount)
+            .checked_add(change_fee.get())
+            .ok_or(HnsWalletError::Arithmetic)?;
+        if total < required {
+            continue;
+        }
+        let change_value = total - required;
+        if change_value >= dust_threshold.get() {
+            if change_fee > maximum_fee {
+                return Err(HnsWalletError::FeeLimit);
+            }
+            let change_value =
+                u64::try_from(change_value).map_err(|_| HnsWalletError::InvalidAmount)?;
+            let transaction = unsigned_payment_transaction(
+                &selected,
+                destination.clone(),
+                Some((change.clone(), change_value)),
+                amount,
+            )?;
+            return Ok((transaction, selected, change_fee));
+        }
+
+        let no_change = unsigned_payment_transaction(&selected, destination.clone(), None, amount)?;
+        let minimum_fee = transaction_fee(&no_change, fee_rate)?;
+        let actual_fee = BaseUnits::new(total - u128::from(amount));
+        if actual_fee >= minimum_fee && actual_fee <= maximum_fee {
+            return Ok((no_change, selected, actual_fee));
+        }
+    }
+    Err(HnsWalletError::InsufficientFunds)
+}
+
+fn unsigned_payment_transaction(
+    selected: &[TrackedHnsCoin],
+    destination: Address,
+    change: Option<(Address, u64)>,
+    amount: u64,
+) -> Result<Transaction, HnsWalletError> {
+    let inputs = selected
+        .iter()
+        .map(|coin| Input {
+            previous_output: Outpoint {
+                transaction_hash: CanonicalTransactionHash::new(
+                    coin.coin.outpoint.transaction.into_bytes(),
+                ),
+                index: coin.coin.outpoint.output_index,
+            },
+            sequence: u32::MAX,
+            witness: Witness {
+                items: vec![vec![0; 65], vec![0; 33]],
+            },
+        })
+        .collect();
+    let mut outputs = vec![Output {
+        value: Dollarydoos::new(amount),
+        address: destination,
+        covenant: Covenant::default(),
+    }];
+    if let Some((address, value)) = change {
+        outputs.push(Output {
+            value: Dollarydoos::new(value),
+            address,
+            covenant: Covenant::default(),
+        });
+    }
+    Ok(Transaction {
+        version: 0,
+        inputs,
+        outputs,
+        locktime: 0,
+    })
+}
+
+fn transaction_fee(
+    transaction: &Transaction,
+    rate_per_kweight: BaseUnits,
+) -> Result<BaseUnits, HnsWalletError> {
+    let weight = transaction
+        .weight()
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+    let product = rate_per_kweight
+        .get()
+        .checked_mul(weight as u128)
+        .ok_or(HnsWalletError::Arithmetic)?;
+    let fee = product.checked_add(999).ok_or(HnsWalletError::Arithmetic)? / 1_000;
+    Ok(BaseUnits::new(fee))
+}
+
+fn sign_payment_plan(
+    store: &WalletStore,
+    account: &HnsAccountRecord,
+    plan: &HnsSpendPlan,
+) -> Result<Vec<u8>, HnsWalletError> {
+    let mut transaction = Transaction::decode(&plan.unsigned_transaction)
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+    if transaction.inputs.len() != plan.inputs.len() || transaction.inputs.is_empty() {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    let seed = store
+        .get_secret(
+            account.config.wallet_id.as_bytes(),
+            SecretKind::RecoverySeed,
+        )?
+        .ok_or(HnsWalletError::MissingSeed)?;
+    for (index, coin) in plan.inputs.iter().enumerate() {
+        let expected = Outpoint {
+            transaction_hash: CanonicalTransactionHash::new(
+                coin.coin.outpoint.transaction.into_bytes(),
+            ),
+            index: coin.coin.outpoint.output_index,
+        };
+        if transaction.inputs[index].previous_output != expected
+            || coin.derivation.role != KeyRole::HnsCoin
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let secret = derive_secret(&seed, coin.derivation)?;
+        let signing =
+            SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
+        let public = signing.verifying_key().to_encoded_point(true);
+        let public_bytes: [u8; 33] = public
+            .as_bytes()
+            .try_into()
+            .map_err(|_| HnsWalletError::KeyDerivation)?;
+        if public_key_hash(&public_bytes)?.as_slice() != coin.address_program {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let previous_value =
+            u64::try_from(coin.coin.value.get()).map_err(|_| HnsWalletError::InvalidAmount)?;
+        let script = p2pkh_script(&coin.address_program)?;
+        let digest = signature_hash(&transaction, index, &script, previous_value, SIGHASH_ALL)
+            .map_err(|_| HnsWalletError::Signing)?;
+        let signature: Signature = signing
+            .sign_prehash(&digest)
+            .map_err(|_| HnsWalletError::Signing)?;
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let mut encoded = signature.to_bytes().to_vec();
+        encoded.push(SIGHASH_ALL as u8);
+        transaction.inputs[index].witness = Witness {
+            items: vec![encoded, public.as_bytes().to_vec()],
+        };
+    }
+    transaction
+        .encode()
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)
+}
+
+fn p2pkh_script(program: &[u8]) -> Result<Vec<u8>, HnsWalletError> {
+    if program.len() != 20 {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    let mut script = Vec::with_capacity(25);
+    script.extend_from_slice(&[OP_DUP, OP_BLAKE160, 20]);
+    script.extend_from_slice(program);
+    script.extend_from_slice(&[OP_EQUALVERIFY, OP_CHECKSIG]);
+    Ok(script)
+}
+
+fn wallet_transaction_hash(transaction: &Transaction) -> Result<TransactionHash, HnsWalletError> {
+    transaction
+        .transaction_hash()
+        .map(|hash| TransactionHash::new(hash.into_bytes()))
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)
+}
+
+fn send_workflow_id(config: &HnsRuntimeConfig, request_nonce: u64) -> WorkflowId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hns-wallet-rs/hns-send-workflow/v1");
+    hasher.update(account_entity_prefix(config));
+    hasher.update(request_nonce.to_be_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    WorkflowId::new(id)
+}
+
+fn ensure_settlement_ready(cache: &HnsRuntimeCache) -> Result<(), ChainError> {
+    ensure_ready(cache)?;
+    if cache.account.config.settlement_enabled {
+        Ok(())
+    } else {
+        Err(ChainError::Disabled)
+    }
+}
+
+fn validate_settlement_request(request: &SettlementLockRequest) -> Result<(), ChainError> {
+    if request.module != ModuleId::Handshake
+        || request.amount.asset != WalletAsset::Hns
+        || request.amount.base_units.is_zero()
+        || request.maximum_fee.is_zero()
+        || request.absolute_timelock == 0
+        || request.absolute_timelock >= HNS_LOCKTIME_THRESHOLD
+    {
+        return Err(ChainError::InvalidRequest(
+            "invalid Handshake settlement terms",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_compressed_key(value: &str) -> Result<[u8; 33], ChainError> {
+    let mut key = [0_u8; 33];
+    hex::decode_to_slice(value, &mut key)
+        .map_err(|_| ChainError::InvalidRequest("invalid compressed settlement key"))?;
+    VerifyingKey::from_sec1_bytes(&key)
+        .map_err(|_| ChainError::InvalidRequest("invalid compressed settlement key"))?;
+    Ok(key)
+}
+
+fn hns_htlc_script(
+    hashlock: ObjectHash,
+    receiver: &[u8; 33],
+    refund: &[u8; 33],
+    absolute_timelock: u64,
+) -> Result<Vec<u8>, ChainError> {
+    let timelock = u32::try_from(absolute_timelock)
+        .map_err(|_| ChainError::InvalidRequest("Handshake timelock exceeds u32"))?;
+    let encoded_timelock = encode_script_number(u64::from(timelock));
+    let mut script = Vec::with_capacity(114);
+    script.extend_from_slice(&[OP_IF, OP_SHA256, 32]);
+    script.extend_from_slice(hashlock.as_bytes());
+    script.extend_from_slice(&[OP_EQUALVERIFY, 33]);
+    script.extend_from_slice(receiver);
+    script.extend_from_slice(&[OP_ELSE, encoded_timelock.len() as u8]);
+    script.extend_from_slice(&encoded_timelock);
+    script.extend_from_slice(&[OP_CHECKLOCKTIMEVERIFY, OP_DROP, 33]);
+    script.extend_from_slice(refund);
+    script.extend_from_slice(&[OP_ENDIF, OP_CHECKSIG]);
+    Ok(script)
+}
+
+fn encode_script_number(mut value: u64) -> Vec<u8> {
+    if value == 0 {
+        return Vec::new();
+    }
+    let mut encoded = Vec::new();
+    while value > 0 {
+        encoded.push(value as u8);
+        value >>= 8;
+    }
+    if encoded.last().is_some_and(|byte| byte & 0x80 != 0) {
+        encoded.push(0);
+    }
+    encoded
+}
+
+fn derive_settlement_secret(
+    seed: &[u8],
+    account: &HnsAccountRecord,
+    session_id: SessionId,
+    refund: bool,
+) -> Result<Zeroizing<[u8; 32]>, HnsWalletError> {
+    let mut context = Sha256::new();
+    context.update(HNS_SETTLEMENT_KEY_DOMAIN);
+    context.update(account_number(account).to_be_bytes());
+    context.update(session_id.as_bytes());
+    context.update([u8::from(refund)]);
+    let context: [u8; 32] = context.finalize().into();
+    for counter in 0_u8..=u8::MAX {
+        let mut info = Vec::with_capacity(context.len() + 1);
+        info.extend_from_slice(&context);
+        info.push(counter);
+        let hkdf = Hkdf::<Sha256>::new(Some(b"Handshake atomic settlement role"), seed);
+        let mut candidate = Zeroizing::new([0_u8; 32]);
+        hkdf.expand(&info, candidate.as_mut())
+            .map_err(|_| HnsWalletError::KeyDerivation)?;
+        if SigningKey::from_slice(candidate.as_slice()).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    Err(HnsWalletError::KeyDerivation)
+}
+
+fn derive_settlement_public_key(
+    store: &WalletStore,
+    account: &HnsAccountRecord,
+    session_id: SessionId,
+    refund: bool,
+) -> Result<[u8; 33], HnsWalletError> {
+    let seed = store
+        .get_secret(
+            account.config.wallet_id.as_bytes(),
+            SecretKind::RecoverySeed,
+        )?
+        .ok_or(HnsWalletError::MissingSeed)?;
+    let secret = derive_settlement_secret(&seed, account, session_id, refund)?;
+    let signing =
+        SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
+    signing
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .map_err(|_| HnsWalletError::KeyDerivation)
+}
+
+fn settlement_workflow_id(
+    config: &HnsRuntimeConfig,
+    session_id: SessionId,
+    action: HnsSettlementAction,
+) -> WorkflowId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hns-wallet-rs/hns-settlement-workflow/v1");
+    hasher.update(account_entity_prefix(config));
+    hasher.update(session_id.as_bytes());
+    hasher.update([match action {
+        HnsSettlementAction::Lock => 0,
+        HnsSettlementAction::Redeem => 1,
+        HnsSettlementAction::Refund => 2,
+    }]);
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    WorkflowId::new(id)
+}
+
+fn settlement_workflow_kind(action: HnsSettlementAction) -> WorkflowKind {
+    if action == HnsSettlementAction::Refund {
+        WorkflowKind::Refund
+    } else {
+        WorkflowKind::AtomicSwap
+    }
+}
+
+fn same_prepared_settlement(
+    stored: &HnsPreparedSettlement,
+    artifact: &HnsPreparedSettlement,
+) -> bool {
+    stored.wallet_id == artifact.wallet_id
+        && stored.account_id == artifact.account_id
+        && stored.workflow_id == artifact.workflow_id
+        && stored.session_id == artifact.session_id
+        && stored.action == artifact.action
+        && artifact.stage == HnsSettlementStage::Prepared
+        && stored.transaction == artifact.transaction
+        && stored.signed_transaction == artifact.signed_transaction
+        && stored.fee == artifact.fee
+        && stored.expires_at_unix == artifact.expires_at_unix
+        && stored.terms == artifact.terms
+}
+
+fn same_verified_settlement_binding(
+    stored: &HnsVerifiedSettlementRecord,
+    candidate: &HnsVerifiedSettlementRecord,
+) -> bool {
+    stored.expected == candidate.expected
+        && stored.output_index == candidate.output_index
+        && stored.script == candidate.script
+        && stored.verified.module == candidate.verified.module
+        && stored.verified.session_id == candidate.verified.session_id
+        && stored.verified.funding_id == candidate.verified.funding_id
+        && stored.verified.amount == candidate.verified.amount
+        && stored.verified.hashlock == candidate.verified.hashlock
+        && stored.verified.absolute_timelock == candidate.verified.absolute_timelock
+        && stored.verified.evidence_hash == candidate.verified.evidence_hash
+}
+
+fn settlement_entity_id(config: &HnsRuntimeConfig, session_id: SessionId) -> [u8; 64] {
+    let mut id = [0_u8; 64];
+    id[..32].copy_from_slice(&account_entity_prefix(config));
+    id[32..].copy_from_slice(session_id.as_bytes());
+    id
+}
+
+fn sign_htlc_spend(
+    store: &WalletStore,
+    account: &HnsAccountRecord,
+    mut transaction: Transaction,
+    session_id: SessionId,
+    script: &[u8],
+    previous_value: u64,
+    preimage: Option<&Preimage>,
+    refund: bool,
+) -> Result<Vec<u8>, HnsWalletError> {
+    let seed = store
+        .get_secret(
+            account.config.wallet_id.as_bytes(),
+            SecretKind::RecoverySeed,
+        )?
+        .ok_or(HnsWalletError::MissingSeed)?;
+    let secret = derive_settlement_secret(&seed, account, session_id, refund)?;
+    let signing =
+        SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
+    let digest = signature_hash(&transaction, 0, script, previous_value, SIGHASH_ALL)
+        .map_err(|_| HnsWalletError::Signing)?;
+    let signature: Signature = signing
+        .sign_prehash(&digest)
+        .map_err(|_| HnsWalletError::Signing)?;
+    let signature = signature.normalize_s().unwrap_or(signature);
+    let mut encoded = signature.to_bytes().to_vec();
+    encoded.push(SIGHASH_ALL as u8);
+    transaction.inputs[0].witness = if refund {
+        Witness {
+            items: vec![encoded, Vec::new(), script.to_vec()],
+        }
+    } else {
+        let preimage = preimage.ok_or(HnsWalletError::InvalidPreparedArtifact)?;
+        Witness {
+            items: vec![
+                encoded,
+                preimage.expose_for_settlement().to_vec(),
+                vec![1],
+                script.to_vec(),
+            ],
+        }
+    };
+    transaction
+        .encode()
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)
+}
+
 #[derive(Debug, Error)]
 pub enum HnsWalletError {
     #[error("wallet store failed")]
@@ -437,18 +4592,58 @@ pub enum HnsWalletError {
     KeyDerivation,
     #[error("Handshake address encoding failed")]
     Address,
+    #[error("invalid Handshake address or network")]
+    InvalidAddress,
     #[error("amount or coin count is invalid")]
     InvalidAmount,
     #[error("checked arithmetic failed")]
     Arithmetic,
     #[error("insufficient spendable funds")]
     InsufficientFunds,
+    #[error("fee exceeds the approved maximum")]
+    FeeLimit,
     #[error("invalid Handshake name")]
     InvalidName,
     #[error("name proof or ownership evidence is invalid")]
     InvalidEvidence,
     #[error("invalid persisted name workflow")]
     InvalidWorkflow,
+    #[error("wallet store must be unlocked")]
+    StoreLocked,
+    #[error("persisted account configuration does not match")]
+    AccountConfigurationMismatch,
+    #[error("the HD account component is already assigned in this wallet")]
+    DuplicateAccountDerivation,
+    #[error("runtime synchronization lock is unavailable")]
+    RuntimePoisoned,
+    #[error("system clock is unavailable")]
+    Clock,
+    #[error("restore lookahead or persisted scan progress is invalid")]
+    InvalidLookahead,
+    #[error("the bounded restore scan cannot preserve a complete trailing gap")]
+    ScanCapacityExhausted,
+    #[error("the node snapshot, cursor, or mempool generation changed")]
+    StaleNodeSnapshot,
+    #[error("the reserved change address was concurrently advanced")]
+    StaleAddressReservation,
+    #[error("runtime configuration is invalid")]
+    InvalidRuntimeConfiguration,
+    #[error("mainnet value operations remain disabled by release policy")]
+    MainnetDisabled,
+    #[error("Handshake value runtime integration has not passed its release gate")]
+    RuntimeIntegrationUnavailable,
+    #[error("prepared transaction artifact is invalid")]
+    InvalidPreparedArtifact,
+    #[error("prepared transaction artifact has expired")]
+    PreparedArtifactExpired,
+    #[error("transaction signing failed")]
+    Signing,
+    #[error("history result exceeds the configured bound")]
+    HistoryLimit,
+    #[error("current name owner output is not controlled by this account")]
+    NameNotOwned,
+    #[error("wallet state encoding failed")]
+    Encoding,
     #[error("Handshake backend failed: {0}")]
     Backend(String),
 }
@@ -456,6 +4651,12 @@ pub enum HnsWalletError {
 impl From<StoreError> for HnsWalletError {
     fn from(_: StoreError) -> Self {
         Self::Store
+    }
+}
+
+impl From<serde_json::Error> for HnsWalletError {
+    fn from(_: serde_json::Error) -> Self {
+        Self::Encoding
     }
 }
 

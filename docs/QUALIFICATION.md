@@ -1,46 +1,56 @@
 # Qualification matrix
 
-This file records evidence, not intent. “Unit” never means “mainnet ready.”
+This file records evidence, not intent. Unit coverage never authorizes mainnet
+value. “Implemented source” means the code boundary exists; “pending” means the
+current commit has no recorded result for that gate.
 
-| Area | Compile | Unit/negative | Persistence/restart | Reorg | Real network/local chain | Bench/audit | Status |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Types/chain traits | yes | yes | n/a | n/a | n/a | no external audit | experimental |
-| Secret store/schema v1 | yes | encryption/lock/migration/CAS/replay | workflow reopen unit only | n/a | no device secure-store test | no DB benchmark/audit | partial |
-| HNS wallet/names | yes | key roles/address/selection/proof units | workflow rows | incomplete | no regtest | no audit | partial |
-| Provider core | yes | origin/permission/stale/rate/replay/forbidden | grants/replays in SQLite | n/a | no installed-browser E2E | no audit | partial |
-| Fixed-price Shakedex | yes | seller recovery/buyer ordering | CAS journal | incomplete | no regtest/Denuo E2E | no audit | partial |
-| Market sessions | yes | reservations/timeouts/evidence/refunds | CAS journal | incomplete | no pair E2E | no audit | partial |
-| Bitcoin Kyoto | yes | descriptor/HTLC/evidence/reorg units | BDK/Kyoto stores designed | unit rewind only | no regtest/P2P run | not measured | partial |
-| Ethereum | yes | roles/signing/policy/code/evidence | schema only | rollback negative unit | contract compiles; no local chain/Helios run | no contract audit | partial |
-| ABI | yes | bounds/high-risk transport negatives | session field only | n/a | no platform ABI E2E | no audit | partial |
-| Browser products | separate repos | targeted tests pending | platform integration pending | n/a | no installed/signed E2E | no review | incomplete |
+| Area | Compile/unit evidence for current tranche | Persistence/restart | Reorg | Real network/product | Bench/audit | Release status |
+| --- | --- | --- | --- | --- | --- | --- |
+| Types/chain traits | pending consolidated gate | n/a | n/a | n/a | no external audit | qualification pending |
+| Encrypted store/schema v3 | pending consolidated gate | source includes migration checkpoint, encrypted typed CRUD/CAS/batches and restart-safe workflow rows | n/a | no device secure-store test | no DB benchmark/audit | qualification pending |
+| HNS wallet/names | pending consolidated gate | source includes atomic account/workflow/reservation preparation and scan/workflow/settlement recovery | source includes checkpoint rewind and split current/proof evidence revalidation | no concrete node adapter, canonical NameState decoder, dedicated name-role scan, or regtest run | no audit | value runtime unavailable; names watch-only |
+| Provider core | pending consolidated gate | encrypted grants/tombstones/approvals/replays implemented | n/a | no installed-browser E2E | no audit | product integration pending |
+| Fixed-price Shakedex | prior unit baseline only | CAS journal source | evidence incomplete | no regtest/Denuo E2E | no audit | unavailable |
+| Market sessions | prior unit baseline only | CAS journal source | evidence incomplete | no pair E2E | no audit | unavailable |
+| Bitcoin Kyoto | prior unit baseline only | BDK/Kyoto stores designed | unit rewind baseline only | no regtest/P2P run | not measured | unavailable |
+| Ethereum | prior unit baseline only | schema only | rollback negative baseline only | contract compiles in baseline; no local-chain/Helios run | no contract audit | unavailable |
+| ABI | prior unit baseline only | session field only | n/a | no platform ABI E2E | no audit | product integration pending |
+| Browser products | separate repositories | platform integration pending | n/a | no installed/signed E2E | no review | unavailable |
 
-## Local commands
+## Single qualification command
 
-The single workspace gate is `scripts/check.sh`. It performs formatting,
-locked all-target check, warning-denied Clippy, tests, warning-denied docs,
+The workspace gate is `scripts/check.sh`. It performs formatting, a locked
+all-target check, warning-denied Clippy, tests, warning-denied docs,
 sibling/forbidden-backend dependency checks, deterministic Solidity artifact
-comparison, and npm high-severity audit.
+comparison, and an npm high-severity audit.
 
-Local result on 2026-08-02: PASS. All 34 Rust unit/negative tests passed;
-formatting, locked all-target check, warning-denied Clippy, warning-denied docs,
-dependency-boundary checks, deterministic Solidity artifact comparison, and
-npm audit (zero vulnerabilities) passed. This result does not upgrade any
-external-network, browser-installation, signed-device, benchmark, or audit row.
+This production-hardening tranche was not built or tested locally, by explicit
+instruction to avoid redundant build/test sessions. Its next evidence event is
+one consolidated CI invocation of `scripts/check.sh`; do not run separate
+build, check, test, and pre-push copies of the same gate. Record its commit ID,
+runner/platform, full result, test count, and artifact hashes here.
 
-Contract evidence SHA-256:
+## Prior baseline evidence
+
+The earlier 2026-08-02 baseline result was PASS: 34 Rust unit/negative tests,
+formatting, locked all-target check, warning-denied Clippy and docs,
+dependency-boundary checks, deterministic Solidity artifact comparison, and an
+npm audit with zero vulnerabilities. It predates this tranche and is not
+qualification evidence for the current commit.
+
+Baseline contract evidence SHA-256:
 
 - source: `537c0a4dd05f8128a6fe11046edc825f5a0a6577fc0fe0b61c7b31d5ec00caa7`;
 - generated artifact: `ba3bfde0443c13bcdbe287ef292072d1a2a8645fd4efd9bdee2b9dd566f52cec`;
 - npm lockfile: `43c5070e3475eb76ea9218bbafbe743307f4e9c7052153f2f53d5c4da3fde8e8`.
 
-External gates still required:
+## External gates still required
 
-- each modified repository's own `scripts/check.sh`;
+- the current commit's single `scripts/check.sh` CI result;
 - `hns-rs` conformance vectors and fuzz smoke/full campaigns;
 - HNS and Bitcoin regtest success/refund/restart/reorg demonstrations;
 - Kyoto invalid-PoW/filter/peer-consistency fixtures and birthday scans;
-- Ethereum local-chain lock/redeem/refund/replay/receiver/refund-address/
+- Ethereum local-chain lock/redeem/refund/replay/receiver/refund-address,
   reentrancy/event/rollback tests;
 - embedded Helios proof and persistence tests;
 - Chromium installed-extension/native-host and signed Android/iOS tests;

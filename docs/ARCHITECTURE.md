@@ -27,7 +27,7 @@ semantics, approvals, and recoverable application workflows.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `hns-wallet-types` | IDs, integer amounts, capabilities, UI-safe summaries | consensus/wire types |
-| `hns-wallet-store` | schema, migrations, secret AEAD, workflow CAS, replay rows | browser storage or remote truth |
+| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, provider tombstones/approvals/replays | browser storage or remote truth |
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | HNS key roles, address/coin/name evidence and workflows | canonical encodings |
 | `hns-wallet-provider` | hostile-input parsing, origin grants, approvals, events | JavaScript injection |
@@ -51,8 +51,32 @@ validated chain adapter. State machines accept explicit verified-evidence
 variants and persist a compare-and-swap revision before the enclosing runtime
 broadcasts an irreversible transaction.
 
-The current implementation does not yet contain that complete enclosing
-runtime for every chain. See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
+The HNS adapter boundary requires a stable chain epoch/tip and a nonzero
+node-instance nonce plus mempool generation across every bounded page of an
+exact sorted wallet-address query. Each query carries canonical address version
+and hash; the adapter must convert the exact version-0 `Address` to its node
+`ScriptId`, never a bare hash. It also requires transaction/parent-output and
+outpoint-spend evidence bound to that same snapshot. A stale cursor, restarted
+mempool instance, or generation change restarts the bounded snapshot rather
+than combining observations from different views.
+
+HNS preparation authenticates the current account, workflow, and reservation
+revisions before atomically committing change-index advancement, the prepared
+workflow, and every input reservation. The cache changes only after commit.
+Failures therefore cannot burn or reuse a change derivation and cannot leave a
+partial losing workflow.
+
+Name evidence deliberately preserves the interval-committed Urkel proof/state/
+owner view separately from the node's current state/owner view. The proof root
+and height must exactly equal the bound tip. A released canonical NameState
+decoder is still required to bind owner, transfer, renewal and resource fields
+to those bytes; until it and a dedicated bounded `HnsName` key-role scan exist,
+known names are watch-only and raw resource/ownership claims are unavailable.
+
+The source does not yet contain the concrete async HNS node adapter or complete
+enclosing product runtime for every chain. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED`
+therefore remains false and HNS value capabilities are not advertised. See
+[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
 
 ## Future chains
 

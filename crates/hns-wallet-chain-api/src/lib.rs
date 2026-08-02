@@ -1,6 +1,8 @@
 #![doc = "Capability-separated wallet chain interfaces."]
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, BaseUnits, ChainCapabilities, ModuleId, ObjectHash,
     ReceiveTarget, SessionId, SyncStatus, TransactionHash, TransactionSummary,
@@ -94,6 +96,116 @@ pub trait AtomicSettlement {
     -> Result<Option<Preimage>, ChainError>;
 }
 
+/// Runtime-owned capability registry. Registration is explicit and rejects a
+/// second implementation for the same module instead of silently replacing a
+/// funds-bearing backend.
+#[derive(Default)]
+pub struct ModuleRegistry<'a> {
+    chains: BTreeMap<ModuleId, &'a dyn ChainModule>,
+    utxo_chains: BTreeMap<ModuleId, &'a dyn UtxoChainModule>,
+    account_chains: BTreeMap<ModuleId, &'a dyn AccountChainModule>,
+    settlements: BTreeMap<ModuleId, &'a dyn AtomicSettlement>,
+}
+
+impl<'a> ModuleRegistry<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_chain<T: ChainModule + 'a>(
+        &mut self,
+        module: &'a T,
+    ) -> Result<(), RegistryError> {
+        let id = module.module_id();
+        insert_unique(&mut self.chains, id, module)
+    }
+
+    pub fn register_utxo<T: UtxoChainModule + 'a>(
+        &mut self,
+        module: &'a T,
+    ) -> Result<(), RegistryError> {
+        let id = module.module_id();
+        if self.chains.contains_key(&id) || self.utxo_chains.contains_key(&id) {
+            return Err(RegistryError::DuplicateModule(id));
+        }
+        self.chains.insert(id, module);
+        self.utxo_chains.insert(id, module);
+        Ok(())
+    }
+
+    pub fn register_account<T: AccountChainModule + 'a>(
+        &mut self,
+        module: &'a T,
+    ) -> Result<(), RegistryError> {
+        let id = module.module_id();
+        if self.chains.contains_key(&id) || self.account_chains.contains_key(&id) {
+            return Err(RegistryError::DuplicateModule(id));
+        }
+        self.chains.insert(id, module);
+        self.account_chains.insert(id, module);
+        Ok(())
+    }
+
+    pub fn register_settlement<T: AtomicSettlement + 'a>(
+        &mut self,
+        module_id: ModuleId,
+        settlement: &'a T,
+    ) -> Result<(), RegistryError> {
+        insert_unique(&mut self.settlements, module_id, settlement)
+    }
+
+    pub fn register_utxo_settlement<T: UtxoChainModule + AtomicSettlement + 'a>(
+        &mut self,
+        module: &'a T,
+    ) -> Result<(), RegistryError> {
+        let id = module.module_id();
+        if self.chains.contains_key(&id)
+            || self.utxo_chains.contains_key(&id)
+            || self.settlements.contains_key(&id)
+        {
+            return Err(RegistryError::DuplicateModule(id));
+        }
+        self.chains.insert(id, module);
+        self.utxo_chains.insert(id, module);
+        self.settlements.insert(id, module);
+        Ok(())
+    }
+
+    pub fn chain(&self, module: ModuleId) -> Option<&'a dyn ChainModule> {
+        self.chains.get(&module).copied()
+    }
+
+    pub fn utxo(&self, module: ModuleId) -> Option<&'a dyn UtxoChainModule> {
+        self.utxo_chains.get(&module).copied()
+    }
+
+    pub fn account(&self, module: ModuleId) -> Option<&'a dyn AccountChainModule> {
+        self.account_chains.get(&module).copied()
+    }
+
+    pub fn settlement(&self, module: ModuleId) -> Option<&'a dyn AtomicSettlement> {
+        self.settlements.get(&module).copied()
+    }
+}
+
+fn insert_unique<V: Copy>(
+    entries: &mut BTreeMap<ModuleId, V>,
+    key: ModuleId,
+    value: V,
+) -> Result<(), RegistryError> {
+    if entries.contains_key(&key) {
+        return Err(RegistryError::DuplicateModule(key));
+    }
+    entries.insert(key, value);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RegistryError {
+    #[error("module {0:?} is already registered for that capability")]
+    DuplicateModule(ModuleId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SendRequest {
     pub account: AccountId,
@@ -115,7 +227,7 @@ impl SendRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PreparedSend {
     pub module: ModuleId,
     pub amount: Amount,
@@ -123,6 +235,20 @@ pub struct PreparedSend {
     pub destination: String,
     pub expires_at_unix: u64,
     payload: Vec<u8>,
+}
+
+impl core::fmt::Debug for PreparedSend {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PreparedSend")
+            .field("module", &self.module)
+            .field("amount", &self.amount)
+            .field("fee", &self.fee)
+            .field("destination", &self.destination)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl PreparedSend {
@@ -383,13 +509,26 @@ pub struct ObservePreimageRequest {
 
 pub type ObserveSecretRequest = ObservePreimageRequest;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PreparedArtifact {
     pub module: ModuleId,
     pub session_id: SessionId,
     pub fee: BaseUnits,
     pub expires_at_unix: u64,
     payload: Vec<u8>,
+}
+
+impl core::fmt::Debug for PreparedArtifact {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PreparedArtifact")
+            .field("module", &self.module)
+            .field("session_id", &self.session_id)
+            .field("fee", &self.fee)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl PreparedArtifact {

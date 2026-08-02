@@ -7,11 +7,11 @@ integration, and qualification evidence remains disabled or unavailable.
 
 | Feature | Status | Release boundary |
 | --- | --- | --- |
-| Handshake ordinary wallet and known-name support | experimental | Key, address, proof-import, coin-selection, and workflow foundations exist; complete sync and transaction builders are unavailable. |
-| Fixed-price Shakedex | experimental, disabled | Persisted orchestration exists; live node/Denuo integration, full transaction construction, and regtest/restart/reorg evidence are unavailable. |
-| HNS/BTC native settlement | experimental, disabled | Native HTLC primitives exist; signed end-to-end settlement, refunds, Kyoto supervisor integration, regtest, and resource qualification are unavailable. |
-| HNS/ETH native settlement | experimental, disabled | Narrow signing, verification policy, and deterministic contract source exist; embedded Helios evidence, approved deployment, local-chain qualification, and audit are unavailable. |
-| Price-round market board | experimental, disabled | Canonical protocol types exist in an unreleased `hns-rs` boundary; reporter governance and live relay/browser integration are unavailable. |
+| Handshake ordinary wallet and known-name support | implemented source, value path unavailable | Bounded restart-safe node snapshots, restoration, history/reorg reconciliation, transaction construction/signing, and atomic account/workflow/input-reservation preparation are implemented. Send remains hard-disabled until a concrete node adapter is qualified. Name import is watch-only until released canonical NameState/resource decoding and a dedicated bounded `HnsName` role scan can independently prove ownership. |
+| Fixed-price Shakedex | implemented source, unavailable | Persisted orchestration exists; live node/Denuo integration, complete signed transaction construction, and regtest/restart/reorg evidence are unavailable. |
+| HNS/BTC native settlement | implemented source, unavailable | HNS and Bitcoin HTLC/evidence primitives exist; the HNS adapter/release gate, Kyoto supervisor integration, end-to-end regtest, and resource qualification remain unavailable. |
+| HNS/ETH native settlement | implemented source, unavailable | Narrow signing, verification policy, and deterministic contract source exist; embedded Helios evidence, approved deployment, local-chain qualification, and audit are unavailable. |
+| Price-round market board | implemented source, unavailable | Canonical protocol types exist in an unreleased `hns-rs` boundary; reporter governance and live relay/browser integration are unavailable. |
 | Litecoin module | deferred | A future module must implement `ChainModule`, `UtxoChainModule`, and `AtomicSettlement` and pass the full pair qualification suite. |
 | Additional UTXO chains | deferred | No assumption is made that Bitcoin script, sighash, address, fee, dust, or locktime policy is reusable. |
 | Additional account-based chains | deferred | Each chain requires a single selected verification model and a narrowly scoped settlement adapter. |
@@ -26,7 +26,7 @@ integration, and qualification evidence remains disabled or unavailable.
 | Generic Bitcoin signing/applications | unavailable | PSBT export/signing, raw-transaction signing, alternate production backends, and unrelated Bitcoin script applications are deliberately forbidden. |
 | Custodial or wrapped settlement | unavailable | Wrapped assets, custodial exchange accounts, pooled liquidity, AMMs, centralized order books, and server-held wallet keys are prohibited. |
 
-No row marked experimental is enabled for mainnet value. Moving a row to
-implemented or tested requires corresponding code and evidence in
-`docs/QUALIFICATION.md`; moving it to available additionally requires complete
-product integration and a reviewed release policy.
+No unavailable row is enabled for value movement. Moving a source boundary to
+qualified requires corresponding evidence in `docs/QUALIFICATION.md`; moving it
+to available additionally requires complete product integration and a reviewed
+release policy.

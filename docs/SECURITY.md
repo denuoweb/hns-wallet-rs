@@ -1,6 +1,8 @@
 # Security model
 
-Status: experimental. Mainnet marketplace settlement is disabled.
+Status: production-hardening source implemented; executable value paths remain
+release-gated. HNS send/settlement are disabled on every network and mainnet
+marketplace settlement is independently disabled.
 
 ## Trust boundaries
 
@@ -23,17 +25,24 @@ Status: experimental. Mainnet marketplace settlement is disabled.
 
 ## Secrets
 
-Recovery seeds, imported private keys, HTLC preimages, metadata keys, provider
-capabilities, and session authorizations use per-record XChaCha20-Poly1305 with
-random nonces and associated data binding database ID, record kind, and record
-ID. The database key is derived with Argon2id. Secret buffers use zeroizing
-containers where practical.
+Recovery seeds, imported private keys, HTLC preimages, wallet/workflow state,
+provider capabilities, pending approvals, and replay origins use per-record
+XChaCha20-Poly1305 with random nonces. Associated data binds the database ID,
+record kind and ID, and every plaintext metadata column used for authorization,
+expiry, revision, revocation, or broadcast decisions. The database key is
+derived with Argon2id. Secret buffers use zeroizing containers where practical.
+The store rejects empty passphrases and inputs larger than 1,024 bytes at its
+own API boundary; this is a resource/safety bound, not a substitute for device
+key wrapping or a password-strength policy.
 
 This is authenticated record encryption, not whole-file encryption. Table
-names, row counts, indexes, timestamps, non-sensitive workflow JSON, filenames,
-SQLite journals, and access patterns may be visible. A platform integration
-must wrap the database key with Android Keystore/iOS Keychain/OS secure storage
-and protect backups. That platform wrapping is not implemented in this repo.
+names, row counts, indexes, selected authenticated metadata, filenames, SQLite
+journals, and access patterns may be visible. On Linux, persistent opening
+requires an owner-only regular file in an owner-only directory and rejects
+symlink traversal. Other persistent platforms fail closed until an equivalent
+native policy is implemented. A product integration must wrap the database key
+with Android Keystore/iOS Keychain/OS secure storage and protect backups; that
+wrapping is not implemented in this repo.
 
 Recovery-phrase display is a dedicated high-risk mobile operation. The stable
 ABI rejects it over Chromium native messaging. Logs and ordinary `Debug`
@@ -55,10 +64,14 @@ from a unit test.
 
 The provider core enforces secure exact origins (with loopback HTTP allowed for
 development), origin-scoped permissions, bounded frames/methods/params, request
-nonces, replay persistence, per-method windows, approval expiry, permission
-generation, and stale-navigation rejection. It explicitly rejects seed/key
-extraction, raw signing, PSBT signing, generic Ethereum transactions/calls,
-chain switching, and arbitrary native-host access.
+nonces, replay persistence, per-method windows, approval expiry, and
+stale-navigation rejection. Authority generations cannot regress within one
+authority/wallet session; random session identifiers are treated as identities,
+not counters. Permission creation may bootstrap from a trusted nonzero
+generation, then every grant or revocation must advance exactly once. Revocation
+stores an authenticated tombstone so delete/regrant cannot reset the generation.
+It explicitly rejects seed/key extraction, raw signing, PSBT signing, generic
+Ethereum transactions/calls, chain switching, and arbitrary native-host access.
 
 ## Atomic-swap limits
 
@@ -69,10 +82,26 @@ privacy leakage, delayed refunds, adverse price movement, or liquidity griefing.
 Timeouts must be asymmetric and refunds must be constructed and validated
 before funding.
 
-Current cross-chain code is not qualified for live value. Bitcoin signed HTLC
-spend/broadcast integration, Helios proof construction, complete HNS adapters,
-restart/reorg demonstrations, real-chain tests, resource benchmarks, and an
-independent contract review remain blockers.
+HNS evidence requests bind a chain epoch, tip and mempool generation across
+bounded sorted exact version-0 address pages. A nonzero node-instance nonce
+prevents a generation reset after restart from reusing an old cursor. Transaction,
+parent-output and outpoint-spend evidence must match that same snapshot.
+Settlement lock verification binds the exact funding outpoint, output index,
+script, terms and confirmation policy, and preimage observation accepts only the
+exact verified redeem witness.
+
+Name proof evidence is bound to the exact chain epoch, tip height and tip tree
+root, and the verified Urkel bytes must equal the separately returned proof
+state. The interval-committed proof view is not collapsed with the current node
+view. Because released protocol crates do not yet decode canonical NameState
+owner/resource/transfer/renewal fields, imported names remain watch-only;
+current/proof owner hints and raw resource bytes are not authorization evidence.
+
+Current cross-chain code is not qualified for live value. A concrete HNS node
+adapter, released canonical HNS name-state/resource decoding, a published
+canonical HNS settlement profile, Bitcoin supervisor qualification, Helios
+proof construction, restart/reorg demonstrations, real-chain tests, resource
+benchmarks, and independent review remain blockers.
 
 ## Reporting
 
