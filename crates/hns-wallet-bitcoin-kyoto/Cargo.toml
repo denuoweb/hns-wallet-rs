@@ -1,0 +1,27 @@
+[package]
+name = "hns-wallet-bitcoin-kyoto"
+description = "Kyoto-only Bitcoin descriptor wallet and native HTLC settlement adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bdk_kyoto.workspace = true
+bdk_wallet.workspace = true
+bip157.workspace = true
+bip39.workspace = true
+bitcoin.workspace = true
+hns-wallet-chain-api.workspace = true
+hns-wallet-types.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20.0"
+
+[lints]
+workspace = true

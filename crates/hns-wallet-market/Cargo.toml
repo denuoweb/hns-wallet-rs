@@ -1,0 +1,17 @@
+[package]
+name = "hns-wallet-market"
+description = "Persisted chain-neutral market reservations and atomic-swap orchestration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hns-wallet-store.workspace = true
+hns-wallet-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

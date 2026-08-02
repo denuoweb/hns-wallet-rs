@@ -1,0 +1,6 @@
+/target/
+**/contracts/node_modules/
+**/contracts/build/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

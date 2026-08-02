@@ -1,0 +1,26 @@
+[package]
+name = "hns-wallet-ethereum"
+description = "Narrow native-ETH wallet and immutable marketplace HTLC verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bip39.workspace = true
+bitcoin.workspace = true
+hns-wallet-store.workspace = true
+hns-wallet-types.workspace = true
+k256.workspace = true
+serde.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

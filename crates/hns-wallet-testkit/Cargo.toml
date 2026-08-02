@@ -1,0 +1,23 @@
+[package]
+name = "hns-wallet-testkit"
+description = "Deterministic non-mainnet wallet, provider, marketplace, and settlement fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hns-wallet-bitcoin-kyoto.workspace = true
+hns-wallet-chain-api.workspace = true
+hns-wallet-ethereum.workspace = true
+hns-wallet-market.workspace = true
+hns-wallet-provider.workspace = true
+hns-wallet-shakedex.workspace = true
+hns-wallet-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

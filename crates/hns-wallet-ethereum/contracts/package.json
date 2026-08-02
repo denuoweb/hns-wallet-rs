@@ -1,0 +1,16 @@
+{
+  "name": "@handshake-rs/native-eth-htlc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node compile.mjs",
+    "check": "node compile.mjs --check"
+  },
+  "devDependencies": {
+    "solc": "0.8.35"
+  },
+  "overrides": {
+    "tmp": "0.2.7"
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "hns-wallet-shakedex"
+description = "Persisted fixed-price Shakedex seller, buyer, and recovery workflows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hns-swap.workspace = true
+hns-wallet-store.workspace = true
+hns-wallet-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

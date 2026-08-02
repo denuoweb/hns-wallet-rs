@@ -1,0 +1,20 @@
+[package]
+name = "hns-wallet-provider"
+description = "Origin- and generation-bound Handshake Provider API core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hns-wallet-store.workspace = true
+hns-wallet-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
