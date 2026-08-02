@@ -5,10 +5,11 @@ Handshake protocol library, full node, DANE trust engine, or browser products.
 
 ```text
 hostile website
-  -> browser authority: exact logical origin + namespace + generations
-  -> browser provider bridge: bounded typed request only
-  -> hns-wallet-ffi: version/session/request validation
-  -> hns-wallet-provider: permission, replay, rate, approval policy
+  -> browser engine authority retained by native host
+  -> private host registry: opaque random authority handle
+  -> hns-wallet-ffi v2: length/session/restart/sequence validation
+  -> hns-wallet-service: handle/revision/event/approval lifecycle
+  -> hns-wallet-provider: origin permission, replay, rate, approval policy
   -> wallet application: HNS / Shakedex / market workflow
   -> capability-specific chain module
   -> verified local chain evidence
@@ -27,15 +28,16 @@ semantics, approvals, and recoverable application workflows.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `hns-wallet-types` | IDs, integer amounts, capabilities, UI-safe summaries | consensus/wire types |
-| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, provider tombstones/approvals/replays | browser storage or remote truth |
+| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, provider permission tombstones, persisted workflow approvals/replays | browser storage, ABI v2 authority handles, or remote truth |
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | HNS key roles, address/coin/name evidence and workflows | canonical encodings |
-| `hns-wallet-provider` | hostile-input parsing, origin grants, approvals, events | JavaScript injection |
+| `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state | proof codecs |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | native ETH, selected Helios policy, approved HTLC | general Ethereum provider |
-| `hns-wallet-ffi` | versioned typed host frames | raw keys/native commands |
+| `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events | raw keys/native commands or engine authority objects |
+| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition | browser engine policy or availability claims |
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
 
 Every maintained repository keeps its own lockfile, tests, and release. There

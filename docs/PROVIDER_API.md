@@ -60,23 +60,29 @@ Cross-chain market:
 `nameMarketChanged`, `priceRoundChanged`, `marketIntentChanged`,
 `swapSessionChanged`, `walletLocked`.
 
-Events are scoped to the same authenticated origin/context as requests. A
-navigation, permission revocation, lock, authority generation change, or wallet
-session change invalidates pending requests and event channels.
+Events are private service frames scoped by an opaque host-issued authority
+handle and exact service-owned revision. A navigation/policy/runtime change,
+permission revocation, wallet-session rotation, authority replacement/revoke,
+or service restart invalidates pending approvals and event channels.
 
-Browser-authority and wallet-session values are random identities, not ordered
-counters. While both identities and the origin/namespace remain unchanged,
-browser-authority, policy, permission, and navigation generations may only stay
-equal or increase; a regression rejects the binding update. Any binding change
-invalidates in-memory approvals, and a session change also resets session rate
-state.
+The browser host retains the engine-issued authority. Only its private control
+channel may register the logical origin, namespace, runtime session/generation,
+policy/navigation generations, decision fingerprint, and expiry. Pages never
+supply those values as authentication and never receive the opaque handle.
+Wallet lock/session and permission generation are owned by the wallet service.
 
-The first permission record for an origin may adopt the trusted current nonzero
-generation. Every later grant must be exactly the authenticated stored
-generation plus one. Revocation is also a compare-and-swap increment and leaves
-an encrypted tombstone, preventing delete/regrant rollback. Approval and replay
-lifetimes are capped and their expiry/identity metadata is authenticated before
-pruning or use.
+Permission records and encrypted tombstone generations survive service
+restart. The service reads the current generation from `WalletStore`; it never
+accepts one from a request. The first grant is generation one and every later
+grant/revocation is exactly the stored generation plus one. Provider approvals,
+handle-bound replay state, rate windows, request-ID windows, and event cursors
+are deliberately process-ephemeral. Their maximum approval lifetime is 90
+seconds, and old service sessions cannot resume them.
+
+The 43 method names remain the closed vocabulary, but presence in that
+vocabulary is not availability. Capability negotiation is a closed enum and an
+unimplemented method returns `unsupportedCapability`. The checked-in subprocess
+does not advertise provider dispatch, value movement, or browser integration.
 
 ## Explicitly forbidden
 

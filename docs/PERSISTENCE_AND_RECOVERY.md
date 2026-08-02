@@ -6,6 +6,15 @@ accounts, derived addresses, HNS/Bitcoin/Ethereum state, known names, input
 reservations, settlement verification records, market state, workflows,
 permissions, approval requests, and replay records have bounded typed accessors.
 
+Provider-service permissions use the encrypted permission records and monotonic
+revocation tombstones. Provider authority handles, service/wallet sessions,
+pending website approvals, handle replay/rate state, request-ID windows, and
+event cursors are intentionally not restored. The generic pending-approval and
+replay tables remain available to persisted wallet/HNS workflows, but ABI v2
+does not write provider approvals or provider nonces there. This prevents stale
+provider rows from becoming actionable or consuming provider capacity after a
+restart.
+
 Sensitive values use XChaCha20-Poly1305 with random nonces. Associated data
 binds the database ID, record domain and identifier, plus plaintext columns that
 can affect a decision: entity/workflow revision and update time, workflow kind
@@ -42,20 +51,25 @@ The product runtime must:
 
 1. securely open and migrate the database, remain locked, and request
    platform-backed unlock;
-2. finish any plaintext-migration checkpoint before exposing wallet state;
-3. load persisted workflows and the last consistent chain checkpoints;
-4. resume HNS, Kyoto, and the selected Ethereum synchronization adapter;
-5. reconcile mempools, confirmations, replacements, and reorgs from atomic,
+2. create fresh random wallet-service and wallet-session IDs with empty
+   authority, approval, replay, rate, request-ID, and event registries;
+3. negotiate a random host session plus exact restart generation over the
+   private host/service transport; old handles and frames remain invalid;
+4. finish any plaintext-migration checkpoint before exposing wallet state;
+5. load persisted workflows, permission generations/tombstones, and the last
+   consistent chain checkpoints;
+6. resume HNS, Kyoto, and the selected Ethereum synchronization adapter;
+7. reconcile mempools, confirmations, replacements, and reorgs from atomic,
    validated evidence;
-6. revalidate split committed-proof/current name views and Shakedex listings,
+8. revalidate split committed-proof/current name views and Shakedex listings,
    while leaving name ownership watch-only until canonical state decoding;
-7. expire price rounds, intents, fill grants, approvals, and replay rows only
+9. expire price rounds, intents, fill grants, persisted workflow approvals, and replay rows only
    after their authenticated metadata verifies;
-8. restore swap sessions and independently verify every recorded funding,
+10. restore swap sessions and independently verify every recorded funding,
    redemption, and refund;
-9. extract an on-chain preimage only from the exact verified spend/event;
-10. determine refund eligibility from validated local chain time; and
-11. surface user actions without automatically moving value.
+11. extract an on-chain preimage only from the exact verified spend/event;
+12. determine refund eligibility from validated local chain time; and
+13. surface user actions without automatically moving value.
 
 The HNS source implements the concrete synchronous authenticated node adapter,
 bounded chain/mempool snapshot reconciliation, and prepared-transaction

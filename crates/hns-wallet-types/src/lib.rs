@@ -51,6 +51,185 @@ semantic_id!(SessionId, 32);
 semantic_id!(ObjectHash, 32);
 semantic_id!(TransactionHash, 32);
 
+const BASE64URL_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn encode_wire_id(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity((bytes.len() * 4 + 2) / 3);
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        let first = bytes[index];
+        let second = bytes[index + 1];
+        let third = bytes[index + 2];
+        encoded.push(BASE64URL_ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(
+            BASE64URL_ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char,
+        );
+        encoded.push(
+            BASE64URL_ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char,
+        );
+        encoded.push(BASE64URL_ALPHABET[(third & 0x3f) as usize] as char);
+        index += 3;
+    }
+    match bytes.len() - index {
+        1 => {
+            let first = bytes[index];
+            encoded.push(BASE64URL_ALPHABET[(first >> 2) as usize] as char);
+            encoded.push(BASE64URL_ALPHABET[((first & 0x03) << 4) as usize] as char);
+        }
+        2 => {
+            let first = bytes[index];
+            let second = bytes[index + 1];
+            encoded.push(BASE64URL_ALPHABET[(first >> 2) as usize] as char);
+            encoded.push(
+                BASE64URL_ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char,
+            );
+            encoded.push(BASE64URL_ALPHABET[((second & 0x0f) << 2) as usize] as char);
+        }
+        _ => {}
+    }
+    encoded
+}
+
+fn decode_wire_id(encoded: &str, bytes: &mut [u8]) -> Result<(), WireIdError> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+
+    let input = encoded.as_bytes();
+    let mut input_index = 0;
+    let mut output_index = 0;
+    while input_index + 4 <= input.len() {
+        let first = value(input[input_index]).ok_or(WireIdError::NonCanonical)?;
+        let second = value(input[input_index + 1]).ok_or(WireIdError::NonCanonical)?;
+        let third = value(input[input_index + 2]).ok_or(WireIdError::NonCanonical)?;
+        let fourth = value(input[input_index + 3]).ok_or(WireIdError::NonCanonical)?;
+        if output_index + 3 > bytes.len() {
+            return Err(WireIdError::NonCanonical);
+        }
+        bytes[output_index] = (first << 2) | (second >> 4);
+        bytes[output_index + 1] = (second << 4) | (third >> 2);
+        bytes[output_index + 2] = (third << 6) | fourth;
+        input_index += 4;
+        output_index += 3;
+    }
+    match input.len() - input_index {
+        2 => {
+            let first = value(input[input_index]).ok_or(WireIdError::NonCanonical)?;
+            let second = value(input[input_index + 1]).ok_or(WireIdError::NonCanonical)?;
+            if second & 0x0f != 0 || output_index >= bytes.len() {
+                return Err(WireIdError::NonCanonical);
+            }
+            bytes[output_index] = (first << 2) | (second >> 4);
+            output_index += 1;
+        }
+        3 => {
+            let first = value(input[input_index]).ok_or(WireIdError::NonCanonical)?;
+            let second = value(input[input_index + 1]).ok_or(WireIdError::NonCanonical)?;
+            let third = value(input[input_index + 2]).ok_or(WireIdError::NonCanonical)?;
+            if third & 0x03 != 0 || output_index + 2 > bytes.len() {
+                return Err(WireIdError::NonCanonical);
+            }
+            bytes[output_index] = (first << 2) | (second >> 4);
+            bytes[output_index + 1] = (second << 4) | (third >> 2);
+            output_index += 2;
+        }
+        0 => {}
+        _ => return Err(WireIdError::NonCanonical),
+    }
+    if output_index != bytes.len() {
+        return Err(WireIdError::NonCanonical);
+    }
+    Ok(())
+}
+
+macro_rules! wire_id {
+    ($name:ident, $size:expr) => {
+        /// Canonical non-zero identifier used only by the wallet service wire
+        /// protocol. Its JSON representation is fixed-width unpadded base64url;
+        /// persisted wallet identifiers deliberately retain their existing
+        /// serialization.
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name([u8; $size]);
+
+        impl $name {
+            pub const LENGTH: usize = $size;
+            pub const ENCODED_LENGTH: usize = ($size * 4 + 2) / 3;
+
+            pub fn from_bytes(bytes: [u8; $size]) -> Result<Self, WireIdError> {
+                if bytes == [0_u8; $size] {
+                    return Err(WireIdError::Zero);
+                }
+                Ok(Self(bytes))
+            }
+
+            pub fn parse(encoded: &str) -> Result<Self, WireIdError> {
+                if encoded.len() != Self::ENCODED_LENGTH {
+                    return Err(WireIdError::NonCanonical);
+                }
+                let mut bytes = [0_u8; $size];
+                decode_wire_id(encoded, &mut bytes)?;
+                Self::from_bytes(bytes)
+            }
+
+            pub const fn as_bytes(&self) -> &[u8; $size] {
+                &self.0
+            }
+
+            pub const fn into_bytes(self) -> [u8; $size] {
+                self.0
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "{}(<redacted>)", stringify!($name))
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("<redacted>")
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&encode_wire_id(&self.0))
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let encoded = <&str>::deserialize(deserializer)?;
+                Self::parse(encoded).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+wire_id!(HostSessionId, 32);
+wire_id!(WalletServiceSessionId, 32);
+wire_id!(WalletSessionId, 32);
+wire_id!(HostAuthorityHandleId, 32);
+wire_id!(BrowserRuntimeSessionId, 16);
+wire_id!(ProviderAuthorityFingerprint, 32);
+wire_id!(ProviderRequestId, 16);
+wire_id!(ProviderApprovalId, 16);
+
 /// A wallet-local module selector. Canonical marketplace wire identifiers live
 /// in `hns-rs`; this enum selects an installed wallet implementation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -372,6 +551,14 @@ pub enum TypeError {
     InvalidLength { field: &'static str, maximum: usize },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum WireIdError {
+    #[error("wire identifier must use fixed-width unpadded base64url")]
+    NonCanonical,
+    #[error("wire identifier cannot be the all-zero sentinel")]
+    Zero,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +589,25 @@ mod tests {
             Amount::new(WalletAsset::Hns, 1).checked_add(Amount::new(WalletAsset::Btc, 1)),
             Err(AmountError::AssetMismatch)
         );
+    }
+
+    #[test]
+    fn service_wire_ids_have_one_canonical_non_zero_encoding() {
+        let id = ProviderRequestId::from_bytes([1_u8; 16]).expect("non-zero identifier");
+        let encoded = serde_json::to_string(&id).expect("serialize");
+        assert_eq!(encoded, "\"AQEBAQEBAQEBAQEBAQEBAQ\"");
+        assert_eq!(
+            serde_json::from_str::<ProviderRequestId>(&encoded).expect("deserialize"),
+            id
+        );
+        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAg\"")
+            .is_ok());
+        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAR\"")
+            .is_err());
+        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAQ==\"")
+            .is_err());
+        assert!(ProviderRequestId::from_bytes([0_u8; 16]).is_err());
+        assert!(!format!("{id:?}").contains("AQEBA"));
+        assert_eq!(format!("{id}"), "<redacted>");
     }
 }

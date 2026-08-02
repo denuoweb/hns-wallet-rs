@@ -4,7 +4,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hns_wallet_store::{StoreError, WalletStore};
-use hns_wallet_types::{ApprovalId, ApprovalKind, PermissionCapability};
+use hns_wallet_types::{
+    ApprovalId, ApprovalKind, BrowserRuntimeSessionId, HostAuthorityHandleId,
+    PermissionCapability, ProviderAuthorityFingerprint, WalletSessionId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -14,8 +17,11 @@ use url::Url;
 pub const MAX_PROVIDER_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_METHOD_BYTES: usize = 96;
 pub const MAX_ORIGIN_BYTES: usize = 512;
-pub const APPROVAL_LIFETIME_SECONDS: u64 = 300;
+pub const APPROVAL_LIFETIME_SECONDS: u64 = 90;
 pub const RATE_WINDOW_SECONDS: u64 = 60;
+pub const MAX_REGISTERED_AUTHORITIES: usize = 256;
+pub const MAX_PENDING_APPROVALS: usize = 128;
+pub const MAX_REPLAY_NONCES: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Origin {
@@ -47,10 +53,15 @@ impl Origin {
             .ok_or(ProviderError::InvalidOrigin)?;
         let default_port = (parsed.scheme() == "https" && port == 443)
             || (parsed.scheme() == "http" && port == 80);
-        let serialized = if default_port {
-            format!("{}://{host}", parsed.scheme())
+        let serialized_host = if host.contains(':') {
+            format!("[{host}]")
         } else {
-            format!("{}://{host}:{port}", parsed.scheme())
+            host.to_owned()
+        };
+        let serialized = if default_port {
+            format!("{}://{serialized_host}", parsed.scheme())
+        } else {
+            format!("{}://{serialized_host}:{port}", parsed.scheme())
         };
         Ok(Self { serialized })
     }
@@ -67,51 +78,35 @@ pub enum SelectedNamespace {
     Icann,
 }
 
+/// Facts copied from an engine-issued authority by the trusted browser host.
+///
+/// The affirmative registration operation is the authorization signal. There
+/// are deliberately no caller-constructible authentication or injection
+/// booleans here, and wallet lock/session/permission state is never supplied
+/// by the host.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthorityBinding {
+pub struct HostAuthorityRegistration {
     pub origin: Origin,
     pub namespace: SelectedNamespace,
-    pub authenticated_context: bool,
-    pub provider_injection_permitted: bool,
-    pub browser_authority_session: u64,
-    pub browser_authority_generation: u64,
+    pub runtime_session: BrowserRuntimeSessionId,
+    pub runtime_generation: u64,
     pub policy_generation: u64,
-    pub wallet_session: u64,
-    pub permission_generation: u64,
     pub navigation_generation: u64,
-    pub wallet_locked: bool,
+    pub decision_fingerprint: ProviderAuthorityFingerprint,
+    pub valid_until_unix_ms: u64,
 }
 
-impl AuthorityBinding {
-    pub fn validate(&self) -> Result<(), ProviderError> {
-        if !self.authenticated_context || !self.provider_injection_permitted {
-            return Err(ProviderError::InjectionDenied);
-        }
-        if self.browser_authority_session == 0
-            || self.browser_authority_generation == 0
+impl HostAuthorityRegistration {
+    fn validate(&self, now_unix_ms: u64) -> Result<(), ProviderError> {
+        if self.runtime_generation == 0
             || self.policy_generation == 0
-            || self.wallet_session == 0
-            || self.permission_generation == 0
             || self.navigation_generation == 0
+            || self.valid_until_unix_ms <= now_unix_ms
         {
             return Err(ProviderError::StaleContext);
         }
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RequestContext {
-    pub origin: Origin,
-    pub namespace: SelectedNamespace,
-    pub browser_authority_session: u64,
-    pub browser_authority_generation: u64,
-    pub policy_generation: u64,
-    pub wallet_session: u64,
-    pub permission_generation: u64,
-    pub navigation_generation: u64,
-    pub request_nonce: u64,
-    pub now_unix: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -361,12 +356,10 @@ pub struct PendingApproval {
     pub id: ApprovalId,
     pub kind: ApprovalKind,
     pub call: ApprovedCall,
-    pub browser_authority_session: u64,
-    pub browser_authority_generation: u64,
-    pub policy_generation: u64,
-    pub wallet_session: u64,
+    pub authority_handle: HostAuthorityHandleId,
+    pub authority_revision: u64,
+    pub wallet_session: WalletSessionId,
     pub permission_generation: u64,
-    pub navigation_generation: u64,
     pub expires_at_unix: u64,
 }
 
@@ -378,24 +371,13 @@ pub enum ProviderAction {
 
 pub trait ProviderStateStore {
     fn permission(&self, origin: &Origin) -> Result<Option<PermissionRecord>, ProviderError>;
+    fn permission_generation(&self, origin: &Origin) -> Result<Option<u64>, ProviderError>;
     fn save_permission(&mut self, record: &PermissionRecord) -> Result<(), ProviderError>;
     fn revoke_permission(
         &mut self,
         origin: &Origin,
         expected_generation: u64,
         next_generation: u64,
-        now_unix: u64,
-    ) -> Result<(), ProviderError>;
-    fn consume_nonce(
-        &mut self,
-        origin: &Origin,
-        nonce: u64,
-        now_unix: u64,
-        expires_at_unix: u64,
-    ) -> Result<(), ProviderError>;
-    fn save_pending(
-        &mut self,
-        approval: &PendingApproval,
         now_unix: u64,
     ) -> Result<(), ProviderError>;
 }
@@ -405,6 +387,10 @@ impl ProviderStateStore for WalletStore {
         self.provider_permission(origin.as_str())?
             .map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(ProviderError::from))
             .transpose()
+    }
+
+    fn permission_generation(&self, origin: &Origin) -> Result<Option<u64>, ProviderError> {
+        Ok(self.provider_permission_generation(origin.as_str())?)
     }
 
     fn save_permission(&mut self, record: &PermissionRecord) -> Result<(), ProviderError> {
@@ -433,44 +419,21 @@ impl ProviderStateStore for WalletStore {
         Ok(())
     }
 
-    fn consume_nonce(
-        &mut self,
-        origin: &Origin,
-        nonce: u64,
-        now_unix: u64,
-        expires_at_unix: u64,
-    ) -> Result<(), ProviderError> {
-        self.consume_replay_nonce(origin.as_str(), nonce, now_unix, expires_at_unix)?;
-        Ok(())
-    }
-
-    fn save_pending(
-        &mut self,
-        approval: &PendingApproval,
-        now_unix: u64,
-    ) -> Result<(), ProviderError> {
-        self.put_pending_approval(
-            approval.id,
-            approval.call.origin.as_str(),
-            &serde_json::to_vec(approval)?,
-            now_unix,
-            approval.expires_at_unix,
-        )?;
-        Ok(())
-    }
 }
 
 #[derive(Default)]
 pub struct MemoryProviderState {
     permissions: BTreeMap<Origin, PermissionRecord>,
     permission_generations: BTreeMap<Origin, u64>,
-    nonces: BTreeMap<(Origin, u64), u64>,
-    pending: BTreeMap<ApprovalId, PendingApproval>,
 }
 
 impl ProviderStateStore for MemoryProviderState {
     fn permission(&self, origin: &Origin) -> Result<Option<PermissionRecord>, ProviderError> {
         Ok(self.permissions.get(origin).cloned())
+    }
+
+    fn permission_generation(&self, origin: &Origin) -> Result<Option<u64>, ProviderError> {
+        Ok(self.permission_generations.get(origin).copied())
     }
 
     fn save_permission(&mut self, record: &PermissionRecord) -> Result<(), ProviderError> {
@@ -509,101 +472,163 @@ impl ProviderStateStore for MemoryProviderState {
         Ok(())
     }
 
-    fn consume_nonce(
-        &mut self,
-        origin: &Origin,
-        nonce: u64,
-        now_unix: u64,
-        expires_at_unix: u64,
-    ) -> Result<(), ProviderError> {
-        self.nonces.retain(|_, expiry| *expiry > now_unix);
-        if self
-            .nonces
-            .insert((origin.clone(), nonce), expires_at_unix)
-            .is_some()
-        {
-            return Err(ProviderError::Replay);
-        }
-        Ok(())
-    }
-
-    fn save_pending(&mut self, approval: &PendingApproval, _: u64) -> Result<(), ProviderError> {
-        self.pending.insert(approval.id, approval.clone());
-        Ok(())
-    }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RegisteredAuthority {
+    facts: HostAuthorityRegistration,
+    revision: u64,
+}
+
+/// Provider policy and persisted state behind a bounded registry of opaque,
+/// host-issued handles. Pages never construct or observe a registered
+/// authority, and no engine policy is duplicated here.
 pub struct ProviderCore<S> {
-    binding: AuthorityBinding,
     state: S,
+    authorities: BTreeMap<HostAuthorityHandleId, RegisteredAuthority>,
+    wallet_session: WalletSessionId,
+    wallet_locked: bool,
     pending: BTreeMap<ApprovalId, PendingApproval>,
-    rate: BTreeMap<(Origin, ProviderMethod), RateWindow>,
+    replay: BTreeMap<(HostAuthorityHandleId, u64), u64>,
+    rate: BTreeMap<(HostAuthorityHandleId, ProviderMethod), RateWindow>,
 }
 
 impl<S: ProviderStateStore> ProviderCore<S> {
-    pub fn new(binding: AuthorityBinding, state: S) -> Result<Self, ProviderError> {
-        binding.validate()?;
-        Ok(Self {
-            binding,
+    pub fn new(state: S, wallet_session: WalletSessionId, wallet_locked: bool) -> Self {
+        Self {
             state,
+            authorities: BTreeMap::new(),
+            wallet_session,
+            wallet_locked,
             pending: BTreeMap::new(),
+            replay: BTreeMap::new(),
             rate: BTreeMap::new(),
-        })
+        }
     }
 
-    pub fn update_binding(&mut self, binding: AuthorityBinding) -> Result<(), ProviderError> {
-        binding.validate()?;
+    pub fn register_authority(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        facts: HostAuthorityRegistration,
+        now_unix_ms: u64,
+    ) -> Result<u64, ProviderError> {
+        facts.validate(now_unix_ms)?;
+        self.prune_expired_authorities(now_unix_ms);
+        if self.authorities.contains_key(&handle) {
+            return Err(ProviderError::DuplicateAuthority);
+        }
+        if self.authorities.len() >= MAX_REGISTERED_AUTHORITIES {
+            return Err(ProviderError::AuthorityCapacity);
+        }
+        self.authorities.insert(
+            handle,
+            RegisteredAuthority {
+                facts,
+                revision: 1,
+            },
+        );
+        Ok(1)
+    }
 
-        let same_authority_session = binding.origin == self.binding.origin
-            && binding.namespace == self.binding.namespace
-            && binding.browser_authority_session == self.binding.browser_authority_session
-            && binding.wallet_session == self.binding.wallet_session;
-        if same_authority_session
-            && (binding.browser_authority_generation < self.binding.browser_authority_generation
-                || binding.policy_generation < self.binding.policy_generation
-                || binding.permission_generation < self.binding.permission_generation
-                || binding.navigation_generation < self.binding.navigation_generation)
+    pub fn replace_authority(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        expected_revision: u64,
+        replacement: HostAuthorityRegistration,
+        now_unix_ms: u64,
+    ) -> Result<u64, ProviderError> {
+        replacement.validate(now_unix_ms)?;
+        let current = self
+            .authorities
+            .get(&handle)
+            .cloned()
+            .ok_or(ProviderError::AuthorityNotFound)?;
+        if expected_revision == 0
+            || current.revision != expected_revision
+            || current.facts.valid_until_unix_ms <= now_unix_ms
+            || replacement.origin != current.facts.origin
+            || replacement.namespace != current.facts.namespace
+            || replacement.runtime_session != current.facts.runtime_session
+            || replacement.runtime_generation < current.facts.runtime_generation
+            || replacement.policy_generation < current.facts.policy_generation
+            || replacement.navigation_generation < current.facts.navigation_generation
         {
             return Err(ProviderError::StaleContext);
         }
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(ProviderError::StaleContext)?;
+        self.authorities.insert(
+            handle,
+            RegisteredAuthority {
+                facts: replacement,
+                revision,
+            },
+        );
+        self.pending
+            .retain(|_, approval| approval.authority_handle != handle);
+        self.rate.retain(|(candidate, _), _| *candidate != handle);
+        self.replay
+            .retain(|(candidate, _), _| *candidate != handle);
+        Ok(revision)
+    }
 
-        let context_changed = binding != self.binding;
-        let session_changed = binding.origin != self.binding.origin
-            || binding.namespace != self.binding.namespace
-            || binding.browser_authority_session != self.binding.browser_authority_session
-            || binding.wallet_session != self.binding.wallet_session;
-        if context_changed {
-            self.pending.clear();
+    pub fn revoke_authority(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        expected_revision: u64,
+    ) -> Result<(), ProviderError> {
+        let authority = self
+            .authorities
+            .get(&handle)
+            .ok_or(ProviderError::AuthorityNotFound)?;
+        if expected_revision == 0 || authority.revision != expected_revision {
+            return Err(ProviderError::StaleContext);
         }
-        if session_changed {
+        self.authorities.remove(&handle);
+        self.pending
+            .retain(|_, approval| approval.authority_handle != handle);
+        self.rate.retain(|(candidate, _), _| *candidate != handle);
+        self.replay
+            .retain(|(candidate, _), _| *candidate != handle);
+        Ok(())
+    }
+
+    pub fn set_wallet_state(&mut self, wallet_session: WalletSessionId, wallet_locked: bool) {
+        if wallet_session != self.wallet_session || wallet_locked != self.wallet_locked {
+            self.pending.clear();
+            self.replay.clear();
             self.rate.clear();
         }
-        self.binding = binding;
-        Ok(())
+        self.wallet_session = wallet_session;
+        self.wallet_locked = wallet_locked;
     }
 
     pub fn request(
         &mut self,
-        context: &RequestContext,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        request_nonce: u64,
+        now_unix_ms: u64,
         request_bytes: &[u8],
     ) -> Result<ProviderAction, ProviderError> {
         let request = ProviderRequest::decode(request_bytes)?;
-        self.validate_context(context)?;
+        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
+        if request_nonce == 0 {
+            return Err(ProviderError::Replay);
+        }
         let method = ProviderMethod::parse(&request.method)?;
         validate_module_params(method, &request.params)?;
-        self.enforce_rate(context, method)?;
-        let replay_expiry = context
-            .now_unix
-            .checked_add(APPROVAL_LIFETIME_SECONDS)
-            .ok_or(ProviderError::StaleContext)?;
-        self.state.consume_nonce(
-            &context.origin,
-            context.request_nonce,
-            context.now_unix,
-            replay_expiry,
-        )?;
+        let now_unix = now_unix_ms / 1_000;
+        self.enforce_rate(handle, method, now_unix)?;
+        let expires_at_unix = now_unix_ms
+            .checked_add(APPROVAL_LIFETIME_SECONDS * 1_000)
+            .ok_or(ProviderError::StaleContext)?
+            / 1_000;
+        self.consume_nonce(handle, request_nonce, now_unix, expires_at_unix)?;
 
-        if self.binding.wallet_locked
+        if self.wallet_locked
             && !matches!(
                 method,
                 ProviderMethod::WalletGetStatus | ProviderMethod::WalletGetCapabilities
@@ -611,91 +636,151 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         {
             return Err(ProviderError::WalletLocked);
         }
+        let permission_generation = self
+            .state
+            .permission_generation(&authority.facts.origin)?
+            .unwrap_or(0);
         if let Some(required) = method.permission() {
             let permission = self
                 .state
-                .permission(&context.origin)?
+                .permission(&authority.facts.origin)?
                 .ok_or(ProviderError::Unauthorized)?;
-            if permission.generation != context.permission_generation
-                || !permission.permits(required, context.now_unix)
+            if permission.generation != permission_generation
+                || !permission.permits(required, now_unix)
             {
                 return Err(ProviderError::Unauthorized);
             }
         }
 
         let call = ApprovedCall {
-            origin: context.origin.clone(),
+            origin: authority.facts.origin,
             method,
             params: request.params,
-            request_nonce: context.request_nonce,
+            request_nonce,
         };
         let Some(kind) = method.approval() else {
             return Ok(ProviderAction::Execute(call));
         };
+        self.pending
+            .retain(|_, approval| approval.expires_at_unix > now_unix);
+        if self.pending.len() >= MAX_PENDING_APPROVALS {
+            return Err(ProviderError::RateLimited);
+        }
         let approval = PendingApproval {
-            id: approval_id(context, method),
+            id: approval_id(
+                handle,
+                authority_revision,
+                self.wallet_session,
+                request_nonce,
+                method,
+            ),
             kind,
             call,
-            browser_authority_session: context.browser_authority_session,
-            browser_authority_generation: context.browser_authority_generation,
-            policy_generation: context.policy_generation,
-            wallet_session: context.wallet_session,
-            permission_generation: context.permission_generation,
-            navigation_generation: context.navigation_generation,
-            expires_at_unix: replay_expiry,
+            authority_handle: handle,
+            authority_revision,
+            wallet_session: self.wallet_session,
+            permission_generation,
+            expires_at_unix,
         };
-        self.state.save_pending(&approval, context.now_unix)?;
         self.pending.insert(approval.id, approval.clone());
         Ok(ProviderAction::ApprovalRequired(approval))
     }
 
     pub fn approve(
         &mut self,
-        context: &RequestContext,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
         id: ApprovalId,
+        now_unix_ms: u64,
     ) -> Result<ApprovedCall, ProviderError> {
-        self.validate_context(context)?;
+        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
         let approval = self
             .pending
-            .remove(&id)
+            .get(&id)
+            .cloned()
             .ok_or(ProviderError::StaleApproval)?;
-        if approval.expires_at_unix <= context.now_unix
-            || approval.call.origin != context.origin
-            || approval.browser_authority_session != context.browser_authority_session
-            || approval.browser_authority_generation != context.browser_authority_generation
-            || approval.policy_generation != context.policy_generation
-            || approval.wallet_session != context.wallet_session
-            || approval.permission_generation != context.permission_generation
-            || approval.navigation_generation != context.navigation_generation
+        let permission_generation = self
+            .state
+            .permission_generation(&authority.facts.origin)?
+            .unwrap_or(0);
+        if approval.expires_at_unix <= now_unix_ms / 1_000
+            || approval.call.origin != authority.facts.origin
+            || approval.authority_handle != handle
+            || approval.authority_revision != authority_revision
+            || approval.wallet_session != self.wallet_session
+            || approval.permission_generation != permission_generation
         {
             return Err(ProviderError::StaleApproval);
         }
+        self.pending.remove(&id);
         Ok(approval.call)
+    }
+
+    pub fn reject(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        id: ApprovalId,
+        now_unix_ms: u64,
+    ) -> Result<(), ProviderError> {
+        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
+        let approval = self
+            .pending
+            .get(&id)
+            .cloned()
+            .ok_or(ProviderError::StaleApproval)?;
+        let permission_generation = self
+            .state
+            .permission_generation(&authority.facts.origin)?
+            .unwrap_or(0);
+        if approval.expires_at_unix <= now_unix_ms / 1_000
+            || approval.call.origin != authority.facts.origin
+            || approval.authority_handle != handle
+            || approval.authority_revision != authority_revision
+            || approval.wallet_session != self.wallet_session
+            || approval.permission_generation != permission_generation
+        {
+            return Err(ProviderError::StaleApproval);
+        }
+        self.pending.remove(&id);
+        Ok(())
+    }
+
+    pub fn permission(
+        &self,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        now_unix_ms: u64,
+    ) -> Result<Option<PermissionRecord>, ProviderError> {
+        let authority = self.authority(handle, authority_revision, now_unix_ms)?;
+        self.state.permission(&authority.facts.origin)
     }
 
     pub fn grant_permissions(
         &mut self,
-        origin: Origin,
-        next_generation: u64,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
         capabilities: BTreeSet<PermissionCapability>,
         approved_names: BTreeSet<[u8; 32]>,
         now_unix: u64,
         expires_at_unix: Option<u64>,
     ) -> Result<PermissionRecord, ProviderError> {
-        if origin != self.binding.origin
-            || next_generation
-                != self
-                    .binding
-                    .permission_generation
-                    .checked_add(1)
-                    .ok_or(ProviderError::StaleContext)?
-            || capabilities.is_empty()
+        let authority = self
+            .authority(handle, authority_revision, now_unix.saturating_mul(1_000))?
+            .clone();
+        if capabilities.is_empty()
             || expires_at_unix.is_some_and(|expiry| expiry <= now_unix)
         {
             return Err(ProviderError::InvalidPermission);
         }
+        let next_generation = self
+            .state
+            .permission_generation(&authority.facts.origin)?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(ProviderError::StaleContext)?;
         let record = PermissionRecord {
-            origin,
+            origin: authority.facts.origin,
             generation: next_generation,
             capabilities,
             approved_names,
@@ -703,59 +788,106 @@ impl<S: ProviderStateStore> ProviderCore<S> {
             expires_at_unix,
         };
         self.state.save_permission(&record)?;
-        self.binding.permission_generation = next_generation;
+        self.pending
+            .retain(|_, approval| approval.authority_handle != handle);
         Ok(record)
     }
 
     pub fn revoke_permissions(
         &mut self,
-        origin: &Origin,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
         now_unix: u64,
-    ) -> Result<(), ProviderError> {
-        if origin != &self.binding.origin {
-            return Err(ProviderError::Unauthorized);
-        }
-        let expected_generation = self.binding.permission_generation;
+    ) -> Result<u64, ProviderError> {
+        let authority = self
+            .authority(handle, authority_revision, now_unix.saturating_mul(1_000))?
+            .clone();
+        let expected_generation = self
+            .state
+            .permission_generation(&authority.facts.origin)?
+            .ok_or(ProviderError::InvalidPermission)?;
         let next_generation = expected_generation
             .checked_add(1)
             .ok_or(ProviderError::StaleContext)?;
-        self.state
-            .revoke_permission(origin, expected_generation, next_generation, now_unix)?;
-        self.pending.clear();
-        self.binding.permission_generation = next_generation;
-        Ok(())
+        self.state.revoke_permission(
+            &authority.facts.origin,
+            expected_generation,
+            next_generation,
+            now_unix,
+        )?;
+        self.pending
+            .retain(|_, approval| approval.call.origin != authority.facts.origin);
+        Ok(next_generation)
     }
 
-    fn validate_context(&self, context: &RequestContext) -> Result<(), ProviderError> {
-        self.binding.validate()?;
-        if context.request_nonce == 0
-            || context.origin != self.binding.origin
-            || context.namespace != self.binding.namespace
-            || context.browser_authority_session != self.binding.browser_authority_session
-            || context.browser_authority_generation != self.binding.browser_authority_generation
-            || context.policy_generation != self.binding.policy_generation
-            || context.wallet_session != self.binding.wallet_session
-            || context.permission_generation != self.binding.permission_generation
-            || context.navigation_generation != self.binding.navigation_generation
+    fn authority(
+        &self,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        now_unix_ms: u64,
+    ) -> Result<&RegisteredAuthority, ProviderError> {
+        let authority = self
+            .authorities
+            .get(&handle)
+            .ok_or(ProviderError::AuthorityNotFound)?;
+        if authority_revision == 0
+            || authority.revision != authority_revision
+            || authority.facts.valid_until_unix_ms <= now_unix_ms
         {
             return Err(ProviderError::StaleContext);
         }
+        Ok(authority)
+    }
+
+    fn prune_expired_authorities(&mut self, now_unix_ms: u64) {
+        let expired: Vec<_> = self
+            .authorities
+            .iter()
+            .filter_map(|(handle, authority)| {
+                (authority.facts.valid_until_unix_ms <= now_unix_ms).then_some(*handle)
+            })
+            .collect();
+        for handle in expired {
+            self.authorities.remove(&handle);
+            self.pending
+                .retain(|_, approval| approval.authority_handle != handle);
+            self.rate.retain(|(candidate, _), _| *candidate != handle);
+            self.replay
+                .retain(|(candidate, _), _| *candidate != handle);
+        }
+    }
+
+    fn consume_nonce(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        nonce: u64,
+        now_unix: u64,
+        expires_at_unix: u64,
+    ) -> Result<(), ProviderError> {
+        self.replay.retain(|_, expiry| *expiry > now_unix);
+        if self.replay.contains_key(&(handle, nonce)) {
+            return Err(ProviderError::Replay);
+        }
+        if self.replay.len() >= MAX_REPLAY_NONCES {
+            return Err(ProviderError::RateLimited);
+        }
+        self.replay.insert((handle, nonce), expires_at_unix);
         Ok(())
     }
 
     fn enforce_rate(
         &mut self,
-        context: &RequestContext,
+        handle: HostAuthorityHandleId,
         method: ProviderMethod,
+        now_unix: u64,
     ) -> Result<(), ProviderError> {
-        let key = (context.origin.clone(), method);
-        let window = self.rate.entry(key).or_insert(RateWindow {
-            starts_at_unix: context.now_unix,
+        let window = self.rate.entry((handle, method)).or_insert(RateWindow {
+            starts_at_unix: now_unix,
             count: 0,
         });
-        if context.now_unix.saturating_sub(window.starts_at_unix) >= RATE_WINDOW_SECONDS {
+        if now_unix.saturating_sub(window.starts_at_unix) >= RATE_WINDOW_SECONDS {
             *window = RateWindow {
-                starts_at_unix: context.now_unix,
+                starts_at_unix: now_unix,
                 count: 0,
             };
         }
@@ -773,14 +905,19 @@ struct RateWindow {
     count: u32,
 }
 
-fn approval_id(context: &RequestContext, method: ProviderMethod) -> ApprovalId {
+fn approval_id(
+    handle: HostAuthorityHandleId,
+    authority_revision: u64,
+    wallet_session: WalletSessionId,
+    request_nonce: u64,
+    method: ProviderMethod,
+) -> ApprovalId {
     let mut hasher = Sha256::new();
-    hasher.update(b"hns-provider-approval/v1");
-    hasher.update(context.origin.as_str().as_bytes());
-    hasher.update(context.browser_authority_session.to_be_bytes());
-    hasher.update(context.wallet_session.to_be_bytes());
-    hasher.update(context.navigation_generation.to_be_bytes());
-    hasher.update(context.request_nonce.to_be_bytes());
+    hasher.update(b"hns-provider-approval/v2");
+    hasher.update(handle.as_bytes());
+    hasher.update(authority_revision.to_be_bytes());
+    hasher.update(wallet_session.as_bytes());
+    hasher.update(request_nonce.to_be_bytes());
     hasher.update(format!("{method:?}").as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let mut id = [0_u8; 16];
@@ -834,8 +971,12 @@ pub enum ProviderError {
     InvalidOrigin,
     #[error("provider requires an authenticated secure context")]
     InsecureContext,
-    #[error("browser authority denied provider injection")]
-    InjectionDenied,
+    #[error("opaque browser authority handle is unknown or revoked")]
+    AuthorityNotFound,
+    #[error("opaque browser authority handle is already registered")]
+    DuplicateAuthority,
+    #[error("browser authority registry reached its bounded capacity")]
+    AuthorityCapacity,
     #[error("request context is stale or mismatched")]
     StaleContext,
     #[error("provider request exceeds its bounded maximum")]
@@ -881,59 +1022,74 @@ impl From<serde_json::Error> for ProviderError {
 mod tests {
     use super::*;
 
+    const NOW_MS: u64 = 100_000;
+
     fn origin() -> Origin {
         Origin::parse("https://wallet.example").expect("origin")
     }
 
-    fn binding() -> AuthorityBinding {
-        AuthorityBinding {
+    fn wire_id<const N: usize>(byte: u8) -> [u8; N] {
+        [byte; N]
+    }
+
+    fn handle() -> HostAuthorityHandleId {
+        HostAuthorityHandleId::from_bytes(wire_id(1)).expect("handle")
+    }
+
+    fn wallet_session() -> WalletSessionId {
+        WalletSessionId::from_bytes(wire_id(2)).expect("wallet session")
+    }
+
+    fn registration() -> HostAuthorityRegistration {
+        HostAuthorityRegistration {
             origin: origin(),
             namespace: SelectedNamespace::Hns,
-            authenticated_context: true,
-            provider_injection_permitted: true,
-            browser_authority_session: 1,
-            browser_authority_generation: 2,
+            runtime_session: BrowserRuntimeSessionId::from_bytes(wire_id(3))
+                .expect("runtime session"),
+            runtime_generation: 2,
             policy_generation: 3,
-            wallet_session: 4,
-            permission_generation: 5,
             navigation_generation: 6,
-            wallet_locked: false,
+            decision_fingerprint: ProviderAuthorityFingerprint::from_bytes(wire_id(4))
+                .expect("fingerprint"),
+            valid_until_unix_ms: NOW_MS + 60_000,
         }
     }
 
-    fn context(nonce: u64) -> RequestContext {
-        let binding = binding();
-        RequestContext {
-            origin: binding.origin,
-            namespace: binding.namespace,
-            browser_authority_session: binding.browser_authority_session,
-            browser_authority_generation: binding.browser_authority_generation,
-            policy_generation: binding.policy_generation,
-            wallet_session: binding.wallet_session,
-            permission_generation: binding.permission_generation,
-            navigation_generation: binding.navigation_generation,
-            request_nonce: nonce,
-            now_unix: 100,
-        }
+    fn provider() -> ProviderCore<MemoryProviderState> {
+        let mut provider = ProviderCore::new(
+            MemoryProviderState::default(),
+            wallet_session(),
+            false,
+        );
+        provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("register authority");
+        provider
     }
 
     #[test]
-    fn rejects_insecure_cross_origin_stale_and_forbidden_requests() {
+    fn pages_have_no_constructible_trust_booleans_or_origin_context() {
         assert!(matches!(
             Origin::parse("http://wallet.example"),
             Err(ProviderError::InsecureContext)
         ));
-        let mut provider =
-            ProviderCore::new(binding(), MemoryProviderState::default()).expect("core");
-        let mut wrong = context(1);
-        wrong.origin = Origin::parse("https://other.example").expect("other");
+        let mut provider = provider();
         assert!(matches!(
-            provider.request(&wrong, br#"{"method":"wallet_getStatus"}"#),
-            Err(ProviderError::StaleContext)
+            provider.request(
+                HostAuthorityHandleId::from_bytes(wire_id(9)).expect("other handle"),
+                1,
+                1,
+                NOW_MS,
+                br#"{"method":"wallet_getStatus"}"#
+            ),
+            Err(ProviderError::AuthorityNotFound)
         ));
         assert!(matches!(
             provider.request(
-                &context(2),
+                handle(),
+                1,
+                2,
+                NOW_MS,
                 br#"{"method":"eth_sendTransaction","params":{}}"#
             ),
             Err(ProviderError::ForbiddenMethod)
@@ -942,13 +1098,12 @@ mod tests {
 
     #[test]
     fn permissions_are_origin_scoped_and_value_movement_always_prompts() {
-        let mut provider =
-            ProviderCore::new(binding(), MemoryProviderState::default()).expect("core");
+        let mut provider = provider();
         provider
             .state
             .save_permission(&PermissionRecord {
                 origin: origin(),
-                generation: 5,
+                generation: 1,
                 capabilities: BTreeSet::from([PermissionCapability::Send]),
                 approved_names: BTreeSet::new(),
                 created_at_unix: 1,
@@ -957,40 +1112,49 @@ mod tests {
             .expect("permission");
         let action = provider
             .request(
-                &context(9),
+                handle(),
+                1,
+                9,
+                NOW_MS,
                 br#"{"method":"hns_send","params":{"amount":"1","recipient":"hs1q"}}"#,
             )
             .expect("authorized request");
         let ProviderAction::ApprovalRequired(approval) = action else {
             panic!("send must require approval")
         };
-        let mut navigated = context(10);
-        navigated.navigation_generation += 1;
+        let mut replacement = registration();
+        replacement.navigation_generation += 1;
+        let revision = provider
+            .replace_authority(handle(), 1, replacement, NOW_MS)
+            .expect("replace");
         assert!(matches!(
-            provider.approve(&navigated, approval.id),
-            Err(ProviderError::StaleContext) | Err(ProviderError::StaleApproval)
+            provider.approve(handle(), revision, approval.id, NOW_MS),
+            Err(ProviderError::StaleApproval)
         ));
     }
 
     #[test]
     fn duplicate_request_nonce_is_rejected() {
-        let mut provider =
-            ProviderCore::new(binding(), MemoryProviderState::default()).expect("core");
+        let mut provider = provider();
         let bytes = br#"{"method":"wallet_getStatus"}"#;
-        provider.request(&context(11), bytes).expect("first");
+        provider
+            .request(handle(), 1, 11, NOW_MS, bytes)
+            .expect("first");
         assert!(matches!(
-            provider.request(&context(11), bytes),
+            provider.request(handle(), 1, 11, NOW_MS, bytes),
             Err(ProviderError::Replay)
         ));
     }
 
     #[test]
     fn external_asset_methods_are_generic_and_module_bounded() {
-        let mut provider =
-            ProviderCore::new(binding(), MemoryProviderState::default()).expect("core");
+        let mut provider = provider();
         assert!(matches!(
             provider.request(
-                &context(12),
+                handle(),
+                1,
+                12,
+                NOW_MS,
                 br#"{"method":"asset_getBalance","params":{"module":"litecoin"}}"#
             ),
             Err(ProviderError::InvalidParams)
@@ -998,26 +1162,29 @@ mod tests {
     }
 
     #[test]
-    fn binding_generations_cannot_regress_within_one_session() {
-        let mut provider =
-            ProviderCore::new(binding(), MemoryProviderState::default()).expect("core");
-        let mut regressed = binding();
+    fn handle_replacement_is_exact_and_cannot_regress() {
+        let mut provider = provider();
+        let mut regressed = registration();
         regressed.navigation_generation -= 1;
         assert!(matches!(
-            provider.update_binding(regressed),
+            provider.replace_authority(handle(), 1, regressed, NOW_MS),
             Err(ProviderError::StaleContext)
         ));
-
-        let mut replacement_session = binding();
-        replacement_session.browser_authority_session = 100;
-        replacement_session.wallet_session = 200;
-        replacement_session.browser_authority_generation = 1;
-        replacement_session.policy_generation = 1;
-        replacement_session.permission_generation = 1;
-        replacement_session.navigation_generation = 1;
+        let mut replacement = registration();
+        replacement.policy_generation += 1;
+        assert_eq!(
+            provider
+                .replace_authority(handle(), 1, replacement, NOW_MS)
+                .expect("fresh replacement"),
+            2
+        );
+        assert!(matches!(
+            provider.revoke_authority(handle(), 1),
+            Err(ProviderError::StaleContext)
+        ));
         provider
-            .update_binding(replacement_session)
-            .expect("random session identities are not ordinal counters");
+            .revoke_authority(handle(), 2)
+            .expect("exact revision revoke");
     }
 
     #[test]

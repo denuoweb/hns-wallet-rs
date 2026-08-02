@@ -7,8 +7,8 @@ chain-neutral market settlement, and deliberately narrow Bitcoin and Ethereum
 modules.
 
 The workspace does not combine the browser, node, or canonical protocol
-repositories. It consumes released protocol crates and exposes a versioned ABI
-for separately released browser adapters.
+repositories. It consumes released protocol crates and exposes a private,
+length-prefixed wallet-service ABI for separately released browser adapters.
 
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS and Bitcoin value operations and all mainnet settlement
@@ -30,7 +30,8 @@ never a mainnet authorization signal.
 - `hns-wallet-market`: price-bound reservations and atomic-swap recovery.
 - `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, separated swap keys, and Bitcoin HTLC adapter.
 - `hns-wallet-ethereum`: Helios policy and native-ETH-only HTLC adapter.
-- `hns-wallet-ffi`: stable typed Android/iOS/Chromium ABI.
+- `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.
+- `hns-wallet-service`: private session/authority registry and subprocess composition boundary.
 - `hns-wallet-testkit`: deterministic, non-mainnet fixtures.
 
 Run `scripts/check.sh` once for the complete local qualification gate.
@@ -45,7 +46,7 @@ Run `scripts/check.sh` once for the complete local qualification gate.
 - [Bitcoin Kyoto-only module](docs/BITCOIN_KYOTO.md)
 - [Ethereum model and contract](docs/ETHEREUM.md)
 - [Shakedex and market state](docs/SHAKEDEX_AND_MARKET.md)
-- [ABI v1](docs/ABI.md)
+- [Wallet service ABI v2](docs/ABI.md)
 - [Qualification matrix](docs/QUALIFICATION.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Future work and excluded features](FUTURE_WORK.md)

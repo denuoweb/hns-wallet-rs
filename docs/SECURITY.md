@@ -8,9 +8,13 @@ marketplace settlement is independently disabled.
 
 - The website is hostile. It cannot supply an authenticated origin, select a
   browser namespace, reuse another navigation, or send native-host commands.
-- Browser authority context is stamped by the browser product and binds exact
-  logical origin, namespace, authority session/generation, policy generation,
-  wallet session, permission generation, and navigation generation.
+- The browser product retains the engine-issued, nonserializable authority. Its
+  native host registers only engine-derived origin/namespace/runtime/policy/
+  navigation facts over a private child pipe and issues a random opaque handle.
+  The page cannot supply the handle or any authority fact as authentication.
+- Service, wallet, and host sessions are random identities. Restart and
+  authority revisions plus directional channel/event sequences are checked
+  exactly. Wallet lock state and permission generation are service-owned.
 - The wallet database and keys live in a native/mobile wallet process. Website
   JavaScript, extension local storage, and native-messaging frames never carry
   seed or raw private-key bytes.
@@ -30,8 +34,10 @@ marketplace settlement is independently disabled.
 ## Secrets
 
 Recovery seeds, imported private keys, HTLC preimages, wallet/workflow state,
-provider capabilities, pending approvals, and replay origins use per-record
-XChaCha20-Poly1305 with random nonces. Associated data binds the database ID,
+provider permissions, and persisted workflow approvals/replay origins use
+per-record XChaCha20-Poly1305 with random nonces. ABI v2 provider approvals and
+handle replay windows are memory-only and disappear on service restart.
+Associated data binds the database ID,
 record kind and ID, and every plaintext metadata column used for authorization,
 expiry, revision, revocation, or broadcast decisions. The database key is
 derived with Argon2id. Secret buffers use zeroizing containers where practical.
@@ -48,9 +54,14 @@ native policy is implemented. A product integration must wrap the database key
 with Android Keystore/iOS Keychain/OS secure storage and protect backups; that
 wrapping is not implemented in this repo.
 
-Recovery-phrase display is a dedicated high-risk mobile operation. The stable
-ABI rejects it over Chromium native messaging. Logs and ordinary `Debug`
+Recovery-phrase display remains a dedicated high-risk native/mobile concern and
+is absent from the private service/provider ABI. Logs and ordinary `Debug`
 implementations redact signing transactions, phrases, keys, and preimages.
+Inbound passphrases and restore phrases use non-cloneable, redacted ABI secret
+values whose owned allocations are zeroized on drop.
+New host/service/wallet session IDs, authority handles, fingerprints, request
+IDs, and approval IDs also redact `Debug` and `Display`; only their canonical
+wire serializers reveal the value to the private transport.
 Bitcoin swap-key handles additionally keep their secret half private,
 non-serializable and non-cloneable, redact it from `Debug`, and zeroize the
 32-byte scalar on drop. Their public recovery coordinates contain no secret.
@@ -59,9 +70,10 @@ non-serializable and non-cloneable, redact it from `Debug`, and zeroize the
 
 Amounts are integer base units serialized to JavaScript as decimal strings.
 Arithmetic is checked; prices and fees never use floating point. Value-moving
-methods require an expiring approval bound to origin and every browser/wallet
-generation. Production UI must display asset, exact amount, recipient, fee
-maximum, chain, finality policy, price-round commitment, and refund timeout.
+methods require a typed approval of at most 90 seconds bound to the service
+session and exact authority handle/revision. Production UI must display asset,
+exact amount, recipient, fee maximum, chain, finality policy, price-round
+commitment, and refund timeout. Free-form approval display lines are rejected.
 
 The library supplies the policy and state boundary; the current browser UI does
 not yet provide every approval screen. No mainnet enablement may infer approval
@@ -70,13 +82,17 @@ from a unit test.
 ## Provider defenses
 
 The provider core enforces secure exact origins (with loopback HTTP allowed for
-development), origin-scoped permissions, bounded frames/methods/params, request
-nonces, replay persistence, per-method windows, approval expiry, and
-stale-navigation rejection. Authority generations cannot regress within one
-authority/wallet session; random session identifiers are treated as identities,
-not counters. Permission creation may bootstrap from a trusted nonzero
-generation, then every grant or revocation must advance exactly once. Revocation
-stores an authenticated tombstone so delete/regrant cannot reset the generation.
+development), origin-scoped persisted permissions, bounded methods/params,
+ephemeral handle-bound request nonces, per-method windows, 90-second approval
+expiry, and exact authority revisions. Replacement cannot change origin,
+namespace, or runtime session and cannot regress runtime, policy, or navigation
+generation. The service owns wallet session/lock state and reads permission
+generation from the encrypted store. Permission creation begins at generation
+one; every later grant or revocation advances the stored generation exactly
+once. Revocation stores an authenticated tombstone so delete/regrant cannot
+reset the generation. Service restart intentionally drops authorities,
+approvals, replay/rate state, request IDs, and event cursors while permissions
+survive.
 It explicitly rejects seed/key extraction, raw signing, PSBT signing, generic
 Ethereum transactions/calls, chain switching, and arbitrary native-host access.
 

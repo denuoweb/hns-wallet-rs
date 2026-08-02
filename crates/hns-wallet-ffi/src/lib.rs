@@ -1,71 +1,241 @@
-#![doc = "Versioned, typed, secret-minimizing browser wallet ABI."]
+#![doc = "Versioned, framed, secret-minimizing private wallet service ABI."]
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
 
 use hns_wallet_types::{
-    AccountId, Amount, ApprovalId, ModuleId, PermissionCapability, ReceiveTarget, SyncStatus,
-    TransactionSummary, WalletId, WorkflowId,
+    AccountId, Amount, ApprovalKind, BaseUnits, BrowserRuntimeSessionId, FinalityModel,
+    HostAuthorityHandleId, HostSessionId, ModuleId, PermissionCapability, ProviderApprovalId,
+    ProviderAuthorityFingerprint, ProviderRequestId, ReceiveTarget, SyncStatus, TransactionSummary,
+    WalletAsset, WalletId, WalletServiceSessionId, WorkflowId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-pub const WALLET_ABI_VERSION: u16 = 1;
+pub const WALLET_ABI_VERSION: u16 = 2;
+pub const LENGTH_PREFIX_BYTES: usize = 4;
 pub const MAX_ABI_FRAME_BYTES: usize = 1_048_576;
+pub const MAX_PROVIDER_REQUEST_BYTES: usize = 65_536;
+pub const MAX_PROVIDER_RESULT_BYTES: usize = 262_144;
+pub const MAX_PROVIDER_EVENT_BYTES: usize = 65_536;
+pub const MAX_APPROVAL_FRAME_BYTES: usize = 16_384;
+pub const MAX_APPROVAL_LIFETIME_MS: u64 = 90_000;
 pub const MAX_PASSPHRASE_BYTES: usize = 1_024;
 pub const MAX_RECOVERY_PHRASE_BYTES: usize = 1_024;
-pub const MAX_PROVIDER_PARAMS_BYTES: usize = 262_144;
+pub const MAX_METHOD_BYTES: usize = 96;
+pub const MAX_ORIGIN_BYTES: usize = 512;
+pub const MAX_PUBLIC_STRING_BYTES: usize = 4_096;
+pub const MAX_PUBLIC_ITEMS: usize = 128;
+pub const MAX_FAILURE_MESSAGE_BYTES: usize = 1_024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum HostPlatform {
     Android,
     Ios,
     ChromiumNativeHost,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AbiEnvelope<T> {
-    pub abi_version: u16,
-    pub request_id: u64,
-    pub session_nonce: u64,
-    pub body: T,
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceCapability {
+    CanonicalFraming,
+    RestartIsolation,
+    OpaqueAuthorityRegistry,
+    PersistentPermissions,
+    StructuredApprovals,
+    TypedEvents,
+    WalletOperations,
+    ProviderDispatch,
+    ValueMovement,
+    BrowserIntegration,
 }
 
-impl<T> AbiEnvelope<T> {
-    fn validate_header(&self) -> Result<(), AbiError> {
-        if self.abi_version != WALLET_ABI_VERSION {
-            return Err(AbiError::VersionMismatch);
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderNamespace {
+    Hns,
+    Icann,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceLimits {
+    pub outer_frame_bytes: u32,
+    pub provider_request_bytes: u32,
+    pub provider_result_bytes: u32,
+    pub provider_event_bytes: u32,
+    pub approval_frame_bytes: u32,
+    pub approval_lifetime_ms: u64,
+}
+
+impl Default for ServiceLimits {
+    fn default() -> Self {
+        Self {
+            outer_frame_bytes: MAX_ABI_FRAME_BYTES as u32,
+            provider_request_bytes: MAX_PROVIDER_REQUEST_BYTES as u32,
+            provider_result_bytes: MAX_PROVIDER_RESULT_BYTES as u32,
+            provider_event_bytes: MAX_PROVIDER_EVENT_BYTES as u32,
+            approval_frame_bytes: MAX_APPROVAL_FRAME_BYTES as u32,
+            approval_lifetime_ms: MAX_APPROVAL_LIFETIME_MS,
         }
-        if self.request_id == 0 || self.session_nonce == 0 {
-            return Err(AbiError::InvalidEnvelope);
-        }
-        Ok(())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "operation", content = "parameters", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HostHello {
+    pub protocol_version: u16,
+    pub platform: HostPlatform,
+    pub host_session_id: HostSessionId,
+    pub restart_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceHello {
+    pub protocol_version: u16,
+    pub platform: HostPlatform,
+    pub host_session_id: HostSessionId,
+    pub service_session_id: WalletServiceSessionId,
+    pub restart_generation: u64,
+    pub capabilities: BTreeSet<ServiceCapability>,
+    pub limits: ServiceLimits,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionEnvelope<T> {
+    pub protocol_version: u16,
+    pub host_session_id: HostSessionId,
+    pub service_session_id: WalletServiceSessionId,
+    pub restart_generation: u64,
+    pub channel_sequence: u64,
+    pub request_id: ProviderRequestId,
+    pub body: T,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HostAuthorityFacts {
+    pub origin: String,
+    pub namespace: ProviderNamespace,
+    pub runtime_session_id: BrowserRuntimeSessionId,
+    pub runtime_generation: u64,
+    pub policy_generation: u64,
+    pub navigation_generation: u64,
+    pub decision_fingerprint: ProviderAuthorityFingerprint,
+    pub valid_until_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ServiceRequest {
+    RegisterAuthority {
+        authority_handle: HostAuthorityHandleId,
+        authority: HostAuthorityFacts,
+    },
+    ReplaceAuthority {
+        authority_handle: HostAuthorityHandleId,
+        expected_authority_revision: u64,
+        authority: HostAuthorityFacts,
+    },
+    RevokeAuthority {
+        authority_handle: HostAuthorityHandleId,
+        expected_authority_revision: u64,
+    },
+    ProviderRequest {
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        request_nonce: u64,
+        method: String,
+        #[serde(default)]
+        params: Value,
+    },
+    ApprovalDecision {
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        approval_id: ProviderApprovalId,
+        decision: ApprovalDecision,
+    },
+    Wallet {
+        request: WalletRequest,
+    },
+}
+
+/// An owned ABI secret that zeroizes its allocation on drop and never prints
+/// its plaintext. It deliberately does not implement `Clone`.
+pub struct SecretString(Zeroizing<String>);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretString([REDACTED])")
+    }
+}
+
+impl PartialEq for SecretString {
+    fn eq(&self, other: &Self) -> bool {
+        self.expose_secret() == other.expose_secret()
+    }
+}
+
+impl Eq for SecretString {}
+
+impl Serialize for SecretString {
+    fn serialize<Serializer>(
+        &self,
+        serializer: Serializer,
+    ) -> Result<Serializer::Ok, Serializer::Error>
+    where
+        Serializer: serde::Serializer,
+    {
+        serializer.serialize_str(self.expose_secret())
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
 pub enum WalletRequest {
     Status,
     CreateWallet {
-        passphrase: String,
-        display_recovery_phrase: bool,
+        passphrase: SecretString,
     },
     RestoreWallet {
-        passphrase: String,
-        recovery_phrase: String,
+        passphrase: SecretString,
+        recovery_phrase: SecretString,
     },
     Unlock {
-        passphrase: String,
+        passphrase: SecretString,
     },
     Lock,
-    DisplayRecoveryPhrase {
-        wallet_id: WalletId,
-        dedicated_ui_confirmation_nonce: u64,
-    },
     ListAccounts,
     Balance {
         module: ModuleId,
@@ -82,114 +252,105 @@ pub enum WalletRequest {
     ModuleStatus {
         module: ModuleId,
     },
-    ProviderRequest {
-        authenticated_origin_context: Vec<u8>,
-        method: String,
-        params: Value,
-    },
-    Approve {
-        approval_id: ApprovalId,
-        authenticated_origin_context: Vec<u8>,
-    },
-    Reject {
-        approval_id: ApprovalId,
-    },
     WorkflowStatus {
         workflow_id: WorkflowId,
     },
 }
 
-impl WalletRequest {
-    fn validate(&self, platform: HostPlatform) -> Result<(), AbiError> {
-        match self {
-            Self::CreateWallet { passphrase, .. } | Self::Unlock { passphrase } => {
-                validate_passphrase(passphrase)
-            }
-            Self::RestoreWallet {
-                passphrase,
-                recovery_phrase,
-            } => {
-                validate_passphrase(passphrase)?;
-                if recovery_phrase.is_empty() || recovery_phrase.len() > MAX_RECOVERY_PHRASE_BYTES {
-                    return Err(AbiError::InvalidSecretInput);
-                }
-                Ok(())
-            }
-            Self::DisplayRecoveryPhrase {
-                dedicated_ui_confirmation_nonce,
-                ..
-            } => {
-                if platform == HostPlatform::ChromiumNativeHost {
-                    return Err(AbiError::HighRiskOperationUnavailable);
-                }
-                if *dedicated_ui_confirmation_nonce == 0 {
-                    return Err(AbiError::HighRiskConfirmationRequired);
-                }
-                Ok(())
-            }
-            Self::ProviderRequest {
-                authenticated_origin_context,
-                method,
-                params,
-            } => {
-                if authenticated_origin_context.is_empty()
-                    || method.is_empty()
-                    || method.len() > 128
-                    || serde_json::to_vec(params)
-                        .map_err(|_| AbiError::InvalidEnvelope)?
-                        .len()
-                        > MAX_PROVIDER_PARAMS_BYTES
-                {
-                    return Err(AbiError::InvalidProviderRequest);
-                }
-                Ok(())
-            }
-            Self::Approve {
-                authenticated_origin_context,
-                ..
-            } if authenticated_origin_context.is_empty() => Err(AbiError::InvalidProviderRequest),
-            _ => Ok(()),
-        }
-    }
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "frameType", rename_all = "camelCase", deny_unknown_fields)]
+pub enum HostFrame {
+    Hello {
+        hello: HostHello,
+    },
+    Request {
+        envelope: SessionEnvelope<ServiceRequest>,
+    },
 }
 
-fn validate_passphrase(passphrase: &str) -> Result<(), AbiError> {
-    if passphrase.is_empty() || passphrase.len() > MAX_PASSPHRASE_BYTES {
-        return Err(AbiError::InvalidSecretInput);
-    }
-    Ok(())
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "frameType", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ServiceFrame {
+    Hello {
+        hello: ServiceHello,
+    },
+    Response {
+        envelope: SessionEnvelope<ServiceResponse>,
+    },
+    Event {
+        event: ProviderEventEnvelope,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ServiceResponse {
+    AuthorityRegistered {
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+    },
+    AuthorityReplaced {
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+    },
+    AuthorityRevoked {
+        authority_handle: HostAuthorityHandleId,
+    },
+    ProviderResult {
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        value: Value,
+    },
+    ApprovalRequired {
+        approval: ApprovalPrompt,
+    },
+    ApprovalRejected {
+        approval_id: ProviderApprovalId,
+    },
+    Wallet {
+        response: WalletResponse,
+    },
+    Failure {
+        failure: ServiceFailure,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "result", content = "value", rename_all = "snake_case")]
+#[serde(tag = "result", rename_all = "camelCase", deny_unknown_fields)]
 pub enum WalletResponse {
-    Status(WalletRuntimeStatus),
+    Status {
+        status: WalletRuntimeStatus,
+    },
     WalletCreated {
         wallet_id: WalletId,
-        recovery_phrase_display_required: bool,
     },
     WalletRestored {
         wallet_id: WalletId,
     },
     Locked,
     Unlocked,
-    /// This is the sole ABI response permitted to contain a phrase. The
-    /// dispatcher refuses it over Chromium native messaging.
-    DedicatedRecoveryPhraseDisplay {
-        recovery_phrase: String,
+    Accounts {
+        accounts: Vec<AccountSummary>,
     },
-    Accounts(Vec<AccountSummary>),
-    Balance(Amount),
-    ReceiveTarget(ReceiveTarget),
-    TransactionHistory(Vec<TransactionSummary>),
-    ModuleStatus(SyncStatus),
-    Provider(Value),
-    ApprovalRequired(ApprovalSummary),
-    ApprovalRejected,
-    Workflow(WorkflowSummary),
+    Balance {
+        amount: Amount,
+    },
+    ReceiveTarget {
+        target: ReceiveTarget,
+    },
+    TransactionHistory {
+        transactions: Vec<TransactionSummary>,
+    },
+    ModuleStatus {
+        status: SyncStatus,
+    },
+    Workflow {
+        summary: WorkflowSummary,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WalletRuntimeStatus {
     pub locked: bool,
     pub active_wallet: Option<WalletId>,
@@ -198,6 +359,7 @@ pub struct WalletRuntimeStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AccountSummary {
     pub account_id: AccountId,
     pub module: ModuleId,
@@ -206,15 +368,7 @@ pub struct AccountSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ApprovalSummary {
-    pub approval_id: ApprovalId,
-    pub origin: String,
-    pub capabilities: BTreeSet<PermissionCapability>,
-    pub display_lines: Vec<String>,
-    pub expires_at_unix: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WorkflowSummary {
     pub workflow_id: WorkflowId,
     pub state: String,
@@ -222,173 +376,1031 @@ pub struct WorkflowSummary {
     pub terminal: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModuleApprovalAction {
+    Enable,
+    Disable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NameMarketApprovalAction {
+    Create,
+    Cancel,
+    Recover,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarketIntentApprovalAction {
+    Publish,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalWarning {
+    FeeEstimateMayChange,
+    NameTransferIsIrreversible,
+    RefundRequiresManualAction,
+    SettlementCanBeDelayed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AbiFailure {
-    pub code: u16,
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ApprovalSummary {
+    Permissions {
+        capabilities: BTreeSet<PermissionCapability>,
+    },
+    ModuleEnablement {
+        module: ModuleId,
+        action: ModuleApprovalAction,
+    },
+    Send {
+        amount: Amount,
+        recipient: String,
+        maximum_fee: Amount,
+        chain: ModuleId,
+        finality: FinalityModel,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+    NameTransfer {
+        name: String,
+        recipient: String,
+        maximum_fee: Amount,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+    NameFinalize {
+        name: String,
+        recipient: String,
+        maximum_fee: Amount,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+    TypedSignature {
+        message_type: String,
+        message_digest: String,
+    },
+    NameMarketOffer {
+        action: NameMarketApprovalAction,
+        name: String,
+        listing_id: Option<String>,
+        price: Amount,
+        maximum_fee: Amount,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+    NameMarketPurchase {
+        name: String,
+        listing_id: String,
+        payment: Amount,
+        recipient: String,
+        maximum_fee: Amount,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+    MarketIntent {
+        action: MarketIntentApprovalAction,
+        market_intent_id: Option<String>,
+        offered: Amount,
+        requested_asset: WalletAsset,
+        price_round: String,
+        maximum_fee: Amount,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+    FillAcceptance {
+        market_intent_id: String,
+        fill_id: String,
+        offered: Amount,
+        expected: Amount,
+        price_round: String,
+        refund_timeout_unix_ms: u64,
+        maximum_fee: Amount,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+    SwapRedeem {
+        swap_session_id: String,
+        amount: Amount,
+        recipient: String,
+        maximum_fee: Amount,
+        finality: FinalityModel,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+    SwapRefund {
+        swap_session_id: String,
+        amount: Amount,
+        recipient: String,
+        maximum_fee: Amount,
+        refund_available_at_unix_ms: u64,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
+}
+
+impl ApprovalSummary {
+    pub const fn approval_kind(&self) -> ApprovalKind {
+        match self {
+            Self::Permissions { .. } => ApprovalKind::Permission,
+            Self::ModuleEnablement { .. } => ApprovalKind::ModuleEnablement,
+            Self::Send { .. } => ApprovalKind::Send,
+            Self::NameTransfer { .. } => ApprovalKind::NameTransfer,
+            Self::NameFinalize { .. } => ApprovalKind::NameFinalize,
+            Self::TypedSignature { .. } => ApprovalKind::TypedSignature,
+            Self::NameMarketOffer { .. } => ApprovalKind::NameMarketOffer,
+            Self::NameMarketPurchase { .. } => ApprovalKind::NameMarketPurchase,
+            Self::MarketIntent { .. } => ApprovalKind::MarketIntent,
+            Self::FillAcceptance { .. } => ApprovalKind::FillAcceptance,
+            Self::SwapRedeem { .. } => ApprovalKind::SwapRedeem,
+            Self::SwapRefund { .. } => ApprovalKind::SwapRefund,
+        }
+    }
+
+    fn validate(&self) -> Result<(), AbiError> {
+        match self {
+            Self::Permissions { capabilities } => {
+                if capabilities.is_empty() || capabilities.len() > MAX_PUBLIC_ITEMS {
+                    return Err(AbiError::InvalidApproval);
+                }
+            }
+            Self::ModuleEnablement { .. } => {}
+            Self::Send {
+                amount,
+                recipient,
+                maximum_fee,
+                chain,
+                warnings,
+            } => {
+                if amount.asset != chain.asset() {
+                    return Err(AbiError::InvalidApproval);
+                }
+                validate_value_movement(*amount, recipient, *maximum_fee, warnings)?;
+            }
+            Self::NameTransfer {
+                name,
+                recipient,
+                maximum_fee,
+                warnings,
+            }
+            | Self::NameFinalize {
+                name,
+                recipient,
+                maximum_fee,
+                warnings,
+            } => {
+                if maximum_fee.asset != WalletAsset::Hns {
+                    return Err(AbiError::InvalidApproval);
+                }
+                validate_public_string(name)?;
+                validate_value_movement(
+                    Amount::new(WalletAsset::Hns, 1),
+                    recipient,
+                    *maximum_fee,
+                    warnings,
+                )?;
+            }
+            Self::TypedSignature {
+                message_type,
+                message_digest,
+            } => {
+                validate_public_string(message_type)?;
+                validate_public_string(message_digest)?;
+            }
+            Self::NameMarketOffer {
+                name,
+                listing_id,
+                price,
+                maximum_fee,
+                warnings,
+                ..
+            } => {
+                if price.asset != WalletAsset::Hns || maximum_fee.asset != WalletAsset::Hns {
+                    return Err(AbiError::InvalidApproval);
+                }
+                validate_public_string(name)?;
+                validate_optional_public_string(listing_id)?;
+                validate_amount(*price, false)?;
+                validate_amount(*maximum_fee, true)?;
+                validate_warnings(warnings)?;
+            }
+            Self::NameMarketPurchase {
+                name,
+                listing_id,
+                payment,
+                recipient,
+                maximum_fee,
+                warnings,
+            } => {
+                if payment.asset != WalletAsset::Hns || maximum_fee.asset != WalletAsset::Hns {
+                    return Err(AbiError::InvalidApproval);
+                }
+                validate_public_string(name)?;
+                validate_public_string(listing_id)?;
+                validate_value_movement(*payment, recipient, *maximum_fee, warnings)?;
+            }
+            Self::MarketIntent {
+                market_intent_id,
+                offered,
+                requested_asset,
+                price_round,
+                maximum_fee,
+                warnings,
+            } => {
+                if offered.asset == *requested_asset || maximum_fee.asset != offered.asset {
+                    return Err(AbiError::InvalidApproval);
+                }
+                validate_optional_public_string(market_intent_id)?;
+                validate_public_string(price_round)?;
+                validate_amount(*offered, false)?;
+                validate_amount(*maximum_fee, true)?;
+                validate_warnings(warnings)?;
+            }
+            Self::FillAcceptance {
+                market_intent_id,
+                fill_id,
+                offered,
+                expected,
+                price_round,
+                refund_timeout_unix_ms,
+                maximum_fee,
+                warnings,
+            } => {
+                if offered.asset == expected.asset || maximum_fee.asset != offered.asset {
+                    return Err(AbiError::InvalidApproval);
+                }
+                validate_public_string(market_intent_id)?;
+                validate_public_string(fill_id)?;
+                validate_public_string(price_round)?;
+                validate_amount(*offered, false)?;
+                validate_amount(*expected, false)?;
+                validate_amount(*maximum_fee, true)?;
+                validate_warnings(warnings)?;
+                if *refund_timeout_unix_ms == 0 {
+                    return Err(AbiError::InvalidApproval);
+                }
+            }
+            Self::SwapRedeem {
+                swap_session_id,
+                amount,
+                recipient,
+                maximum_fee,
+                warnings,
+                ..
+            } => {
+                validate_public_string(swap_session_id)?;
+                validate_value_movement(*amount, recipient, *maximum_fee, warnings)?;
+            }
+            Self::SwapRefund {
+                swap_session_id,
+                amount,
+                recipient,
+                maximum_fee,
+                refund_available_at_unix_ms,
+                warnings,
+            } => {
+                validate_public_string(swap_session_id)?;
+                validate_value_movement(*amount, recipient, *maximum_fee, warnings)?;
+                if *refund_available_at_unix_ms == 0 {
+                    return Err(AbiError::InvalidApproval);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_method(&self, method: &str) -> Result<(), AbiError> {
+        let matches = match self {
+            Self::Permissions { .. } => {
+                matches!(method, "wallet_requestPermissions" | "hns_requestAccounts")
+            }
+            Self::ModuleEnablement { action, .. } => matches!(
+                (method, *action),
+                ("wallet_enableModule", ModuleApprovalAction::Enable)
+                    | ("wallet_disableModule", ModuleApprovalAction::Disable)
+            ),
+            Self::Send { .. } => matches!(method, "hns_send" | "asset_send"),
+            Self::NameTransfer { .. } => method == "hns_transferName",
+            Self::NameFinalize { .. } => method == "hns_finalizeName",
+            Self::TypedSignature { .. } => method == "hns_signTypedMessage",
+            Self::NameMarketOffer { action, .. } => matches!(
+                (method, *action),
+                (
+                    "nameMarket_createFixedPriceOffer",
+                    NameMarketApprovalAction::Create
+                ) | ("nameMarket_cancelOffer", NameMarketApprovalAction::Cancel)
+                    | ("nameMarket_recoverName", NameMarketApprovalAction::Recover)
+            ),
+            Self::NameMarketPurchase { .. } => matches!(
+                method,
+                "nameMarket_acceptOffer" | "nameMarket_finalizePurchase"
+            ),
+            Self::MarketIntent { action, .. } => matches!(
+                (method, *action),
+                ("swap_publishMarketIntent", MarketIntentApprovalAction::Publish)
+                    | ("swap_cancelMarketIntent", MarketIntentApprovalAction::Cancel)
+            ),
+            Self::FillAcceptance { .. } => {
+                matches!(method, "swap_requestMatch" | "swap_acceptFill")
+            }
+            Self::SwapRedeem { .. } => method == "swap_redeem",
+            Self::SwapRefund { .. } => method == "swap_refund",
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(AbiError::InvalidApproval)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ApprovalPrompt {
+    pub approval_id: ProviderApprovalId,
+    pub authority_handle: HostAuthorityHandleId,
+    pub authority_revision: u64,
+    pub origin: String,
+    pub method: String,
+    pub expires_at_unix_ms: u64,
+    pub summary: ApprovalSummary,
+}
+
+impl ApprovalPrompt {
+    pub fn validate(
+        &self,
+        expected_kind: ApprovalKind,
+        now_unix_ms: u64,
+    ) -> Result<(), AbiError> {
+        if self.authority_revision == 0
+            || self.expires_at_unix_ms <= now_unix_ms
+            || self.expires_at_unix_ms > now_unix_ms.saturating_add(MAX_APPROVAL_LIFETIME_MS)
+            || self.origin.is_empty()
+            || self.origin.len() > MAX_ORIGIN_BYTES
+            || !self.origin.is_ascii()
+            || self.method.is_empty()
+            || self.method.len() > MAX_METHOD_BYTES
+            || !self.method.is_ascii()
+            || self.summary.approval_kind() != expected_kind
+        {
+            return Err(AbiError::InvalidApproval);
+        }
+        self.summary.validate()?;
+        self.summary.validate_method(&self.method)?;
+        if serde_json::to_vec(self)
+            .map_err(|_| AbiError::Encoding)?
+            .len()
+            > MAX_APPROVAL_FRAME_BYTES
+        {
+            return Err(AbiError::ApprovalTooLarge);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DisconnectReason {
+    AuthorityRevoked,
+    AuthorityExpired,
+    NavigationChanged,
+    PolicyChanged,
+    WalletSessionChanged,
+    ServiceRestarted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ProviderEventPayload {
+    Connect {
+        permission_generation: u64,
+    },
+    Disconnect {
+        reason: DisconnectReason,
+    },
+    PermissionsChanged {
+        permission_generation: u64,
+        capabilities: BTreeSet<PermissionCapability>,
+    },
+    ModulesChanged {
+        modules: BTreeSet<ModuleId>,
+    },
+    AccountsChanged {
+        modules: BTreeSet<ModuleId>,
+    },
+    BalancesChanged {
+        modules: BTreeSet<ModuleId>,
+    },
+    TransactionsChanged {
+        modules: BTreeSet<ModuleId>,
+    },
+    NamesChanged {
+        names: Vec<String>,
+    },
+    NameMarketChanged {
+        listing_ids: Vec<String>,
+    },
+    PriceRoundChanged {
+        pairs: Vec<String>,
+    },
+    MarketIntentChanged {
+        market_intent_ids: Vec<String>,
+    },
+    SwapSessionChanged {
+        swap_session_ids: Vec<String>,
+    },
+    WalletLocked,
+}
+
+impl ProviderEventPayload {
+    fn validate(&self) -> Result<(), AbiError> {
+        match self {
+            Self::Connect {
+                permission_generation,
+            }
+            | Self::PermissionsChanged {
+                permission_generation,
+                ..
+            } if *permission_generation == 0 => return Err(AbiError::InvalidEvent),
+            Self::PermissionsChanged { capabilities, .. } => {
+                if capabilities.len() > MAX_PUBLIC_ITEMS {
+                    return Err(AbiError::InvalidEvent);
+                }
+            }
+            Self::ModulesChanged { modules }
+            | Self::AccountsChanged { modules }
+            | Self::BalancesChanged { modules }
+            | Self::TransactionsChanged { modules } => {
+                if modules.len() > MAX_PUBLIC_ITEMS {
+                    return Err(AbiError::InvalidEvent);
+                }
+            }
+            Self::NamesChanged { names } => validate_public_strings(names)?,
+            Self::NameMarketChanged { listing_ids } => validate_public_strings(listing_ids)?,
+            Self::PriceRoundChanged { pairs } => validate_public_strings(pairs)?,
+            Self::MarketIntentChanged { market_intent_ids } => {
+                validate_public_strings(market_intent_ids)?;
+            }
+            Self::SwapSessionChanged { swap_session_ids } => {
+                validate_public_strings(swap_session_ids)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProviderEventEnvelope {
+    pub protocol_version: u16,
+    pub host_session_id: HostSessionId,
+    pub service_session_id: WalletServiceSessionId,
+    pub restart_generation: u64,
+    pub channel_sequence: u64,
+    pub authority_handle: HostAuthorityHandleId,
+    pub authority_revision: u64,
+    pub event_sequence: u64,
+    pub payload: ProviderEventPayload,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceErrorCode {
+    InvalidFrame,
+    VersionMismatch,
+    SessionMismatch,
+    SequenceMismatch,
+    AuthorityUnknown,
+    AuthorityStale,
+    PermissionDenied,
+    ApprovalStale,
+    WalletLocked,
+    RateLimited,
+    Replay,
+    UnsupportedCapability,
+    InvalidRequest,
+    PersistenceFailure,
+    RuntimeFailure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceFailure {
+    pub code: ServiceErrorCode,
     pub message: String,
+    pub unsupported_capability: Option<ServiceCapability>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum AbiResult {
-    Success(AbiEnvelope<WalletResponse>),
-    Failure(AbiEnvelope<AbiFailure>),
+impl ServiceFailure {
+    pub fn unsupported(capability: ServiceCapability) -> Self {
+        Self {
+            code: ServiceErrorCode::UnsupportedCapability,
+            message: "requested wallet capability is not available".to_owned(),
+            unsupported_capability: Some(capability),
+        }
+    }
+
+    fn validate(&self) -> Result<(), AbiError> {
+        if self.message.is_empty()
+            || self.message.len() > MAX_FAILURE_MESSAGE_BYTES
+            || !self.message.is_ascii()
+            || (self.code == ServiceErrorCode::UnsupportedCapability)
+                != self.unsupported_capability.is_some()
+        {
+            return Err(AbiError::InvalidFailure);
+        }
+        Ok(())
+    }
 }
 
-pub trait WalletRuntime {
-    fn handle(
-        &mut self,
-        platform: HostPlatform,
-        request: WalletRequest,
-    ) -> Result<WalletResponse, RuntimeError>;
-}
-
-/// Parse, validate, and dispatch one complete length-delimited frame. Platform
-/// adapters own transport framing; this function never accepts native-host
-/// commands, filesystem paths, raw-signing calls, or arbitrary contract calls.
-pub fn dispatch_frame<R: WalletRuntime>(
-    runtime: &mut R,
-    platform: HostPlatform,
-    frame: &[u8],
-) -> Result<Vec<u8>, AbiError> {
-    if frame.is_empty() || frame.len() > MAX_ABI_FRAME_BYTES {
+pub fn declared_payload_len(prefix: [u8; LENGTH_PREFIX_BYTES]) -> Result<usize, AbiError> {
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length == 0 || length > MAX_ABI_FRAME_BYTES {
         return Err(AbiError::FrameSize);
     }
-    let envelope: AbiEnvelope<WalletRequest> =
-        serde_json::from_slice(frame).map_err(|_| AbiError::InvalidEnvelope)?;
-    envelope.validate_header()?;
-    envelope.body.validate(platform)?;
-    let result = runtime.handle(platform, envelope.body);
-    let response = match result {
-        Ok(body) => {
-            if platform == HostPlatform::ChromiumNativeHost
-                && matches!(body, WalletResponse::DedicatedRecoveryPhraseDisplay { .. })
-            {
-                return Err(AbiError::SecretResponseForbidden);
-            }
-            AbiResult::Success(AbiEnvelope {
-                abi_version: WALLET_ABI_VERSION,
-                request_id: envelope.request_id,
-                session_nonce: envelope.session_nonce,
-                body,
-            })
-        }
-        Err(error) => AbiResult::Failure(AbiEnvelope {
-            abi_version: WALLET_ABI_VERSION,
-            request_id: envelope.request_id,
-            session_nonce: envelope.session_nonce,
-            body: AbiFailure {
-                code: error.code,
-                message: error.message,
-            },
-        }),
-    };
-    serde_json::to_vec(&response).map_err(|_| AbiError::ResponseEncoding)
+    Ok(length)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeError {
-    pub code: u16,
-    pub message: String,
+pub fn decode_host_frame(frame: &[u8]) -> Result<HostFrame, AbiError> {
+    let payload = decode_payload(frame)?;
+    let decoded: HostFrame =
+        serde_json::from_slice(payload).map_err(|_| AbiError::InvalidEnvelope)?;
+    validate_host_frame(&decoded)?;
+    Ok(decoded)
+}
+
+pub fn encode_host_frame(frame: &HostFrame) -> Result<Vec<u8>, AbiError> {
+    validate_host_frame(frame)?;
+    encode_frame(frame)
+}
+
+pub fn decode_service_frame(frame: &[u8]) -> Result<ServiceFrame, AbiError> {
+    let payload = decode_payload(frame)?;
+    let decoded: ServiceFrame =
+        serde_json::from_slice(payload).map_err(|_| AbiError::InvalidEnvelope)?;
+    validate_service_frame(&decoded)?;
+    Ok(decoded)
+}
+
+pub fn encode_service_frame(frame: &ServiceFrame) -> Result<Vec<u8>, AbiError> {
+    validate_service_frame(frame)?;
+    encode_frame(frame)
+}
+
+fn decode_payload(frame: &[u8]) -> Result<&[u8], AbiError> {
+    if frame.len() < LENGTH_PREFIX_BYTES {
+        return Err(AbiError::TruncatedFrame);
+    }
+    let prefix: [u8; LENGTH_PREFIX_BYTES] = frame[..LENGTH_PREFIX_BYTES]
+        .try_into()
+        .map_err(|_| AbiError::TruncatedFrame)?;
+    let length = declared_payload_len(prefix)?;
+    if frame.len() != LENGTH_PREFIX_BYTES + length {
+        return Err(AbiError::TruncatedFrame);
+    }
+    Ok(&frame[LENGTH_PREFIX_BYTES..])
+}
+
+fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, AbiError> {
+    let payload = serde_json::to_vec(value).map_err(|_| AbiError::Encoding)?;
+    if payload.is_empty() || payload.len() > MAX_ABI_FRAME_BYTES {
+        return Err(AbiError::FrameSize);
+    }
+    let length = u32::try_from(payload.len()).map_err(|_| AbiError::FrameSize)?;
+    let mut framed = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    framed.extend_from_slice(&length.to_be_bytes());
+    framed.extend_from_slice(&payload);
+    Ok(framed)
+}
+
+fn validate_host_frame(frame: &HostFrame) -> Result<(), AbiError> {
+    match frame {
+        HostFrame::Hello { hello } => {
+            if hello.protocol_version != WALLET_ABI_VERSION || hello.restart_generation == 0 {
+                return Err(AbiError::VersionMismatch);
+            }
+        }
+        HostFrame::Request { envelope } => {
+            validate_session_envelope(envelope)?;
+            validate_service_request(&envelope.body)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_session_envelope<T>(envelope: &SessionEnvelope<T>) -> Result<(), AbiError> {
+    if envelope.protocol_version != WALLET_ABI_VERSION {
+        return Err(AbiError::VersionMismatch);
+    }
+    if envelope.restart_generation == 0 || envelope.channel_sequence == 0 {
+        return Err(AbiError::InvalidEnvelope);
+    }
+    Ok(())
+}
+
+fn validate_service_request(request: &ServiceRequest) -> Result<(), AbiError> {
+    match request {
+        ServiceRequest::RegisterAuthority { authority, .. } => validate_authority(authority),
+        ServiceRequest::ReplaceAuthority {
+            expected_authority_revision,
+            authority,
+            ..
+        } => {
+            if *expected_authority_revision == 0 {
+                return Err(AbiError::InvalidAuthority);
+            }
+            validate_authority(authority)
+        }
+        ServiceRequest::RevokeAuthority {
+            expected_authority_revision,
+            ..
+        } => {
+            if *expected_authority_revision == 0 {
+                return Err(AbiError::InvalidAuthority);
+            }
+            Ok(())
+        }
+        ServiceRequest::ProviderRequest {
+            authority_revision,
+            request_nonce,
+            method,
+            params,
+            ..
+        } => {
+            if *authority_revision == 0
+                || *request_nonce == 0
+                || method.is_empty()
+                || method.len() > MAX_METHOD_BYTES
+                || !method.is_ascii()
+            {
+                return Err(AbiError::InvalidProviderRequest);
+            }
+            let provider = serde_json::json!({ "method": method, "params": params });
+            if serde_json::to_vec(&provider)
+                .map_err(|_| AbiError::Encoding)?
+                .len()
+                > MAX_PROVIDER_REQUEST_BYTES
+            {
+                return Err(AbiError::ProviderRequestTooLarge);
+            }
+            Ok(())
+        }
+        ServiceRequest::ApprovalDecision {
+            authority_revision,
+            ..
+        } => {
+            if *authority_revision == 0 {
+                return Err(AbiError::InvalidApproval);
+            }
+            Ok(())
+        }
+        ServiceRequest::Wallet { request } => validate_wallet_request(request),
+    }
+}
+
+fn validate_authority(authority: &HostAuthorityFacts) -> Result<(), AbiError> {
+    if authority.origin.is_empty()
+        || authority.origin.len() > MAX_ORIGIN_BYTES
+        || !authority.origin.is_ascii()
+        || authority.runtime_generation == 0
+        || authority.policy_generation == 0
+        || authority.navigation_generation == 0
+        || authority.valid_until_unix_ms == 0
+    {
+        return Err(AbiError::InvalidAuthority);
+    }
+    Ok(())
+}
+
+fn validate_wallet_request(request: &WalletRequest) -> Result<(), AbiError> {
+    match request {
+        WalletRequest::CreateWallet { passphrase } | WalletRequest::Unlock { passphrase } => {
+            validate_secret(passphrase.expose_secret(), MAX_PASSPHRASE_BYTES)
+        }
+        WalletRequest::RestoreWallet {
+            passphrase,
+            recovery_phrase,
+        } => {
+            validate_secret(passphrase.expose_secret(), MAX_PASSPHRASE_BYTES)?;
+            validate_secret(
+                recovery_phrase.expose_secret(),
+                MAX_RECOVERY_PHRASE_BYTES,
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_service_frame(frame: &ServiceFrame) -> Result<(), AbiError> {
+    match frame {
+        ServiceFrame::Hello { hello } => {
+            if hello.protocol_version != WALLET_ABI_VERSION
+                || hello.restart_generation == 0
+                || hello.limits != ServiceLimits::default()
+                || hello.capabilities.len() > MAX_PUBLIC_ITEMS
+            {
+                return Err(AbiError::InvalidEnvelope);
+            }
+        }
+        ServiceFrame::Response { envelope } => {
+            validate_session_envelope(envelope)?;
+            validate_service_response(&envelope.body)?;
+        }
+        ServiceFrame::Event { event } => {
+            if event.protocol_version != WALLET_ABI_VERSION
+                || event.restart_generation == 0
+                || event.channel_sequence == 0
+                || event.authority_revision == 0
+                || event.event_sequence == 0
+            {
+                return Err(AbiError::InvalidEvent);
+            }
+            event.payload.validate()?;
+            if serde_json::to_vec(event)
+                .map_err(|_| AbiError::Encoding)?
+                .len()
+                > MAX_PROVIDER_EVENT_BYTES
+            {
+                return Err(AbiError::EventTooLarge);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_response(response: &ServiceResponse) -> Result<(), AbiError> {
+    match response {
+        ServiceResponse::AuthorityRegistered {
+            authority_revision,
+            ..
+        }
+        | ServiceResponse::AuthorityReplaced {
+            authority_revision,
+            ..
+        }
+        | ServiceResponse::ProviderResult {
+            authority_revision,
+            ..
+        } if *authority_revision == 0 => Err(AbiError::InvalidEnvelope),
+        ServiceResponse::ProviderResult { value, .. } => {
+            if serde_json::to_vec(value)
+                .map_err(|_| AbiError::Encoding)?
+                .len()
+                > MAX_PROVIDER_RESULT_BYTES
+            {
+                return Err(AbiError::ProviderResultTooLarge);
+            }
+            Ok(())
+        }
+        ServiceResponse::ApprovalRequired { approval } => {
+            if approval.authority_revision == 0
+                || approval.origin.is_empty()
+                || approval.method.is_empty()
+                || approval.expires_at_unix_ms == 0
+            {
+                return Err(AbiError::InvalidApproval);
+            }
+            approval.summary.validate()?;
+            approval.summary.validate_method(&approval.method)?;
+            if serde_json::to_vec(approval)
+                .map_err(|_| AbiError::Encoding)?
+                .len()
+                > MAX_APPROVAL_FRAME_BYTES
+            {
+                return Err(AbiError::ApprovalTooLarge);
+            }
+            Ok(())
+        }
+        ServiceResponse::Wallet { response } => validate_wallet_response(response),
+        ServiceResponse::Failure { failure } => failure.validate(),
+        _ => Ok(()),
+    }
+}
+
+fn validate_wallet_response(response: &WalletResponse) -> Result<(), AbiError> {
+    match response {
+        WalletResponse::Accounts { accounts } if accounts.len() > MAX_PUBLIC_ITEMS => {
+            Err(AbiError::ProviderResultTooLarge)
+        }
+        WalletResponse::TransactionHistory { transactions }
+            if transactions.len() > MAX_PUBLIC_ITEMS =>
+        {
+            Err(AbiError::ProviderResultTooLarge)
+        }
+        WalletResponse::Accounts { accounts } => {
+            for account in accounts {
+                validate_public_string(&account.label)?;
+                validate_optional_public_string(&account.receive_display)?;
+            }
+            Ok(())
+        }
+        WalletResponse::Workflow { summary } => {
+            validate_public_string(&summary.state)?;
+            validate_optional_public_string(&summary.next_action)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_secret(value: &str, maximum: usize) -> Result<(), AbiError> {
+    if value.is_empty() || value.len() > maximum {
+        return Err(AbiError::InvalidSecretInput);
+    }
+    Ok(())
+}
+
+fn validate_value_movement(
+    amount: Amount,
+    recipient: &str,
+    maximum_fee: Amount,
+    warnings: &BTreeSet<ApprovalWarning>,
+) -> Result<(), AbiError> {
+    if amount.asset != maximum_fee.asset {
+        return Err(AbiError::InvalidApproval);
+    }
+    validate_amount(amount, false)?;
+    validate_public_string(recipient)?;
+    validate_amount(maximum_fee, true)?;
+    validate_warnings(warnings)
+}
+
+fn validate_amount(amount: Amount, allow_zero: bool) -> Result<(), AbiError> {
+    if !allow_zero && amount.base_units == BaseUnits::ZERO {
+        return Err(AbiError::InvalidApproval);
+    }
+    Ok(())
+}
+
+fn validate_warnings(warnings: &BTreeSet<ApprovalWarning>) -> Result<(), AbiError> {
+    if warnings.len() > MAX_PUBLIC_ITEMS {
+        return Err(AbiError::InvalidApproval);
+    }
+    Ok(())
+}
+
+fn validate_public_string(value: &str) -> Result<(), AbiError> {
+    if value.is_empty() || value.len() > MAX_PUBLIC_STRING_BYTES || !value.is_ascii() {
+        return Err(AbiError::InvalidPublicValue);
+    }
+    Ok(())
+}
+
+fn validate_optional_public_string(value: &Option<String>) -> Result<(), AbiError> {
+    if let Some(value) = value {
+        validate_public_string(value)?;
+    }
+    Ok(())
+}
+
+fn validate_public_strings(values: &[String]) -> Result<(), AbiError> {
+    if values.len() > MAX_PUBLIC_ITEMS {
+        return Err(AbiError::InvalidEvent);
+    }
+    for value in values {
+        validate_public_string(value)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum AbiError {
-    #[error("ABI frame is empty or too large")]
+    #[error("frame is empty or exceeds the bounded outer maximum")]
     FrameSize,
-    #[error("ABI version mismatch")]
+    #[error("length-prefixed frame is truncated or has trailing bytes")]
+    TruncatedFrame,
+    #[error("wallet service protocol version mismatch")]
     VersionMismatch,
-    #[error("invalid ABI envelope")]
+    #[error("invalid wallet service envelope")]
     InvalidEnvelope,
-    #[error("secret input is empty or exceeds the bounded maximum")]
-    InvalidSecretInput,
-    #[error("provider request is invalid or unbounded")]
+    #[error("invalid or stale host authority registration")]
+    InvalidAuthority,
+    #[error("provider request is invalid")]
     InvalidProviderRequest,
-    #[error("high-risk recovery operation is unavailable on this transport")]
-    HighRiskOperationUnavailable,
-    #[error("dedicated high-risk UI confirmation is required")]
-    HighRiskConfirmationRequired,
-    #[error("a secret-bearing response is forbidden on this transport")]
-    SecretResponseForbidden,
-    #[error("ABI response encoding failed")]
-    ResponseEncoding,
+    #[error("provider request exceeds 64 KiB")]
+    ProviderRequestTooLarge,
+    #[error("provider result exceeds 256 KiB")]
+    ProviderResultTooLarge,
+    #[error("provider event exceeds 64 KiB")]
+    EventTooLarge,
+    #[error("approval prompt exceeds 16 KiB")]
+    ApprovalTooLarge,
+    #[error("approval prompt is incomplete, stale, or mismatched")]
+    InvalidApproval,
+    #[error("provider event is invalid")]
+    InvalidEvent,
+    #[error("secret input is empty or exceeds its bounded maximum")]
+    InvalidSecretInput,
+    #[error("public response value is empty, non-ASCII, or unbounded")]
+    InvalidPublicValue,
+    #[error("failure response is invalid or unbounded")]
+    InvalidFailure,
+    #[error("frame JSON encoding failed")]
+    Encoding,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct Runtime;
+    fn host_session() -> HostSessionId {
+        HostSessionId::from_bytes([1_u8; 32]).expect("host session")
+    }
 
-    impl WalletRuntime for Runtime {
-        fn handle(
-            &mut self,
-            _platform: HostPlatform,
-            request: WalletRequest,
-        ) -> Result<WalletResponse, RuntimeError> {
-            match request {
-                WalletRequest::DisplayRecoveryPhrase { .. } => {
-                    Ok(WalletResponse::DedicatedRecoveryPhraseDisplay {
-                        recovery_phrase: "test phrase".to_owned(),
-                    })
-                }
-                _ => Ok(WalletResponse::Locked),
-            }
+    fn service_session() -> WalletServiceSessionId {
+        WalletServiceSessionId::from_bytes([2_u8; 32]).expect("service session")
+    }
+
+    fn request_id() -> ProviderRequestId {
+        ProviderRequestId::from_bytes([3_u8; 16]).expect("request id")
+    }
+
+    fn handle() -> HostAuthorityHandleId {
+        HostAuthorityHandleId::from_bytes([4_u8; 32]).expect("handle")
+    }
+
+    fn request(body: ServiceRequest) -> HostFrame {
+        HostFrame::Request {
+            envelope: SessionEnvelope {
+                protocol_version: WALLET_ABI_VERSION,
+                host_session_id: host_session(),
+                service_session_id: service_session(),
+                restart_generation: 7,
+                channel_sequence: 1,
+                request_id: request_id(),
+                body,
+            },
         }
     }
 
-    fn frame(body: WalletRequest) -> Vec<u8> {
-        serde_json::to_vec(&AbiEnvelope {
-            abi_version: WALLET_ABI_VERSION,
-            request_id: 1,
-            session_nonce: 2,
-            body,
+    #[test]
+    fn golden_hello_is_length_prefixed_v2_with_canonical_ids() {
+        let encoded = encode_host_frame(&HostFrame::Hello {
+            hello: HostHello {
+                protocol_version: WALLET_ABI_VERSION,
+                platform: HostPlatform::ChromiumNativeHost,
+                host_session_id: host_session(),
+                restart_generation: 7,
+            },
         })
-        .expect("frame")
+        .expect("encode");
+        let declared = u32::from_be_bytes(encoded[..4].try_into().expect("prefix")) as usize;
+        assert_eq!(declared, encoded.len() - 4);
+        assert!(std::str::from_utf8(&encoded[4..])
+            .expect("json")
+            .contains("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"));
+        assert_eq!(
+            decode_host_frame(&encoded).expect("decode"),
+            decode_host_frame(&encoded).expect("decode twice")
+        );
     }
 
     #[test]
-    fn rejects_unknown_or_oversized_frames() {
+    fn v1_unframed_json_and_unknown_fields_are_rejected() {
+        assert!(decode_host_frame(br#"{"abi_version":1}"#).is_err());
+        let payload = br#"{"frameType":"hello","hello":{"protocolVersion":2,"platform":"chromiumNativeHost","hostSessionId":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","restartGeneration":1,"trusted":true}}"#;
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(payload);
+        assert_eq!(decode_host_frame(&frame), Err(AbiError::InvalidEnvelope));
+    }
+
+    #[test]
+    fn provider_context_is_only_an_opaque_handle_and_revision() {
+        let frame = request(ServiceRequest::ProviderRequest {
+            authority_handle: handle(),
+            authority_revision: 1,
+            request_nonce: 9,
+            method: "wallet_getStatus".to_owned(),
+            params: Value::Null,
+        });
+        let json = String::from_utf8(encode_host_frame(&frame).expect("frame")[4..].to_vec())
+            .expect("json");
+        assert!(json.contains("authorityHandle"));
+        assert!(!json.contains("authenticated"));
+        assert!(!json.contains("walletSession"));
+        assert!(!json.contains("permissionGeneration"));
+    }
+
+    #[test]
+    fn oversized_declared_payload_fails_before_payload_allocation() {
         assert_eq!(
-            dispatch_frame(&mut Runtime, HostPlatform::Android, b"{}"),
-            Err(AbiError::InvalidEnvelope)
-        );
-        assert_eq!(
-            dispatch_frame(
-                &mut Runtime,
-                HostPlatform::Android,
-                &vec![0; MAX_ABI_FRAME_BYTES + 1]
-            ),
+            declared_payload_len(((MAX_ABI_FRAME_BYTES as u32) + 1).to_be_bytes()),
             Err(AbiError::FrameSize)
         );
     }
 
     #[test]
-    fn chromium_can_never_receive_a_recovery_phrase() {
-        let request = WalletRequest::DisplayRecoveryPhrase {
-            wallet_id: WalletId::default(),
-            dedicated_ui_confirmation_nonce: 9,
-        };
-        assert_eq!(
-            dispatch_frame(
-                &mut Runtime,
-                HostPlatform::ChromiumNativeHost,
-                &frame(request)
-            ),
-            Err(AbiError::HighRiskOperationUnavailable)
-        );
-    }
-
-    #[test]
-    fn dedicated_mobile_display_requires_explicit_confirmation() {
-        let request = WalletRequest::DisplayRecoveryPhrase {
-            wallet_id: WalletId::default(),
-            dedicated_ui_confirmation_nonce: 0,
-        };
-        assert_eq!(
-            dispatch_frame(&mut Runtime, HostPlatform::Ios, &frame(request)),
-            Err(AbiError::HighRiskConfirmationRequired)
-        );
+    fn every_provider_approval_kind_has_a_typed_wire_variant() {
+        let kinds = [
+            ApprovalKind::Permission,
+            ApprovalKind::ModuleEnablement,
+            ApprovalKind::Send,
+            ApprovalKind::NameTransfer,
+            ApprovalKind::NameFinalize,
+            ApprovalKind::TypedSignature,
+            ApprovalKind::NameMarketOffer,
+            ApprovalKind::NameMarketPurchase,
+            ApprovalKind::MarketIntent,
+            ApprovalKind::FillAcceptance,
+            ApprovalKind::SwapRedeem,
+            ApprovalKind::SwapRefund,
+        ];
+        assert_eq!(kinds.len(), 12);
+        assert!(!kinds.contains(&ApprovalKind::RecoveryPhraseDisplay));
     }
 }
