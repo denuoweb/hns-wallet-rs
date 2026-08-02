@@ -925,9 +925,13 @@ pub fn decode_host_frame(frame: &[u8]) -> Result<HostFrame, AbiError> {
     Ok(decoded)
 }
 
-pub fn encode_host_frame(frame: &HostFrame) -> Result<Vec<u8>, AbiError> {
+/// Encode a host frame into an owned buffer that clears its allocation on
+/// drop. Host requests can contain wallet passphrases or restore phrases, so
+/// callers must retain this owner through the transport write instead of
+/// copying the bytes into an ordinary `Vec<u8>`.
+pub fn encode_host_frame(frame: &HostFrame) -> Result<Zeroizing<Vec<u8>>, AbiError> {
     validate_host_frame(frame)?;
-    encode_frame(frame)
+    encode_zeroizing_frame(frame)
 }
 
 pub fn decode_service_frame(frame: &[u8]) -> Result<ServiceFrame, AbiError> {
@@ -958,12 +962,26 @@ fn decode_payload(frame: &[u8]) -> Result<&[u8], AbiError> {
 }
 
 fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, AbiError> {
-    let payload = serde_json::to_vec(value).map_err(|_| AbiError::Encoding)?;
+    let payload = Zeroizing::new(serde_json::to_vec(value).map_err(|_| AbiError::Encoding)?);
     if payload.is_empty() || payload.len() > MAX_ABI_FRAME_BYTES {
         return Err(AbiError::FrameSize);
     }
     let length = u32::try_from(payload.len()).map_err(|_| AbiError::FrameSize)?;
     let mut framed = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    framed.extend_from_slice(&length.to_be_bytes());
+    framed.extend_from_slice(&payload);
+    Ok(framed)
+}
+
+fn encode_zeroizing_frame<T: Serialize>(
+    value: &T,
+) -> Result<Zeroizing<Vec<u8>>, AbiError> {
+    let payload = Zeroizing::new(serde_json::to_vec(value).map_err(|_| AbiError::Encoding)?);
+    if payload.is_empty() || payload.len() > MAX_ABI_FRAME_BYTES {
+        return Err(AbiError::FrameSize);
+    }
+    let length = u32::try_from(payload.len()).map_err(|_| AbiError::FrameSize)?;
+    let mut framed = Zeroizing::new(Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len()));
     framed.extend_from_slice(&length.to_be_bytes());
     framed.extend_from_slice(&payload);
     Ok(framed)

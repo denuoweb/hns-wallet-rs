@@ -864,7 +864,7 @@ mod tests {
         HostSessionId::from_bytes([1_u8; 32]).expect("host session")
     }
 
-    fn hello() -> Vec<u8> {
+    fn hello() -> zeroize::Zeroizing<Vec<u8>> {
         encode_host_frame(&HostFrame::Hello {
             hello: HostHello {
                 protocol_version: WALLET_ABI_VERSION,

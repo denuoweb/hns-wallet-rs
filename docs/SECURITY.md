@@ -58,7 +58,10 @@ Recovery-phrase display remains a dedicated high-risk native/mobile concern and
 is absent from the private service/provider ABI. Logs and ordinary `Debug`
 implementations redact signing transactions, phrases, keys, and preimages.
 Inbound passphrases and restore phrases use non-cloneable, redacted ABI secret
-values whose owned allocations are zeroized on drop.
+values whose owned allocations are zeroized on drop. Host-frame encoding, its
+temporary JSON payload, and the checked-in service's inbound frame allocation
+are also zeroized on drop; platform transports must not copy those
+secret-bearing bytes into ordinary persistent buffers.
 New host/service/wallet session IDs, authority handles, fingerprints, request
 IDs, and approval IDs also redact `Debug` and `Display`; only their canonical
 wire serializers reveal the value to the private transport.

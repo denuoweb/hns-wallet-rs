@@ -886,6 +886,7 @@ dependencies = [
  "hns-wallet-types",
  "serde_json",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

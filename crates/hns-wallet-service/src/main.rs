@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hns_wallet_ffi::{declared_payload_len, LENGTH_PREFIX_BYTES};
 use hns_wallet_provider::MemoryProviderState;
 use hns_wallet_service::{UnavailableRuntime, WalletService};
+use zeroize::Zeroizing;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut service = WalletService::new_ephemeral(
@@ -25,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         input.read_exact(&mut prefix[1..])?;
         let length = declared_payload_len(prefix)?;
-        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + length);
+        let mut frame = Zeroizing::new(Vec::with_capacity(LENGTH_PREFIX_BYTES + length));
         frame.extend_from_slice(&prefix);
         frame.resize(LENGTH_PREFIX_BYTES + length, 0);
         input.read_exact(&mut frame[LENGTH_PREFIX_BYTES..])?;
@@ -33,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .duration_since(UNIX_EPOCH)?
             .as_millis()
             .try_into()?;
-        let response = service.process_frame(&frame, now_unix_ms)?;
+        let response = service.process_frame(frame.as_slice(), now_unix_ms)?;
         output.write_all(&response)?;
         output.flush()?;
     }

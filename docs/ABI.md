@@ -10,6 +10,11 @@ strict JSON object. Unknown fields, empty frames, trailing bytes, partial
 frames, and declared payloads over 1 MiB are rejected. The length is checked
 before payload allocation. Provider requests are at most 64 KiB, provider
 results 256 KiB, provider events 64 KiB, and approval prompts 16 KiB.
+Host-frame encoding returns a zeroizing owner because wallet-operation frames
+can contain passphrases or restore phrases. Platform transports must write
+directly from that owner and must not copy secret-bearing requests into
+ordinary long-lived byte buffers. The checked-in stdio service likewise reads
+each inbound frame into a zeroizing allocation.
 
 The first frame is a host hello containing:
 
