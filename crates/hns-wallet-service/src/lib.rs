@@ -4,25 +4,25 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hns_wallet_ffi::{
-    encode_service_frame, ApprovalPrompt, ApprovalSummary, HostAuthorityFacts, HostFrame,
-    HostPlatform, ModuleApprovalAction, ProviderBinding, ProviderCapabilitySnapshot,
+    APPROVAL_SCHEMA_VERSION, AccountSummary, ApprovalPrompt, ApprovalSummary, HostAuthorityFacts,
+    HostFrame, MAX_PROVIDER_RESULT_BYTES, MAX_PUBLIC_STRING_BYTES, ModuleApprovalAction,
+    PROVIDER_SCHEMA_VERSION, ProviderBinding, ProviderCapabilitySnapshot,
     ProviderEventEnvelope, ProviderEventPayload, ProviderNamespace, ServiceCapability,
     ServiceErrorCode, ServiceFailure, ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest,
-    ServiceResponse, SessionEnvelope, WalletRequest, WalletResponse, APPROVAL_SCHEMA_VERSION,
-    PROVIDER_SCHEMA_VERSION, WALLET_ABI_VERSION,
+    ServiceResponse, SessionEnvelope, WALLET_ABI_VERSION, WalletRequest, WalletResponse,
+    encode_service_frame,
 };
 use hns_wallet_provider::{
-    ApprovedCall, HostAuthorityRegistration, Origin, PendingApproval, PermissionSnapshot,
-    ProviderAction, ProviderCore, ProviderError, ProviderMethod, ProviderStateStore,
-    SelectedNamespace, PROVIDER_API_VERSION,
+    ApprovedCall, HostAuthorityRegistration, Origin, PROVIDER_API_VERSION, PendingApproval,
+    PermissionSnapshot, ProviderAction, ProviderCore, ProviderError, ProviderMethod,
+    ProviderStateStore, SelectedNamespace,
 };
 use hns_wallet_store::WalletStore;
 use hns_wallet_types::{
-    ApprovalId, ApprovalKind, HostAuthorityHandleId, HostSessionId, ModuleId,
-    PermissionCapability, ProviderApprovalId, ProviderRequestId, WalletServiceSessionId,
-    WalletSessionId,
+    ApprovalId, ApprovalKind, HostAuthorityHandleId, HostSessionId, ModuleId, PermissionCapability,
+    ProviderApprovalId, ProviderRequestId, WalletServiceSessionId, WalletSessionId,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 pub const MAX_SEEN_REQUEST_IDS: usize = 4_096;
@@ -40,6 +40,18 @@ pub trait ServiceRuntime {
         &mut self,
         approval: &PendingApproval,
     ) -> Result<ApprovalSummary, ServiceFailure>;
+
+    /// Select the one minimized Handshake account that an approved origin may
+    /// learn through `hns_requestAccounts`. The service validates and persists
+    /// the exact account identifier before returning it.
+    fn prepare_hns_account_grant(
+        &mut self,
+        _: &ApprovedCall,
+    ) -> Result<AccountSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
 
     fn execute_provider(&mut self, call: ApprovedCall) -> Result<Value, ServiceFailure>;
 
@@ -469,25 +481,54 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         params: Value,
         now_unix_ms: u64,
     ) -> Result<ServiceResponse, ServiceFailure> {
-        if !self.capabilities.contains(&ServiceCapability::ProviderDispatch) {
-            return Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch));
+        if !self
+            .capabilities
+            .contains(&ServiceCapability::ProviderDispatch)
+        {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ));
         }
         let method = ProviderMethod::parse(&method_name).map_err(provider_failure)?;
-        if method == ProviderMethod::HnsRequestAccounts {
-            return Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch));
+        if matches!(
+            method,
+            ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
+        ) {
+            validate_empty_params(&params)?;
         }
         if method == ProviderMethod::WalletLock
-            && !self.capabilities.contains(&ServiceCapability::WalletOperations)
+            && !self
+                .capabilities
+                .contains(&ServiceCapability::WalletOperations)
         {
-            return Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations));
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ));
         }
         if method.approval().is_some_and(value_movement_approval)
-            && !self.capabilities.contains(&ServiceCapability::ValueMovement)
+            && !self
+                .capabilities
+                .contains(&ServiceCapability::ValueMovement)
         {
-            return Err(ServiceFailure::unsupported(ServiceCapability::ValueMovement));
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::ValueMovement,
+            ));
+        }
+        if matches!(
+            method,
+            ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
+        ) && !self
+            .runtime
+            .supports_provider_method(ProviderMethod::HnsRequestAccounts)
+        {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ));
         }
         if !service_owned_method(method) && !self.runtime.supports_provider_method(method) {
-            return Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch));
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ));
         }
         let encoded_request = serde_json::to_vec(&json!({
             "method": method_name.clone(),
@@ -521,17 +562,12 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     authority_handle,
                     authority_revision,
                     call,
+                    None,
                     now_unix_ms,
                 )?;
-                let binding = self.provider_binding(
-                    authority_handle,
-                    authority_revision,
-                    now_unix_ms,
-                )?;
-                Ok(ServiceResponse::ProviderResult {
-                    binding,
-                    value,
-                })
+                let binding =
+                    self.provider_binding(authority_handle, authority_revision, now_unix_ms)?;
+                Ok(ServiceResponse::ProviderResult { binding, value })
             }
             ProviderAction::ApprovalRequired(approval) => {
                 if self.pending.len() >= MAX_SERVICE_PENDING_APPROVALS {
@@ -680,17 +716,12 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     authority_handle,
                     authority_revision,
                     call,
+                    Some(pending.binding.permission_generation),
                     now_unix_ms,
                 )?;
-                let binding = self.provider_binding(
-                    authority_handle,
-                    authority_revision,
-                    now_unix_ms,
-                )?;
-                Ok(ServiceResponse::ProviderResult {
-                    binding,
-                    value,
-                })
+                let binding =
+                    self.provider_binding(authority_handle, authority_revision, now_unix_ms)?;
+                Ok(ServiceResponse::ProviderResult { binding, value })
             }
         }
     }
@@ -725,55 +756,70 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         authority_handle: HostAuthorityHandleId,
         authority_revision: u64,
         call: ApprovedCall,
+        expected_permission_generation: Option<u64>,
         now_unix_ms: u64,
     ) -> Result<Value, ServiceFailure> {
         match call.method {
-            ProviderMethod::WalletGetCapabilities => {
-                Ok(json!({
-                    "providerApiVersion": PROVIDER_API_VERSION,
-                    "methods": self.supported_provider_method_names(),
-                }))
-            }
+            ProviderMethod::WalletGetCapabilities => Ok(json!({
+                "providerApiVersion": PROVIDER_API_VERSION,
+                "methods": self.supported_provider_method_names(),
+            })),
             ProviderMethod::WalletGetPermissions => {
-                let permission = self.provider.permission_snapshot(
-                    authority_handle,
-                    authority_revision,
-                    now_unix_ms,
-                )
-                .map_err(provider_failure)?;
+                let permission = self
+                    .provider
+                    .permission_snapshot(authority_handle, authority_revision, now_unix_ms)
+                    .map_err(provider_failure)?;
                 if permission.record.is_none() {
                     self.event_sequences.clear();
                 }
                 permission_value(permission)
             }
             ProviderMethod::WalletRevokePermissions => {
-                let generation = self.provider.revoke_permissions(
-                    authority_handle,
-                    authority_revision,
-                    now_unix_ms,
-                )
-                .map_err(provider_failure)?;
+                let generation = self
+                    .provider
+                    .revoke_permissions(authority_handle, authority_revision, now_unix_ms)
+                    .map_err(provider_failure)?;
                 self.pending.clear();
                 self.event_sequences.clear();
-                Ok(json!({ "permissionGeneration": generation, "capabilities": [] }))
+                Ok(json!({
+                    "permissionGeneration": generation,
+                    "capabilities": [],
+                    "accounts": []
+                }))
             }
             ProviderMethod::WalletRequestPermissions => {
                 let capabilities = requested_capabilities(&call)?;
-                let permission = self.provider.grant_permissions(
-                    authority_handle,
-                    authority_revision,
-                    capabilities,
-                    BTreeSet::new(),
-                    now_unix_ms,
-                    None,
-                )
-                .map_err(provider_failure)?;
+                let expected_generation =
+                    expected_permission_generation.ok_or_else(stale_approval)?;
+                let permission = self
+                    .provider
+                    .grant_scoped_permissions_at_generation(
+                        authority_handle,
+                        authority_revision,
+                        expected_generation,
+                        capabilities,
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                        now_unix_ms,
+                        None,
+                    )
+                    .map_err(provider_failure)?;
                 self.pending.clear();
                 self.event_sequences.clear();
                 permission_value(PermissionSnapshot {
                     generation: permission.generation,
                     record: Some(permission),
                 })
+            }
+            ProviderMethod::HnsRequestAccounts => self.approve_hns_account_grant(
+                authority_handle,
+                authority_revision,
+                &call,
+                expected_permission_generation.ok_or_else(stale_approval)?,
+                now_unix_ms,
+            ),
+            ProviderMethod::HnsAccounts => {
+                self.approved_hns_accounts(authority_handle, authority_revision, &call, now_unix_ms)
             }
             ProviderMethod::WalletLock => {
                 self.runtime.lock_wallet()?;
@@ -804,22 +850,34 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
     }
 
     fn supported_provider_methods(&self) -> BTreeSet<ProviderMethod> {
-        if !self.capabilities.contains(&ServiceCapability::ProviderDispatch) {
+        if !self
+            .capabilities
+            .contains(&ServiceCapability::ProviderDispatch)
+        {
             return BTreeSet::new();
         }
         ProviderMethod::ALL
             .into_iter()
             .filter(|method| {
-                if *method == ProviderMethod::HnsRequestAccounts {
-                    return false;
+                if matches!(
+                    method,
+                    ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
+                ) {
+                    return self
+                        .runtime
+                        .supports_provider_method(ProviderMethod::HnsRequestAccounts);
                 }
                 if *method == ProviderMethod::WalletLock
-                    && !self.capabilities.contains(&ServiceCapability::WalletOperations)
+                    && !self
+                        .capabilities
+                        .contains(&ServiceCapability::WalletOperations)
                 {
                     return false;
                 }
                 if method.approval().is_some_and(value_movement_approval)
-                    && !self.capabilities.contains(&ServiceCapability::ValueMovement)
+                    && !self
+                        .capabilities
+                        .contains(&ServiceCapability::ValueMovement)
                 {
                     return false;
                 }
@@ -838,6 +896,96 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
     fn prune_pending(&mut self, now_unix: u64) {
         self.pending
             .retain(|_, pending| pending.expires_at_unix > now_unix);
+    }
+
+    fn approve_hns_account_grant(
+        &mut self,
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        call: &ApprovedCall,
+        expected_permission_generation: u64,
+        now_unix_ms: u64,
+    ) -> Result<Value, ServiceFailure> {
+        validate_empty_params(&call.params)?;
+        if call.namespace != SelectedNamespace::Hns {
+            return Err(invalid_request(
+                "Handshake accounts require the HNS namespace",
+            ));
+        }
+        if !self
+            .runtime
+            .supports_provider_method(ProviderMethod::HnsRequestAccounts)
+        {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ));
+        }
+        let account = self.runtime.prepare_hns_account_grant(call)?;
+        validate_hns_account_summary(&account)?;
+        let account_id = account.account_id;
+        let value = json!([account_id.to_string()]);
+        if serde_json::to_vec(&value)
+            .map_err(|_| invalid_request("account result encoding failed"))?
+            .len()
+            > MAX_PROVIDER_RESULT_BYTES
+        {
+            return Err(invalid_request("account result exceeds the provider bound"));
+        }
+        let permission = self
+            .provider
+            .grant_scoped_permissions_at_generation(
+                authority_handle,
+                authority_revision,
+                expected_permission_generation,
+                BTreeSet::from([PermissionCapability::Accounts]),
+                BTreeSet::from([account_id]),
+                BTreeSet::new(),
+                now_unix_ms,
+                None,
+            )
+            .map_err(provider_failure)?;
+        if permission.approved_accounts != BTreeSet::from([account_id]) {
+            return Err(provider_failure(ProviderError::Persistence));
+        }
+        self.pending.clear();
+        self.event_sequences.clear();
+        Ok(value)
+    }
+
+    fn approved_hns_accounts(
+        &mut self,
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        call: &ApprovedCall,
+        now_unix_ms: u64,
+    ) -> Result<Value, ServiceFailure> {
+        validate_empty_params(&call.params)?;
+        if call.namespace != SelectedNamespace::Hns {
+            return Err(invalid_request(
+                "Handshake accounts require the HNS namespace",
+            ));
+        }
+        let permission = self
+            .provider
+            .permission_snapshot(authority_handle, authority_revision, now_unix_ms)
+            .map_err(provider_failure)?;
+        let record = permission
+            .record
+            .ok_or_else(|| provider_failure(ProviderError::Unauthorized))?;
+        if !record
+            .capabilities
+            .contains(&PermissionCapability::Accounts)
+            || record.approved_accounts.is_empty()
+        {
+            return Err(provider_failure(ProviderError::Unauthorized));
+        }
+        Ok(Value::Array(
+            record
+                .approved_accounts
+                .iter()
+                .map(|account| Value::String(account.to_string()))
+                .collect(),
+        ))
     }
 }
 
@@ -872,6 +1020,7 @@ fn service_owned_method(method: ProviderMethod) -> bool {
             | ProviderMethod::WalletRequestPermissions
             | ProviderMethod::WalletGetPermissions
             | ProviderMethod::WalletRevokePermissions
+            | ProviderMethod::HnsAccounts
             | ProviderMethod::WalletLock
     )
 }
@@ -908,7 +1057,36 @@ fn requested_capabilities(
     if capabilities.is_empty() {
         return Err(invalid_request("permission capabilities are empty"));
     }
+    if capabilities.contains(&PermissionCapability::Accounts) {
+        return Err(invalid_request(
+            "Accounts permission requires hns_requestAccounts",
+        ));
+    }
     Ok(capabilities)
+}
+
+fn validate_empty_params(params: &Value) -> Result<(), ServiceFailure> {
+    if params.is_null() || params.as_object().is_some_and(|object| object.is_empty()) {
+        Ok(())
+    } else {
+        Err(invalid_request("method does not accept parameters"))
+    }
+}
+
+fn validate_hns_account_summary(account: &AccountSummary) -> Result<(), ServiceFailure> {
+    let valid_receive = account.receive_display.as_ref().is_none_or(|value| {
+        !value.is_empty() && value.len() <= MAX_PUBLIC_STRING_BYTES && value.is_ascii()
+    });
+    if account.module != ModuleId::Handshake
+        || account.account_id.as_bytes().iter().all(|byte| *byte == 0)
+        || account.label.is_empty()
+        || account.label.len() > MAX_PUBLIC_STRING_BYTES
+        || !account.label.is_ascii()
+        || !valid_receive
+    {
+        return Err(invalid_request("runtime returned an invalid HNS account"));
+    }
+    Ok(())
 }
 
 fn requested_module(params: &Value) -> Result<ModuleId, ServiceFailure> {
@@ -953,26 +1131,33 @@ fn validate_approval_summary(
         || amount.asset != expected_chain.asset()
         || maximum_fee.asset != expected_chain.asset()
     {
-        return Err(invalid_request("send approval asset or chain is mismatched"));
+        return Err(invalid_request(
+            "send approval asset or chain is mismatched",
+        ));
     }
     Ok(())
 }
 
-fn permission_value(
-    permission: PermissionSnapshot,
-) -> Result<Value, ServiceFailure> {
+fn permission_value(permission: PermissionSnapshot) -> Result<Value, ServiceFailure> {
     let Some(record) = permission.record else {
         return Ok(json!({
             "permissionGeneration": permission.generation,
-            "capabilities": []
+            "capabilities": [],
+            "accounts": []
         }));
     };
     let origin = record.origin.as_str().to_owned();
     let capabilities = record.capabilities;
+    let accounts = record
+        .approved_accounts
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     Ok(json!({
         "origin": origin,
         "permissionGeneration": permission.generation,
         "capabilities": capabilities,
+        "accounts": accounts,
         "expiresAtUnix": record.expires_at_unix,
     }))
 }
@@ -1075,9 +1260,9 @@ pub enum ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_wallet_ffi::{decode_service_frame, encode_host_frame, HostHello};
+    use hns_wallet_ffi::{HostHello, decode_service_frame, encode_host_frame};
     use hns_wallet_provider::MemoryProviderState;
-    use hns_wallet_types::{BrowserRuntimeSessionId, ProviderAuthorityFingerprint};
+    use hns_wallet_types::{AccountId, BrowserRuntimeSessionId, ProviderAuthorityFingerprint};
 
     const NOW_MS: u64 = 100_000;
 
@@ -1097,19 +1282,76 @@ mod tests {
             &mut self,
             _: &PendingApproval,
         ) -> Result<ApprovalSummary, ServiceFailure> {
-            Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch))
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ))
         }
 
         fn execute_provider(&mut self, _: ApprovedCall) -> Result<Value, ServiceFailure> {
-            Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch))
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ))
         }
 
         fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
-            Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations))
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ))
         }
 
         fn execute_wallet(&mut self, _: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
-            Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations))
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ))
+        }
+    }
+
+    struct AccountRuntime {
+        account: AccountSummary,
+        account_join_available: bool,
+    }
+
+    impl ServiceRuntime for AccountRuntime {
+        fn capabilities(&self) -> BTreeSet<ServiceCapability> {
+            BTreeSet::from([ServiceCapability::ProviderDispatch])
+        }
+
+        fn supports_provider_method(&self, method: ProviderMethod) -> bool {
+            self.account_join_available && method == ProviderMethod::HnsRequestAccounts
+        }
+
+        fn prepare_approval(
+            &mut self,
+            _: &PendingApproval,
+        ) -> Result<ApprovalSummary, ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ))
+        }
+
+        fn prepare_hns_account_grant(
+            &mut self,
+            _: &ApprovedCall,
+        ) -> Result<AccountSummary, ServiceFailure> {
+            Ok(self.account.clone())
+        }
+
+        fn execute_provider(&mut self, _: ApprovedCall) -> Result<Value, ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ))
+        }
+
+        fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ))
+        }
+
+        fn execute_wallet(&mut self, _: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ))
         }
     }
 
@@ -1125,7 +1367,7 @@ mod tests {
         HostAuthorityRegistration {
             origin: Origin::parse("https://wallet.example").expect("origin"),
             namespace: SelectedNamespace::Hns,
-            runtime_session: BrowserRuntimeSessionId::from_bytes([3_u8; 32])
+            runtime_session: BrowserRuntimeSessionId::from_bytes([3_u8; 16])
                 .expect("runtime session"),
             runtime_generation: 1,
             policy_generation: 1,
@@ -1137,11 +1379,9 @@ mod tests {
     }
 
     fn provider_service() -> WalletService<MemoryProviderState, ProviderRuntime> {
-        let mut service = WalletService::new_ephemeral(
-            MemoryProviderState::default(),
-            ProviderRuntime,
-        )
-        .expect("service");
+        let mut service =
+            WalletService::new_ephemeral(MemoryProviderState::default(), ProviderRuntime)
+                .expect("service");
         service
             .provider
             .register_authority(handle(), registration(), NOW_MS)
@@ -1149,11 +1389,35 @@ mod tests {
         service
     }
 
+    fn account_service() -> WalletService<MemoryProviderState, AccountRuntime> {
+        let mut service = WalletService::new_ephemeral(
+            MemoryProviderState::default(),
+            AccountRuntime {
+                account: AccountSummary {
+                    account_id: AccountId::new([9_u8; 16]),
+                    module: ModuleId::Handshake,
+                    label: "Handshake".to_owned(),
+                    receive_display: None,
+                },
+                account_join_available: true,
+            },
+        )
+        .expect("service");
+        service
+            .provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("authority");
+        service
+            .provider
+            .set_wallet_state(service.wallet_session_id, false);
+        service
+    }
+
     fn hello() -> zeroize::Zeroizing<Vec<u8>> {
         encode_host_frame(&HostFrame::Hello {
             hello: HostHello {
                 protocol_version: WALLET_ABI_VERSION,
-                platform: HostPlatform::ChromiumNativeHost,
+                platform: hns_wallet_ffi::HostPlatform::ChromiumNativeHost,
                 host_session_id: host_session(),
                 restart_generation: 1,
             },
@@ -1237,6 +1501,150 @@ mod tests {
     }
 
     #[test]
+    fn canonical_provider_account_join_persists_and_projects_only_the_approved_account() {
+        let mut service = account_service();
+        let ServiceResponse::ProviderCapabilities { capabilities, .. } = service
+            .provider_capabilities(handle(), 1, NOW_MS)
+            .expect("capabilities")
+        else {
+            panic!("private capabilities")
+        };
+        assert!(capabilities.methods.contains("hns_requestAccounts"));
+        assert!(capabilities.methods.contains("hns_accounts"));
+
+        let ServiceResponse::ApprovalRequired { approval } = service
+            .provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::HnsRequestAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS,
+            )
+            .expect("account request")
+        else {
+            panic!("approval")
+        };
+        assert_eq!(
+            approval.summary,
+            ApprovalSummary::Permissions {
+                capabilities: BTreeSet::from([PermissionCapability::Accounts]),
+            }
+        );
+
+        let ServiceResponse::ProviderResult { binding, value } = service
+            .approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 1,
+            )
+            .expect("approved account join")
+        else {
+            panic!("account result")
+        };
+        let account = AccountId::new([9_u8; 16]);
+        assert_eq!(binding.permission_generation, 1);
+        assert_eq!(value, json!([account.to_string()]));
+        let permission = service
+            .provider
+            .permission(handle(), 1, NOW_MS + 1)
+            .expect("permission")
+            .expect("grant");
+        assert_eq!(permission.approved_accounts, BTreeSet::from([account]));
+
+        let ServiceResponse::ProviderResult { binding, value } = service
+            .provider_request(
+                handle(),
+                1,
+                2,
+                ProviderMethod::HnsAccounts.wire_name().to_owned(),
+                Value::Object(serde_json::Map::new()),
+                NOW_MS + 2,
+            )
+            .expect("account projection")
+        else {
+            panic!("account projection")
+        };
+        assert_eq!(binding.permission_generation, 1);
+        assert_eq!(value, json!([account.to_string()]));
+
+        service.runtime.account_join_available = false;
+        let failure = service.provider_request(
+            handle(),
+            1,
+            3,
+            ProviderMethod::HnsAccounts.wire_name().to_owned(),
+            Value::Null,
+            NOW_MS + 3,
+        );
+        assert!(matches!(
+            failure,
+            Err(ServiceFailure {
+                code: ServiceErrorCode::UnsupportedCapability,
+                ..
+            })
+        ));
+
+        let failure = service.provider_request(
+            handle(),
+            1,
+            4,
+            ProviderMethod::WalletRequestPermissions
+                .wire_name()
+                .to_owned(),
+            json!({ "capabilities": ["accounts"] }),
+            NOW_MS + 4,
+        );
+        assert!(matches!(
+            failure,
+            Err(ServiceFailure {
+                code: ServiceErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn canonical_provider_account_join_rechecks_runtime_when_approval_executes() {
+        let mut service = account_service();
+        let ServiceResponse::ApprovalRequired { approval } = service
+            .provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::HnsRequestAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS,
+            )
+            .expect("account request")
+        else {
+            panic!("approval")
+        };
+        service.runtime.account_join_available = false;
+        assert!(matches!(
+            service.approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 1,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::UnsupportedCapability,
+                ..
+            })
+        ));
+        let permission = service
+            .provider
+            .permission_snapshot(handle(), 1, NOW_MS + 1)
+            .expect("permission snapshot");
+        assert_eq!(permission.generation, 0);
+        assert!(permission.record.is_none());
+    }
+
+    #[test]
     fn website_capabilities_expose_only_public_api_version_and_methods() {
         let mut service = provider_service();
         let response = service
@@ -1271,7 +1679,7 @@ mod tests {
             .grant_permissions(
                 handle(),
                 1,
-                BTreeSet::from([PermissionCapability::Accounts]),
+                BTreeSet::from([PermissionCapability::Send]),
                 BTreeSet::new(),
                 NOW_MS,
                 None,

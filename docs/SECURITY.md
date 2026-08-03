@@ -136,6 +136,14 @@ once. Revocation stores an authenticated tombstone so delete/regrant cannot
 reset the generation. Service restart intentionally drops authorities,
 approvals, replay/rate state, request IDs, and event cursors while permissions
 survive.
+Accounts permission is valid only with a bounded nonempty set of exact HNS
+account IDs in the same encrypted permission generation. Generic permission
+requests cannot mint Accounts authority, and legacy capability-only records
+fail closed. The account result is validated and bounded before the scoped
+grant is persisted against the exact generation authenticated by the approval;
+a generation mismatch fails stale. `hns_accounts` reads only that stored set,
+and both account methods fail unavailable if the runtime selector is absent or
+later withdrawn. The checked-in unavailable runtime cannot advertise the join.
 Host restart/reset independently drops every service-derived handle revision,
 pending request and approval, private binding, and event cursor. A response
 kind mismatch, stale session, sequence gap/replay, unknown request ID, or stale

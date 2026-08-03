@@ -335,7 +335,6 @@ impl ProviderCapabilitySnapshot {
             if method.is_empty()
                 || method.len() > MAX_METHOD_BYTES
                 || !method.is_ascii()
-                || method == "hns_requestAccounts"
                 || !PROVIDER_METHOD_WIRE_NAMES.contains(&method.as_str())
             {
                 return Err(AbiError::InvalidEnvelope);
@@ -592,6 +591,7 @@ impl ApprovalSummary {
                 maximum_fee,
                 chain,
                 warnings,
+                ..
             } => {
                 if amount.asset != chain.asset() {
                     return Err(AbiError::InvalidApproval);
@@ -667,6 +667,7 @@ impl ApprovalSummary {
                 price_round,
                 maximum_fee,
                 warnings,
+                ..
             } => {
                 if offered.asset == *requested_asset || maximum_fee.asset != offered.asset {
                     return Err(AbiError::InvalidApproval);
@@ -732,9 +733,16 @@ impl ApprovalSummary {
 
     fn validate_method(&self, method: &str) -> Result<(), AbiError> {
         let matches = match self {
-            Self::Permissions { .. } => {
-                matches!(method, "wallet_requestPermissions" | "hns_requestAccounts")
-            }
+            Self::Permissions { capabilities } => match method {
+                "hns_requestAccounts" => {
+                    capabilities.len() == 1
+                        && capabilities.contains(&PermissionCapability::Accounts)
+                }
+                "wallet_requestPermissions" => {
+                    !capabilities.contains(&PermissionCapability::Accounts)
+                }
+                _ => false,
+            },
             Self::ModuleEnablement { action, .. } => matches!(
                 (method, *action),
                 ("wallet_enableModule", ModuleApprovalAction::Enable)
@@ -1526,7 +1534,7 @@ mod tests {
             method: "wallet_requestPermissions".to_owned(),
             expires_at_unix_ms: 10_000,
             summary: ApprovalSummary::Permissions {
-                capabilities: BTreeSet::from([PermissionCapability::Accounts]),
+                capabilities: BTreeSet::from([PermissionCapability::Balance]),
             },
         };
         prompt
@@ -1535,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn private_capability_snapshot_is_exact_and_matches_its_binding() {
+    fn canonical_provider_account_join_private_capability_snapshot_is_exact_and_bound() {
         assert_eq!(
             validate_service_request(&ServiceRequest::ProviderCapabilities {
                 authority_handle: handle(),
@@ -1599,14 +1607,40 @@ mod tests {
             }),
             Err(AbiError::InvalidEnvelope)
         );
-        let mut unavailable_method = capabilities.clone();
-        unavailable_method.methods = BTreeSet::from(["hns_requestAccounts".to_owned()]);
+        let mut account_join = capabilities.clone();
+        account_join.methods = BTreeSet::from(["hns_requestAccounts".to_owned()]);
+        validate_service_response(&ServiceResponse::ProviderCapabilities {
+            binding,
+            capabilities: account_join,
+        })
+        .expect("canonical account join method");
+
+        let account_prompt = ApprovalPrompt {
+            approval_id: approval_id(),
+            binding,
+            origin: "https://wallet.example".to_owned(),
+            method: "hns_requestAccounts".to_owned(),
+            expires_at_unix_ms: 10_000,
+            summary: ApprovalSummary::Permissions {
+                capabilities: BTreeSet::from([PermissionCapability::Accounts]),
+            },
+        };
+        account_prompt
+            .validate(ApprovalKind::Permission, 1_000)
+            .expect("exact account permission prompt");
+        let mut wrong_account_prompt = account_prompt.clone();
+        wrong_account_prompt.summary = ApprovalSummary::Permissions {
+            capabilities: BTreeSet::from([PermissionCapability::Balance]),
+        };
         assert_eq!(
-            validate_service_response(&ServiceResponse::ProviderCapabilities {
-                binding,
-                capabilities: unavailable_method,
-            }),
-            Err(AbiError::InvalidEnvelope)
+            wrong_account_prompt.validate(ApprovalKind::Permission, 1_000),
+            Err(AbiError::InvalidApproval)
+        );
+        let mut generic_accounts = account_prompt;
+        generic_accounts.method = "wallet_requestPermissions".to_owned();
+        assert_eq!(
+            generic_accounts.validate(ApprovalKind::Permission, 1_000),
+            Err(AbiError::InvalidApproval)
         );
         let mut oversized_method = capabilities;
         oversized_method.methods = BTreeSet::from(["m".repeat(MAX_METHOD_BYTES + 1)]);

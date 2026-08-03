@@ -94,12 +94,18 @@ origin, stored under a domain-separated opaque key; the record retains both
 values and must match them when loaded. The service reads the current generation
 from `WalletStore`; it never accepts one from a request. The first grant is
 generation one and every later grant/revocation is exactly the stored generation
-plus one. Every approved call rechecks the active, unexpired permission and
-generation immediately before execution. Provider approvals, handle-bound
-replay state, rate windows, request-ID windows, and event cursors are
-deliberately process-ephemeral. Their maximum approval lifetime is 90 seconds,
-and old service sessions cannot resume them. Time-bearing provider entry points
-also reject a process-local wall-clock rollback instead of extending authority.
+plus one. An Accounts grant also retains a bounded exact set of approved
+wallet-local account IDs. A legacy or generic grant that claims Accounts
+without that set fails closed. Every approved permission change carries the
+generation authenticated by its prompt into the persisted compare-and-swap;
+if another grant or revocation wins first, the old approval is stale and cannot
+authorize the next generation. Every other approved call rechecks the active,
+unexpired permission and generation immediately before execution. Provider
+approvals, handle-bound replay state, rate windows, request-ID windows, and
+event cursors are deliberately process-ephemeral. Their maximum approval
+lifetime is 90 seconds, and old service sessions cannot resume them.
+Time-bearing provider entry points also reject a process-local wall-clock
+rollback instead of extending authority.
 
 `wallet_lock` is service-owned: the runtime locks first, then the service rotates
 the wallet session and clears approvals and event cursors. If fresh session
@@ -126,10 +132,18 @@ capability list. An unimplemented method returns `unsupportedCapability`. The
 checked-in subprocess does not advertise provider dispatch, value movement, or
 browser integration.
 
-`hns_requestAccounts` remains in the canonical vocabulary but is
-unconditionally unavailable in this tranche. The current runtime interface
-cannot atomically join an approved Accounts grant to a real account result, so
-the service neither advertises nor invents that behavior.
+The service source now defines the atomic `hns_requestAccounts` join. Only an
+explicit runtime account-selector capability may advertise it. After the
+trusted approval, the runtime supplies one typed HNS account; the service
+validates and encodes its minimized ID result before atomically persisting that
+same ID in the approval-bound permission generation. `hns_accounts` is then a
+service-owned projection of only those persisted IDs; both methods return the
+IDs as ordered 32-character lowercase hexadecimal strings. Null or an empty
+object are the only accepted parameters, and generic `wallet_requestPermissions`
+cannot create Accounts authority. The checked-in subprocess still uses
+`UnavailableRuntime`, advertises neither method, and has no concrete
+`HnsWalletRuntime`/browser product adapter, so this source contract is not
+product availability.
 
 ## Explicitly forbidden
 
@@ -147,5 +161,6 @@ origins, unauthorized capabilities, replays, request flooding, stale context,
 stale approval, locked wallet, and unavailable module/backend are distinct
 errors. Errors minimize account and policy disclosure.
 
-The new provider/ABI/service/host contract tests and machine-readable vectors
-are source-only and were not run.
+The provider/ABI/service/host account-join tests are focused implementation
+evidence only; installed-browser and concrete-runtime qualification remain
+pending.

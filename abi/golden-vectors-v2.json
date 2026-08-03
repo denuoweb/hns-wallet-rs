@@ -244,7 +244,7 @@
             "approvalSchemaVersion": 2,
             "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
             "permissionGeneration": 0,
-            "methods": []
+            "methods": ["hns_requestAccounts", "hns_accounts"]
           }
         }
       },
@@ -259,7 +259,7 @@
             "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
             "permissionGeneration": 8
           },
-          "value": { "permissionGeneration": 8, "capabilities": [] }
+          "value": { "permissionGeneration": 8, "capabilities": [], "accounts": [] }
         }
       },
       {
@@ -276,7 +276,7 @@
               "permissionGeneration": 0
             },
             "origin": "https://wallet.example",
-            "method": "wallet_requestPermissions",
+            "method": "hns_requestAccounts",
             "expiresAtUnixMs": 200000,
             "summary": { "kind": "permissions", "capabilities": ["accounts"] }
           }
@@ -357,7 +357,12 @@
       {
         "name": "permissions",
         "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts", "balance"] } }
+        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"] } }
+      },
+      {
+        "name": "hnsAccountJoin",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"] } }
       },
       {
         "name": "moduleEnablement",
@@ -506,16 +511,22 @@
       "value": { "providerSchemaVersion": 1, "approvalSchemaVersion": 2, "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "permissionGeneration": 0, "methods": ["eth_sendTransaction"] }
     },
     {
-      "name": "privateSnapshotUnavailableAtomicJoin",
-      "schemaPointer": "#/$defs/privateProviderCapabilitySnapshotV1",
-      "reason": "hns_requestAccounts cannot be advertised before its atomic permission and account join exists",
-      "value": { "providerSchemaVersion": 1, "approvalSchemaVersion": 2, "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "permissionGeneration": 0, "methods": ["hns_requestAccounts"] }
-    },
-    {
       "name": "publicApprovalLeaksPrivateBinding",
       "schemaPointer": "#/$defs/publicApprovalProjectionV2",
       "reason": "private authority/session bindings never enter the public approval shape",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"] }, "binding": { "permissionGeneration": 0 } }
+      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"] }, "binding": { "permissionGeneration": 0 } }
+    },
+    {
+      "name": "publicApprovalGenericAccountsAuthority",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "reason": "Accounts authority can be created only by the exact hns_requestAccounts join",
+      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"] } }
+    },
+    {
+      "name": "publicApprovalInexactHnsAccountJoin",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "reason": "hns_requestAccounts requires exactly the Accounts capability",
+      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"] } }
     },
     {
       "name": "publicApprovalKindMethodMismatch",

@@ -41,7 +41,7 @@ semantics, approvals, and recoverable application workflows.
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events | raw keys/native commands or engine authority objects |
-| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition | browser engine policy or availability claims |
+| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition, runtime-selected atomic HNS account grant and minimized persisted account projection | concrete HNS runtime composition, browser engine policy, or availability claims |
 | `hns-wallet-host` | host-owned negotiation, identifiers/nonces, bounded request correlation, authority revisions, approval ownership, private provider bindings, and event replay cursors | platform process launch, engine policy, page injection, artifact trust, or availability claims |
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
 

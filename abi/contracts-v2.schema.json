@@ -220,15 +220,10 @@
     },
     "providerMethods": {
       "type": "array",
-      "maxItems": 42,
+      "maxItems": 43,
       "uniqueItems": true,
-      "items": {
-        "allOf": [
-          { "$ref": "#/$defs/providerMethod" },
-          { "not": { "const": "hns_requestAccounts" } }
-        ]
-      },
-      "$comment": "Presence in this closed vocabulary does not imply runtime availability. The snapshot contains only methods supported by the negotiated runtime; hns_requestAccounts remains unavailable until its atomic permission/account join exists."
+      "items": { "$ref": "#/$defs/providerMethod" },
+      "$comment": "Presence in this closed vocabulary does not imply runtime availability. The snapshot contains only methods supported by the negotiated runtime; hns_requestAccounts requires the service's atomic permission/account join and an explicit runtime account selector."
     },
     "approvalMethod": {
       "enum": [
@@ -830,8 +825,12 @@
       },
       "allOf": [
         {
-          "if": { "properties": { "method": { "enum": ["wallet_requestPermissions", "hns_requestAccounts"] } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" } } } } }
+          "if": { "properties": { "method": { "const": "hns_requestAccounts" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "const": ["accounts"] } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "wallet_requestPermissions" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "not": { "contains": { "const": "accounts" } } } } } } }
         },
         {
           "if": { "properties": { "method": { "const": "wallet_enableModule" } } },
@@ -1645,7 +1644,7 @@
         },
         {
           "if": { "properties": { "method": { "const": "wallet_requestPermissions" } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" } } } } }
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "not": { "contains": { "const": "accounts" } } } } } } }
         },
         {
           "if": { "properties": { "method": { "const": "wallet_enableModule" } } },

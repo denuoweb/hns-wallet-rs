@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hns_wallet_store::{StoreError, WalletStore};
 use hns_wallet_types::{
-    ApprovalId, ApprovalKind, BrowserRuntimeSessionId, HostAuthorityHandleId,
-    PermissionCapability, ProviderAuthorityFingerprint, WalletSessionId,
-    PROVIDER_METHOD_WIRE_NAMES,
+    AccountId, ApprovalId, ApprovalKind, BrowserRuntimeSessionId, HostAuthorityHandleId,
+    PROVIDER_METHOD_WIRE_NAMES, PermissionCapability, ProviderAuthorityFingerprint,
+    WalletSessionId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +23,7 @@ pub const RATE_WINDOW_SECONDS: u64 = 60;
 pub const MAX_REGISTERED_AUTHORITIES: usize = 256;
 pub const MAX_PENDING_APPROVALS: usize = 128;
 pub const MAX_REPLAY_NONCES: usize = 4_096;
+pub const MAX_APPROVED_ACCOUNTS: usize = 16;
 pub const PROVIDER_API_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -347,6 +348,10 @@ pub struct PermissionRecord {
     pub namespace: SelectedNamespace,
     pub generation: u64,
     pub capabilities: BTreeSet<PermissionCapability>,
+    /// Exact wallet-local accounts visible to this origin. Legacy records that
+    /// claimed `Accounts` without this binding deserialize but fail closed.
+    #[serde(default)]
+    pub approved_accounts: BTreeSet<AccountId>,
     pub approved_names: BTreeSet<[u8; 32]>,
     pub created_at_unix: u64,
     pub expires_at_unix: Option<u64>,
@@ -661,11 +666,20 @@ impl<S: ProviderStateStore> ProviderCore<S> {
     ) -> Result<ProviderAction, ProviderError> {
         self.accept_time(now_unix_ms)?;
         let request = ProviderRequest::decode(request_bytes)?;
-        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
+        let authority = self
+            .authority(handle, authority_revision, now_unix_ms)?
+            .clone();
         if request_nonce == 0 {
             return Err(ProviderError::Replay);
         }
         let method = ProviderMethod::parse(&request.method)?;
+        if matches!(
+            method,
+            ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
+        ) && authority.facts.namespace != SelectedNamespace::Hns
+        {
+            return Err(ProviderError::Unauthorized);
+        }
         validate_module_params(method, &request.params)?;
         let now_unix = now_unix_ms / 1_000;
         self.enforce_rate(handle, method, now_unix)?;
@@ -858,21 +872,103 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         now_unix_ms: u64,
         expires_at_unix: Option<u64>,
     ) -> Result<PermissionRecord, ProviderError> {
+        self.grant_scoped_permissions(
+            handle,
+            authority_revision,
+            capabilities,
+            BTreeSet::new(),
+            approved_names,
+            now_unix_ms,
+            expires_at_unix,
+        )
+    }
+
+    /// Persist one generation of origin/namespace permission authority with
+    /// an exact account disclosure set. Account capability without a binding,
+    /// or a binding without account capability, is never accepted.
+    pub fn grant_scoped_permissions(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        capabilities: BTreeSet<PermissionCapability>,
+        approved_accounts: BTreeSet<AccountId>,
+        approved_names: BTreeSet<[u8; 32]>,
+        now_unix_ms: u64,
+        expires_at_unix: Option<u64>,
+    ) -> Result<PermissionRecord, ProviderError> {
+        self.grant_scoped_permissions_inner(
+            handle,
+            authority_revision,
+            None,
+            capabilities,
+            approved_accounts,
+            approved_names,
+            now_unix_ms,
+            expires_at_unix,
+        )
+    }
+
+    /// Persist a permission grant only if it still targets the exact
+    /// generation authenticated by an approval prompt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_scoped_permissions_at_generation(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        expected_generation: u64,
+        capabilities: BTreeSet<PermissionCapability>,
+        approved_accounts: BTreeSet<AccountId>,
+        approved_names: BTreeSet<[u8; 32]>,
+        now_unix_ms: u64,
+        expires_at_unix: Option<u64>,
+    ) -> Result<PermissionRecord, ProviderError> {
+        self.grant_scoped_permissions_inner(
+            handle,
+            authority_revision,
+            Some(expected_generation),
+            capabilities,
+            approved_accounts,
+            approved_names,
+            now_unix_ms,
+            expires_at_unix,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn grant_scoped_permissions_inner(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        expected_generation: Option<u64>,
+        capabilities: BTreeSet<PermissionCapability>,
+        approved_accounts: BTreeSet<AccountId>,
+        approved_names: BTreeSet<[u8; 32]>,
+        now_unix_ms: u64,
+        expires_at_unix: Option<u64>,
+    ) -> Result<PermissionRecord, ProviderError> {
         self.accept_time(now_unix_ms)?;
         let now_unix = now_unix_ms / 1_000;
         let authority = self
             .authority(handle, authority_revision, now_unix_ms)?
             .clone();
+        let binds_accounts = !approved_accounts.is_empty();
         if capabilities.is_empty()
+            || approved_accounts.len() > MAX_APPROVED_ACCOUNTS
+            || approved_accounts
+                .iter()
+                .any(|account| account.as_bytes().iter().all(|byte| *byte == 0))
+            || capabilities.contains(&PermissionCapability::Accounts) != binds_accounts
+            || (binds_accounts && authority.facts.namespace != SelectedNamespace::Hns)
             || expires_at_unix.is_some_and(|expiry| expiry <= now_unix)
         {
             return Err(ProviderError::InvalidPermission);
         }
         let scope = permission_scope(&authority.facts);
-        let next_generation = self
-            .state
-            .permission_generation(&scope)?
-            .unwrap_or(0)
+        let current_generation = self.state.permission_generation(&scope)?.unwrap_or(0);
+        if expected_generation.is_some_and(|expected| expected != current_generation) {
+            return Err(ProviderError::StaleApproval);
+        }
+        let next_generation = current_generation
             .checked_add(1)
             .ok_or(ProviderError::StaleContext)?;
         let record = PermissionRecord {
@@ -880,6 +976,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
             namespace: authority.facts.namespace,
             generation: next_generation,
             capabilities,
+            approved_accounts,
             approved_names,
             created_at_unix: now_unix,
             expires_at_unix,
@@ -1056,6 +1153,17 @@ fn validate_permission_identity(
         || permission.namespace != facts.namespace
         || permission.generation == 0
         || permission.capabilities.is_empty()
+        || permission.approved_accounts.len() > MAX_APPROVED_ACCOUNTS
+        || permission
+            .approved_accounts
+            .iter()
+            .any(|account| account.as_bytes().iter().all(|byte| *byte == 0))
+        || permission
+            .capabilities
+            .contains(&PermissionCapability::Accounts)
+            != !permission.approved_accounts.is_empty()
+        || (!permission.approved_accounts.is_empty()
+            && permission.namespace != SelectedNamespace::Hns)
         || permission.created_at_unix > now_unix
         || permission
             .expires_at_unix
@@ -1278,17 +1386,20 @@ mod tests {
         assert_eq!(fresh.generation, 0);
         assert!(fresh.record.is_none());
 
+        let account = AccountId::new([7_u8; 16]);
         let granted = provider
-            .grant_permissions(
+            .grant_scoped_permissions(
                 handle(),
                 1,
                 BTreeSet::from([PermissionCapability::Accounts]),
+                BTreeSet::from([account]),
                 BTreeSet::new(),
                 NOW_MS,
                 None,
             )
             .expect("grant");
         assert_eq!(granted.generation, 1);
+        assert_eq!(granted.approved_accounts, BTreeSet::from([account]));
         let revoked_generation = provider
             .revoke_permissions(handle(), 1, NOW_MS)
             .expect("revoke");
@@ -1299,6 +1410,98 @@ mod tests {
             .expect("tombstone snapshot");
         assert_eq!(tombstone.generation, 2);
         assert!(tombstone.record.is_none());
+    }
+
+    #[test]
+    fn canonical_provider_account_join_rejects_unbound_and_legacy_account_authority() {
+        let mut scoped_provider = provider();
+        assert!(matches!(
+            scoped_provider.grant_permissions(
+                handle(),
+                1,
+                BTreeSet::from([PermissionCapability::Accounts]),
+                BTreeSet::new(),
+                NOW_MS,
+                None,
+            ),
+            Err(ProviderError::InvalidPermission)
+        ));
+
+        let account = AccountId::new([8_u8; 16]);
+        let record = scoped_provider
+            .grant_scoped_permissions(
+                handle(),
+                1,
+                BTreeSet::from([PermissionCapability::Accounts]),
+                BTreeSet::from([account]),
+                BTreeSet::new(),
+                NOW_MS,
+                None,
+            )
+            .expect("scoped account grant");
+        let mut legacy = serde_json::to_value(record).expect("record");
+        legacy
+            .as_object_mut()
+            .expect("record object")
+            .remove("approved_accounts");
+        let legacy: PermissionRecord = serde_json::from_value(legacy).expect("legacy record");
+        assert!(legacy.approved_accounts.is_empty());
+        assert!(matches!(
+            validate_permission_identity(Some(legacy), &registration(), NOW_MS / 1_000),
+            Err(ProviderError::Persistence)
+        ));
+
+        let mut provider = provider();
+        let ProviderAction::ApprovalRequired(approval) = provider
+            .request(
+                handle(),
+                1,
+                1,
+                NOW_MS,
+                br#"{"method":"hns_requestAccounts","params":null}"#,
+            )
+            .expect("account approval")
+        else {
+            panic!("account approval required")
+        };
+        let approved_generation = approval.permission_generation;
+        let approved_call = provider
+            .approve(handle(), 1, approval.id, NOW_MS)
+            .expect("approval validated");
+        assert_eq!(approved_call.method, ProviderMethod::HnsRequestAccounts);
+        provider
+            .grant_permissions(
+                handle(),
+                1,
+                BTreeSet::from([PermissionCapability::Send]),
+                BTreeSet::new(),
+                NOW_MS,
+                None,
+            )
+            .expect("concurrent permission generation");
+        assert!(matches!(
+            provider.grant_scoped_permissions_at_generation(
+                handle(),
+                1,
+                approved_generation,
+                BTreeSet::from([PermissionCapability::Accounts]),
+                BTreeSet::from([account]),
+                BTreeSet::new(),
+                NOW_MS,
+                None,
+            ),
+            Err(ProviderError::StaleApproval)
+        ));
+        let current = provider
+            .permission(handle(), 1, NOW_MS)
+            .expect("permission read")
+            .expect("concurrent grant retained");
+        assert_eq!(current.generation, 1);
+        assert_eq!(
+            current.capabilities,
+            BTreeSet::from([PermissionCapability::Send])
+        );
+        assert!(current.approved_accounts.is_empty());
     }
 
     #[test]
@@ -1336,15 +1539,19 @@ mod tests {
         let scope = permission_scope(&registration());
         provider
             .state
-            .save_permission(&scope, &PermissionRecord {
-                origin: origin(),
-                namespace: SelectedNamespace::Hns,
-                generation: 1,
-                capabilities: BTreeSet::from([PermissionCapability::Send]),
-                approved_names: BTreeSet::new(),
-                created_at_unix: 1,
-                expires_at_unix: None,
-            })
+            .save_permission(
+                &scope,
+                &PermissionRecord {
+                    origin: origin(),
+                    namespace: SelectedNamespace::Hns,
+                    generation: 1,
+                    capabilities: BTreeSet::from([PermissionCapability::Send]),
+                    approved_accounts: BTreeSet::new(),
+                    approved_names: BTreeSet::new(),
+                    created_at_unix: 1,
+                    expires_at_unix: None,
+                },
+            )
             .expect("permission");
         let action = provider
             .request(
@@ -1432,6 +1639,7 @@ mod tests {
             namespace: SelectedNamespace::Hns,
             generation: 5,
             capabilities: BTreeSet::from([PermissionCapability::Send]),
+            approved_accounts: BTreeSet::new(),
             approved_names: BTreeSet::new(),
             created_at_unix: 1,
             expires_at_unix: None,

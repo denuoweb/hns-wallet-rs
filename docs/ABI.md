@@ -107,8 +107,11 @@ snapshot with exactly `providerSchemaVersion: 1`, `approvalSchemaVersion: 2`,
 generation must equal the accompanying binding, schema versions are exact, and
 method strings must belong to the exact shared 43-name wallet-types list; short
 unknown strings are rejected as well as oversized ones. The advertised subset
-also rejects `hns_requestAccounts` until its atomic permission/account join
-exists. When provider dispatch is absent, `methods` is empty.
+may contain `hns_requestAccounts` only when the service runtime explicitly
+supports the account selector; the service pairs it with `hns_accounts`, a
+structured approval containing exactly Accounts, and an exact persisted account
+binding. Generic `wallet_requestPermissions` summaries cannot contain Accounts.
+When provider dispatch is absent, `methods` is empty.
 
 The website method `wallet_getCapabilities` instead returns only
 `providerApiVersion: 1` and `methods`. Its outer private result binding is

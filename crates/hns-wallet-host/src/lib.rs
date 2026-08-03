@@ -1196,7 +1196,6 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
                 !method.is_empty()
                     && method.len() <= MAX_METHOD_BYTES
                     && method.is_ascii()
-                    && method != "hns_requestAccounts"
                     && PROVIDER_METHOD_WIRE_NAMES.contains(&method.as_str())
             });
         if binding.authority_handle != handle
@@ -2314,13 +2313,14 @@ mod tests {
     }
 
     #[test]
-    fn capability_snapshot_cannot_advertise_unavailable_atomic_join() {
+    fn canonical_provider_account_join_capability_snapshot_is_negotiated() {
         let (mut host, _) = new_host();
         let mut service_capabilities = required_capabilities();
         service_capabilities.insert(ServiceCapability::ProviderDispatch);
+        service_capabilities.insert(ServiceCapability::StructuredApprovals);
         negotiate(&mut host, service_capabilities);
         install_active_authority(&mut host, 2_000);
-        let result = host.install_capabilities(
+        host.install_capabilities(
             handle(),
             1,
             binding(),
@@ -2331,11 +2331,8 @@ mod tests {
                 permission_generation: 1,
                 methods: BTreeSet::from(["hns_requestAccounts".to_owned()]),
             },
-        );
-        assert!(matches!(
-            result,
-            Err(HostError::InvalidCapabilitySnapshot)
-        ));
+        )
+        .expect("account join capability");
     }
 
     #[test]
