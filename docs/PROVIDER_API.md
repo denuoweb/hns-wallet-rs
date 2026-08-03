@@ -62,8 +62,10 @@ Cross-chain market:
 
 Events are private service frames scoped by an opaque host-issued authority
 handle and exact service-owned revision. A navigation/policy/runtime change,
-permission revocation, wallet-session rotation, authority replacement/revoke,
-or service restart invalidates pending approvals and event channels.
+permission revocation or expiry, wallet-session rotation, authority
+replacement/revoke, or service restart invalidates pending approvals and event
+channels. Only the explicit disconnect event may be emitted after permission is
+no longer active.
 
 The browser host retains the engine-issued authority. Only its private control
 channel may register the logical origin, namespace, runtime session/generation,
@@ -72,12 +74,23 @@ supply those values as authentication and never receive the opaque handle.
 Wallet lock/session and permission generation are owned by the wallet service.
 
 Permission records and encrypted tombstone generations survive service
-restart. The service reads the current generation from `WalletStore`; it never
-accepts one from a request. The first grant is generation one and every later
-grant/revocation is exactly the stored generation plus one. Provider approvals,
-handle-bound replay state, rate windows, request-ID windows, and event cursors
-are deliberately process-ephemeral. Their maximum approval lifetime is 90
-seconds, and old service sessions cannot resume them.
+restart. Their persistence scope is the exact selected namespace plus logical
+origin, stored under a domain-separated opaque key; the record retains both
+values and must match them when loaded. The service reads the current generation
+from `WalletStore`; it never accepts one from a request. The first grant is
+generation one and every later grant/revocation is exactly the stored generation
+plus one. Every approved call rechecks the active, unexpired permission and
+generation immediately before execution. Provider approvals, handle-bound
+replay state, rate windows, request-ID windows, and event cursors are
+deliberately process-ephemeral. Their maximum approval lifetime is 90 seconds,
+and old service sessions cannot resume them. Time-bearing provider entry points
+also reject a process-local wall-clock rollback instead of extending authority.
+
+`wallet_lock` is service-owned: the runtime locks first, then the service rotates
+the wallet session and clears approvals and event cursors. If fresh session
+entropy is unavailable, the provider remains locked. Send prompts are accepted
+only when the method, requested module, displayed chain, amount asset, and fee
+asset agree exactly.
 
 The 43 method names remain the closed vocabulary, but presence in that
 vocabulary is not availability. Capability negotiation is a closed enum and an

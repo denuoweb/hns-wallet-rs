@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use url::Url;
+use url::{Host, Url};
 
 pub const MAX_PROVIDER_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_METHOD_BYTES: usize = 96;
@@ -42,9 +42,14 @@ impl Origin {
         {
             return Err(ProviderError::InvalidOrigin);
         }
-        let host = parsed.host_str().ok_or(ProviderError::InvalidOrigin)?;
+        let host = parsed.host().ok_or(ProviderError::InvalidOrigin)?;
+        let loopback = match host {
+            Host::Domain(domain) => domain == "localhost",
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+        };
         let secure = parsed.scheme() == "https"
-            || (parsed.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1"));
+            || (parsed.scheme() == "http" && loopback);
         if !secure {
             return Err(ProviderError::InsecureContext);
         }
@@ -53,11 +58,7 @@ impl Origin {
             .ok_or(ProviderError::InvalidOrigin)?;
         let default_port = (parsed.scheme() == "https" && port == 443)
             || (parsed.scheme() == "http" && port == 80);
-        let serialized_host = if host.contains(':') {
-            format!("[{host}]")
-        } else {
-            host.to_owned()
-        };
+        let serialized_host = parsed.host_str().ok_or(ProviderError::InvalidOrigin)?;
         let serialized = if default_port {
             format!("{}://{serialized_host}", parsed.scheme())
         } else {
@@ -329,6 +330,7 @@ const FORBIDDEN_METHODS: &[&str] = &[
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRecord {
     pub origin: Origin,
+    pub namespace: SelectedNamespace,
     pub generation: u64,
     pub capabilities: BTreeSet<PermissionCapability>,
     pub approved_names: BTreeSet<[u8; 32]>,
@@ -346,6 +348,7 @@ impl PermissionRecord {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApprovedCall {
     pub origin: Origin,
+    pub namespace: SelectedNamespace,
     pub method: ProviderMethod,
     pub params: Value,
     pub request_nonce: u64,
@@ -370,12 +373,16 @@ pub enum ProviderAction {
 }
 
 pub trait ProviderStateStore {
-    fn permission(&self, origin: &Origin) -> Result<Option<PermissionRecord>, ProviderError>;
-    fn permission_generation(&self, origin: &Origin) -> Result<Option<u64>, ProviderError>;
-    fn save_permission(&mut self, record: &PermissionRecord) -> Result<(), ProviderError>;
+    fn permission(&self, scope: &str) -> Result<Option<PermissionRecord>, ProviderError>;
+    fn permission_generation(&self, scope: &str) -> Result<Option<u64>, ProviderError>;
+    fn save_permission(
+        &mut self,
+        scope: &str,
+        record: &PermissionRecord,
+    ) -> Result<(), ProviderError>;
     fn revoke_permission(
         &mut self,
-        origin: &Origin,
+        scope: &str,
         expected_generation: u64,
         next_generation: u64,
         now_unix: u64,
@@ -383,19 +390,23 @@ pub trait ProviderStateStore {
 }
 
 impl ProviderStateStore for WalletStore {
-    fn permission(&self, origin: &Origin) -> Result<Option<PermissionRecord>, ProviderError> {
-        self.provider_permission(origin.as_str())?
+    fn permission(&self, scope: &str) -> Result<Option<PermissionRecord>, ProviderError> {
+        self.provider_permission(scope)?
             .map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(ProviderError::from))
             .transpose()
     }
 
-    fn permission_generation(&self, origin: &Origin) -> Result<Option<u64>, ProviderError> {
-        Ok(self.provider_permission_generation(origin.as_str())?)
+    fn permission_generation(&self, scope: &str) -> Result<Option<u64>, ProviderError> {
+        Ok(self.provider_permission_generation(scope)?)
     }
 
-    fn save_permission(&mut self, record: &PermissionRecord) -> Result<(), ProviderError> {
+    fn save_permission(
+        &mut self,
+        scope: &str,
+        record: &PermissionRecord,
+    ) -> Result<(), ProviderError> {
         self.put_provider_permission(
-            record.origin.as_str(),
+            scope,
             record.generation,
             &serde_json::to_vec(record)?,
             record.created_at_unix,
@@ -405,13 +416,13 @@ impl ProviderStateStore for WalletStore {
 
     fn revoke_permission(
         &mut self,
-        origin: &Origin,
+        scope: &str,
         expected_generation: u64,
         next_generation: u64,
         now_unix: u64,
     ) -> Result<(), ProviderError> {
         self.revoke_provider_permission(
-            origin.as_str(),
+            scope,
             expected_generation,
             next_generation,
             now_unix,
@@ -423,21 +434,25 @@ impl ProviderStateStore for WalletStore {
 
 #[derive(Default)]
 pub struct MemoryProviderState {
-    permissions: BTreeMap<Origin, PermissionRecord>,
-    permission_generations: BTreeMap<Origin, u64>,
+    permissions: BTreeMap<String, PermissionRecord>,
+    permission_generations: BTreeMap<String, u64>,
 }
 
 impl ProviderStateStore for MemoryProviderState {
-    fn permission(&self, origin: &Origin) -> Result<Option<PermissionRecord>, ProviderError> {
-        Ok(self.permissions.get(origin).cloned())
+    fn permission(&self, scope: &str) -> Result<Option<PermissionRecord>, ProviderError> {
+        Ok(self.permissions.get(scope).cloned())
     }
 
-    fn permission_generation(&self, origin: &Origin) -> Result<Option<u64>, ProviderError> {
-        Ok(self.permission_generations.get(origin).copied())
+    fn permission_generation(&self, scope: &str) -> Result<Option<u64>, ProviderError> {
+        Ok(self.permission_generations.get(scope).copied())
     }
 
-    fn save_permission(&mut self, record: &PermissionRecord) -> Result<(), ProviderError> {
-        let expected = match self.permission_generations.get(&record.origin).copied() {
+    fn save_permission(
+        &mut self,
+        scope: &str,
+        record: &PermissionRecord,
+    ) -> Result<(), ProviderError> {
+        let expected = match self.permission_generations.get(scope).copied() {
             Some(current) => current.checked_add(1).ok_or(ProviderError::StaleContext)?,
             None => record.generation,
         };
@@ -445,20 +460,20 @@ impl ProviderStateStore for MemoryProviderState {
             return Err(ProviderError::StaleContext);
         }
         self.permission_generations
-            .insert(record.origin.clone(), record.generation);
+            .insert(scope.to_owned(), record.generation);
         self.permissions
-            .insert(record.origin.clone(), record.clone());
+            .insert(scope.to_owned(), record.clone());
         Ok(())
     }
 
     fn revoke_permission(
         &mut self,
-        origin: &Origin,
+        scope: &str,
         expected_generation: u64,
         next_generation: u64,
         _: u64,
     ) -> Result<(), ProviderError> {
-        if self.permission_generations.get(origin).copied() != Some(expected_generation)
+        if self.permission_generations.get(scope).copied() != Some(expected_generation)
             || next_generation
                 != expected_generation
                     .checked_add(1)
@@ -466,9 +481,9 @@ impl ProviderStateStore for MemoryProviderState {
         {
             return Err(ProviderError::StaleContext);
         }
-        self.permissions.remove(origin);
+        self.permissions.remove(scope);
         self.permission_generations
-            .insert(origin.clone(), next_generation);
+            .insert(scope.to_owned(), next_generation);
         Ok(())
     }
 
@@ -488,6 +503,7 @@ pub struct ProviderCore<S> {
     authorities: BTreeMap<HostAuthorityHandleId, RegisteredAuthority>,
     wallet_session: WalletSessionId,
     wallet_locked: bool,
+    last_now_unix_ms: u64,
     pending: BTreeMap<ApprovalId, PendingApproval>,
     replay: BTreeMap<(HostAuthorityHandleId, u64), u64>,
     rate: BTreeMap<(HostAuthorityHandleId, ProviderMethod), RateWindow>,
@@ -500,6 +516,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
             authorities: BTreeMap::new(),
             wallet_session,
             wallet_locked,
+            last_now_unix_ms: 0,
             pending: BTreeMap::new(),
             replay: BTreeMap::new(),
             rate: BTreeMap::new(),
@@ -512,6 +529,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         facts: HostAuthorityRegistration,
         now_unix_ms: u64,
     ) -> Result<u64, ProviderError> {
+        self.accept_time(now_unix_ms)?;
         facts.validate(now_unix_ms)?;
         self.prune_expired_authorities(now_unix_ms);
         if self.authorities.contains_key(&handle) {
@@ -537,6 +555,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         replacement: HostAuthorityRegistration,
         now_unix_ms: u64,
     ) -> Result<u64, ProviderError> {
+        self.accept_time(now_unix_ms)?;
         replacement.validate(now_unix_ms)?;
         let current = self
             .authorities
@@ -613,6 +632,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         now_unix_ms: u64,
         request_bytes: &[u8],
     ) -> Result<ProviderAction, ProviderError> {
+        self.accept_time(now_unix_ms)?;
         let request = ProviderRequest::decode(request_bytes)?;
         let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
         if request_nonce == 0 {
@@ -636,14 +656,14 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         {
             return Err(ProviderError::WalletLocked);
         }
-        let permission_generation = self
-            .state
-            .permission_generation(&authority.facts.origin)?
-            .unwrap_or(0);
+        let scope = permission_scope(&authority.facts);
+        let permission_generation = self.state.permission_generation(&scope)?.unwrap_or(0);
         if let Some(required) = method.permission() {
-            let permission = self
-                .state
-                .permission(&authority.facts.origin)?
+            let permission = validate_permission_identity(
+                self.state.permission(&scope)?,
+                &authority.facts,
+                now_unix,
+            )?
                 .ok_or(ProviderError::Unauthorized)?;
             if permission.generation != permission_generation
                 || !permission.permits(required, now_unix)
@@ -653,7 +673,8 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         }
 
         let call = ApprovedCall {
-            origin: authority.facts.origin,
+            origin: authority.facts.origin.clone(),
+            namespace: authority.facts.namespace,
             method,
             params: request.params,
             request_nonce,
@@ -673,6 +694,8 @@ impl<S: ProviderStateStore> ProviderCore<S> {
                 self.wallet_session,
                 request_nonce,
                 method,
+                authority.facts.namespace,
+                &authority.facts.origin,
             ),
             kind,
             call,
@@ -693,24 +716,38 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         id: ApprovalId,
         now_unix_ms: u64,
     ) -> Result<ApprovedCall, ProviderError> {
+        self.accept_time(now_unix_ms)?;
         let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
         let approval = self
             .pending
             .get(&id)
             .cloned()
             .ok_or(ProviderError::StaleApproval)?;
-        let permission_generation = self
-            .state
-            .permission_generation(&authority.facts.origin)?
-            .unwrap_or(0);
+        let now_unix = now_unix_ms / 1_000;
+        let scope = permission_scope(&authority.facts);
+        let permission_generation = self.state.permission_generation(&scope)?.unwrap_or(0);
         if approval.expires_at_unix <= now_unix_ms / 1_000
             || approval.call.origin != authority.facts.origin
+            || approval.call.namespace != authority.facts.namespace
             || approval.authority_handle != handle
             || approval.authority_revision != authority_revision
             || approval.wallet_session != self.wallet_session
             || approval.permission_generation != permission_generation
         {
             return Err(ProviderError::StaleApproval);
+        }
+        if let Some(required) = approval.call.method.permission() {
+            let permission = validate_permission_identity(
+                self.state.permission(&scope)?,
+                &authority.facts,
+                now_unix,
+            )?
+            .ok_or(ProviderError::StaleApproval)?;
+            if permission.generation != permission_generation
+                || !permission.permits(required, now_unix)
+            {
+                return Err(ProviderError::StaleApproval);
+            }
         }
         self.pending.remove(&id);
         Ok(approval.call)
@@ -723,18 +760,18 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         id: ApprovalId,
         now_unix_ms: u64,
     ) -> Result<(), ProviderError> {
+        self.accept_time(now_unix_ms)?;
         let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
         let approval = self
             .pending
             .get(&id)
             .cloned()
             .ok_or(ProviderError::StaleApproval)?;
-        let permission_generation = self
-            .state
-            .permission_generation(&authority.facts.origin)?
-            .unwrap_or(0);
+        let scope = permission_scope(&authority.facts);
+        let permission_generation = self.state.permission_generation(&scope)?.unwrap_or(0);
         if approval.expires_at_unix <= now_unix_ms / 1_000
             || approval.call.origin != authority.facts.origin
+            || approval.call.namespace != authority.facts.namespace
             || approval.authority_handle != handle
             || approval.authority_revision != authority_revision
             || approval.wallet_session != self.wallet_session
@@ -747,13 +784,27 @@ impl<S: ProviderStateStore> ProviderCore<S> {
     }
 
     pub fn permission(
-        &self,
+        &mut self,
         handle: HostAuthorityHandleId,
         authority_revision: u64,
         now_unix_ms: u64,
     ) -> Result<Option<PermissionRecord>, ProviderError> {
-        let authority = self.authority(handle, authority_revision, now_unix_ms)?;
-        self.state.permission(&authority.facts.origin)
+        self.accept_time(now_unix_ms)?;
+        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
+        let scope = permission_scope(&authority.facts);
+        let generation = self.state.permission_generation(&scope)?.unwrap_or(0);
+        let permission = validate_permission_identity(
+            self.state.permission(&scope)?,
+            &authority.facts,
+            now_unix_ms / 1_000,
+        )?;
+        if permission
+            .as_ref()
+            .is_some_and(|permission| permission.generation != generation)
+        {
+            return Err(ProviderError::Persistence);
+        }
+        Ok(permission)
     }
 
     pub fn grant_permissions(
@@ -762,34 +813,40 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         authority_revision: u64,
         capabilities: BTreeSet<PermissionCapability>,
         approved_names: BTreeSet<[u8; 32]>,
-        now_unix: u64,
+        now_unix_ms: u64,
         expires_at_unix: Option<u64>,
     ) -> Result<PermissionRecord, ProviderError> {
+        self.accept_time(now_unix_ms)?;
+        let now_unix = now_unix_ms / 1_000;
         let authority = self
-            .authority(handle, authority_revision, now_unix.saturating_mul(1_000))?
+            .authority(handle, authority_revision, now_unix_ms)?
             .clone();
         if capabilities.is_empty()
             || expires_at_unix.is_some_and(|expiry| expiry <= now_unix)
         {
             return Err(ProviderError::InvalidPermission);
         }
+        let scope = permission_scope(&authority.facts);
         let next_generation = self
             .state
-            .permission_generation(&authority.facts.origin)?
+            .permission_generation(&scope)?
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(ProviderError::StaleContext)?;
         let record = PermissionRecord {
-            origin: authority.facts.origin,
+            origin: authority.facts.origin.clone(),
+            namespace: authority.facts.namespace,
             generation: next_generation,
             capabilities,
             approved_names,
             created_at_unix: now_unix,
             expires_at_unix,
         };
-        self.state.save_permission(&record)?;
-        self.pending
-            .retain(|_, approval| approval.authority_handle != handle);
+        self.state.save_permission(&scope, &record)?;
+        self.pending.retain(|_, approval| {
+            approval.call.origin != authority.facts.origin
+                || approval.call.namespace != authority.facts.namespace
+        });
         Ok(record)
     }
 
@@ -797,27 +854,40 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         &mut self,
         handle: HostAuthorityHandleId,
         authority_revision: u64,
-        now_unix: u64,
+        now_unix_ms: u64,
     ) -> Result<u64, ProviderError> {
+        self.accept_time(now_unix_ms)?;
+        let now_unix = now_unix_ms / 1_000;
         let authority = self
-            .authority(handle, authority_revision, now_unix.saturating_mul(1_000))?
+            .authority(handle, authority_revision, now_unix_ms)?
             .clone();
+        let scope = permission_scope(&authority.facts);
         let expected_generation = self
             .state
-            .permission_generation(&authority.facts.origin)?
+            .permission_generation(&scope)?
             .ok_or(ProviderError::InvalidPermission)?;
         let next_generation = expected_generation
             .checked_add(1)
             .ok_or(ProviderError::StaleContext)?;
         self.state.revoke_permission(
-            &authority.facts.origin,
+            &scope,
             expected_generation,
             next_generation,
             now_unix,
         )?;
-        self.pending
-            .retain(|_, approval| approval.call.origin != authority.facts.origin);
+        self.pending.retain(|_, approval| {
+            approval.call.origin != authority.facts.origin
+                || approval.call.namespace != authority.facts.namespace
+        });
         Ok(next_generation)
+    }
+
+    fn accept_time(&mut self, now_unix_ms: u64) -> Result<(), ProviderError> {
+        if now_unix_ms < self.last_now_unix_ms {
+            return Err(ProviderError::ClockRollback);
+        }
+        self.last_now_unix_ms = now_unix_ms;
+        Ok(())
     }
 
     fn authority(
@@ -905,12 +975,69 @@ struct RateWindow {
     count: u32,
 }
 
+fn permission_scope(facts: &HostAuthorityRegistration) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let namespace = match facts.namespace {
+        SelectedNamespace::Hns => b"hns".as_slice(),
+        SelectedNamespace::Icann => b"icann".as_slice(),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"hns-provider-permission-scope/v2");
+    hasher.update([0_u8]);
+    hasher.update(namespace);
+    hasher.update([0_u8]);
+    hasher.update(facts.origin.as_str().as_bytes());
+    let digest = hasher.finalize();
+    let mut scope = String::with_capacity(31 + namespace.len() + digest.len() * 2);
+    scope.push_str("hns-provider-permission-v2:");
+    scope.push_str(match facts.namespace {
+        SelectedNamespace::Hns => "hns:",
+        SelectedNamespace::Icann => "icann:",
+    });
+    for byte in digest {
+        scope.push(HEX[(byte >> 4) as usize] as char);
+        scope.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    scope
+}
+
+fn validate_permission_identity(
+    permission: Option<PermissionRecord>,
+    facts: &HostAuthorityRegistration,
+    now_unix: u64,
+) -> Result<Option<PermissionRecord>, ProviderError> {
+    let Some(permission) = permission else {
+        return Ok(None);
+    };
+    if permission.origin != facts.origin
+        || permission.namespace != facts.namespace
+        || permission.generation == 0
+        || permission.capabilities.is_empty()
+        || permission.created_at_unix > now_unix
+        || permission
+            .expires_at_unix
+            .is_some_and(|expiry| expiry <= permission.created_at_unix)
+    {
+        return Err(ProviderError::Persistence);
+    }
+    if permission
+        .expires_at_unix
+        .is_some_and(|expiry| expiry <= now_unix)
+    {
+        return Ok(None);
+    }
+    Ok(Some(permission))
+}
+
 fn approval_id(
     handle: HostAuthorityHandleId,
     authority_revision: u64,
     wallet_session: WalletSessionId,
     request_nonce: u64,
     method: ProviderMethod,
+    namespace: SelectedNamespace,
+    origin: &Origin,
 ) -> ApprovalId {
     let mut hasher = Sha256::new();
     hasher.update(b"hns-provider-approval/v2");
@@ -918,6 +1045,12 @@ fn approval_id(
     hasher.update(authority_revision.to_be_bytes());
     hasher.update(wallet_session.as_bytes());
     hasher.update(request_nonce.to_be_bytes());
+    hasher.update([match namespace {
+        SelectedNamespace::Hns => 0_u8,
+        SelectedNamespace::Icann => 1_u8,
+    }]);
+    hasher.update((origin.as_str().len() as u64).to_be_bytes());
+    hasher.update(origin.as_str().as_bytes());
     hasher.update(format!("{method:?}").as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let mut id = [0_u8; 16];
@@ -979,6 +1112,8 @@ pub enum ProviderError {
     AuthorityCapacity,
     #[error("request context is stale or mismatched")]
     StaleContext,
+    #[error("provider wall clock moved backwards within this process")]
+    ClockRollback,
     #[error("provider request exceeds its bounded maximum")]
     RequestTooLarge,
     #[error("provider method was not found")]
@@ -1099,10 +1234,12 @@ mod tests {
     #[test]
     fn permissions_are_origin_scoped_and_value_movement_always_prompts() {
         let mut provider = provider();
+        let scope = permission_scope(&registration());
         provider
             .state
-            .save_permission(&PermissionRecord {
+            .save_permission(&scope, &PermissionRecord {
                 origin: origin(),
+                namespace: SelectedNamespace::Hns,
                 generation: 1,
                 capabilities: BTreeSet::from([PermissionCapability::Send]),
                 approved_names: BTreeSet::new(),
@@ -1190,27 +1327,31 @@ mod tests {
     #[test]
     fn permission_tombstone_prevents_generation_reset() {
         let mut state = MemoryProviderState::default();
+        let scope = permission_scope(&registration());
         let record = PermissionRecord {
             origin: origin(),
+            namespace: SelectedNamespace::Hns,
             generation: 5,
             capabilities: BTreeSet::from([PermissionCapability::Send]),
             approved_names: BTreeSet::new(),
             created_at_unix: 1,
             expires_at_unix: None,
         };
-        state.save_permission(&record).expect("trusted bootstrap");
         state
-            .revoke_permission(&record.origin, 5, 6, 2)
+            .save_permission(&scope, &record)
+            .expect("trusted bootstrap");
+        state
+            .revoke_permission(&scope, 5, 6, 2)
             .expect("revoke");
         let mut reset = record.clone();
         reset.generation = 6;
         assert!(matches!(
-            state.save_permission(&reset),
+            state.save_permission(&scope, &reset),
             Err(ProviderError::StaleContext)
         ));
         reset.generation = 7;
         state
-            .save_permission(&reset)
+            .save_permission(&scope, &reset)
             .expect("next monotonic generation");
     }
 }

@@ -41,6 +41,8 @@ pub trait ServiceRuntime {
 
     fn execute_provider(&mut self, call: ApprovedCall) -> Result<Value, ServiceFailure>;
 
+    fn lock_wallet(&mut self) -> Result<(), ServiceFailure>;
+
     fn execute_wallet(&mut self, request: WalletRequest) -> Result<WalletResponse, ServiceFailure>;
 }
 
@@ -62,6 +64,10 @@ impl ServiceRuntime for UnavailableRuntime {
 
     fn execute_provider(&mut self, _: ApprovedCall) -> Result<Value, ServiceFailure> {
         Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch))
+    }
+
+    fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+        Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations))
     }
 
     fn execute_wallet(&mut self, _: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
@@ -156,12 +162,19 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
     }
 
     pub fn rotate_wallet_session(&mut self, locked: bool) -> Result<(), ServiceError> {
-        self.wallet_session_id = random_wallet_session()?;
-        self.provider
-            .set_wallet_state(self.wallet_session_id, locked);
         self.pending.clear();
         self.event_sequences.clear();
-        Ok(())
+        match random_wallet_session() {
+            Ok(wallet_session_id) => {
+                self.wallet_session_id = wallet_session_id;
+                self.provider.set_wallet_state(wallet_session_id, locked);
+                Ok(())
+            }
+            Err(error) => {
+                self.provider.set_wallet_state(self.wallet_session_id, true);
+                Err(error)
+            }
+        }
     }
 
     pub fn emit_event(
@@ -171,9 +184,23 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         payload: ProviderEventPayload,
         now_unix_ms: u64,
     ) -> Result<Vec<u8>, ServiceError> {
-        self.provider
+        let permission = match self
+            .provider
             .permission(authority_handle, authority_revision, now_unix_ms)
-            .map_err(ServiceError::from)?;
+        {
+            Ok(permission) => permission,
+            Err(error) => {
+                self.event_sequences.clear();
+                return Err(ServiceError::from(error));
+            }
+        };
+        if permission.is_none()
+            && !matches!(&payload, ProviderEventPayload::Disconnect { .. })
+        {
+            self.event_sequences.clear();
+            return Err(ServiceError::Provider(ProviderError::Unauthorized));
+        }
+        let retire_after_emit = permission.is_none();
         let event_sequence = self
             .event_sequences
             .entry((authority_handle, authority_revision))
@@ -183,7 +210,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             .ok_or(ServiceError::SequenceExhausted)?;
         let event_sequence = *event_sequence;
         let (session, channel_sequence) = self.next_service_sequence()?;
-        encode_service_frame(&ServiceFrame::Event {
+        let encoded = encode_service_frame(&ServiceFrame::Event {
             event: ProviderEventEnvelope {
                 protocol_version: WALLET_ABI_VERSION,
                 host_session_id: session.host_session_id,
@@ -196,7 +223,12 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 payload,
             },
         })
-        .map_err(ServiceError::from)
+        .map_err(ServiceError::from);
+        if retire_after_emit {
+            self.event_sequences
+                .remove(&(authority_handle, authority_revision));
+        }
+        encoded
     }
 
     fn negotiate(&mut self, hello: hns_wallet_ffi::HostHello) -> Result<Vec<u8>, ServiceError> {
@@ -404,6 +436,11 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             return Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch));
         }
         let method = ProviderMethod::parse(&method_name).map_err(provider_failure)?;
+        if method == ProviderMethod::WalletLock
+            && !self.capabilities.contains(&ServiceCapability::WalletOperations)
+        {
+            return Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations));
+        }
         if method.approval().is_some_and(value_movement_approval)
             && !self.capabilities.contains(&ServiceCapability::ValueMovement)
         {
@@ -417,15 +454,28 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             "params": params,
         }))
         .map_err(|_| invalid_request("provider request encoding failed"))?;
-        match self.provider.request(
+        let action = match self.provider.request(
             authority_handle,
             authority_revision,
             request_nonce,
             now_unix_ms,
             &encoded_request,
-        )
-        .map_err(provider_failure)?
-        {
+        ) {
+            Ok(action) => action,
+            Err(error) => {
+                if matches!(
+                    &error,
+                    ProviderError::Unauthorized | ProviderError::ClockRollback
+                ) {
+                    self.event_sequences.clear();
+                }
+                if matches!(&error, ProviderError::ClockRollback) {
+                    self.pending.clear();
+                }
+                return Err(provider_failure(error));
+            }
+        };
+        match action {
             ProviderAction::Execute(call) => {
                 let value = self.execute_call(
                     authority_handle,
@@ -590,7 +640,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         &mut self,
         approval: &PendingApproval,
     ) -> Result<ApprovalSummary, ServiceFailure> {
-        match approval.call.method {
+        let summary = match approval.call.method {
             ProviderMethod::WalletRequestPermissions | ProviderMethod::HnsRequestAccounts => {
                 Ok(ApprovalSummary::Permissions {
                     capabilities: requested_capabilities(&approval.call)?,
@@ -606,7 +656,9 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 Ok(ApprovalSummary::ModuleEnablement { module, action })
             }
             _ => self.runtime.prepare_approval(approval),
-        }
+        }?;
+        validate_approval_summary(&approval.call, &summary)?;
+        Ok(summary)
     }
 
     fn execute_call(
@@ -626,17 +678,20 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     now_unix_ms,
                 )
                 .map_err(provider_failure)?;
+                if permission.is_none() {
+                    self.event_sequences.clear();
+                }
                 permission_value(permission)
             }
             ProviderMethod::WalletRevokePermissions => {
                 let generation = self.provider.revoke_permissions(
                     authority_handle,
                     authority_revision,
-                    now_unix_ms / 1_000,
+                    now_unix_ms,
                 )
                 .map_err(provider_failure)?;
-                self.pending
-                    .retain(|_, pending| pending.authority_handle != authority_handle);
+                self.pending.clear();
+                self.event_sequences.clear();
                 Ok(json!({ "permissionGeneration": generation, "capabilities": [] }))
             }
             ProviderMethod::WalletRequestPermissions | ProviderMethod::HnsRequestAccounts => {
@@ -646,13 +701,19 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     authority_revision,
                     capabilities,
                     BTreeSet::new(),
-                    now_unix_ms / 1_000,
+                    now_unix_ms,
                     None,
                 )
                 .map_err(provider_failure)?;
-                self.pending
-                    .retain(|_, pending| pending.authority_handle != authority_handle);
+                self.pending.clear();
+                self.event_sequences.clear();
                 permission_value(Some(permission))
+            }
+            ProviderMethod::WalletLock => {
+                self.runtime.lock_wallet()?;
+                self.rotate_wallet_session(true)
+                    .map_err(ServiceFailure::from)?;
+                Ok(json!({ "locked": true }))
             }
             _ => self.runtime.execute_provider(call),
         }
@@ -695,6 +756,7 @@ fn service_owned_method(method: ProviderMethod) -> bool {
             | ProviderMethod::WalletRequestPermissions
             | ProviderMethod::WalletGetPermissions
             | ProviderMethod::WalletRevokePermissions
+            | ProviderMethod::WalletLock
             | ProviderMethod::HnsRequestAccounts
     )
 }
@@ -742,6 +804,43 @@ fn requested_module(params: &Value) -> Result<ModuleId, ServiceFailure> {
             .ok_or_else(|| invalid_request("module is required"))?,
     )
     .map_err(|_| invalid_request("module is invalid"))
+}
+
+fn validate_approval_summary(
+    call: &ApprovedCall,
+    summary: &ApprovalSummary,
+) -> Result<(), ServiceFailure> {
+    let ApprovalSummary::Send {
+        amount,
+        maximum_fee,
+        chain,
+        ..
+    } = summary
+    else {
+        if matches!(call.method, ProviderMethod::HnsSend | ProviderMethod::AssetSend) {
+            return Err(invalid_request("send approval summary is mismatched"));
+        }
+        return Ok(());
+    };
+
+    let expected_chain = match call.method {
+        ProviderMethod::HnsSend => ModuleId::Handshake,
+        ProviderMethod::AssetSend => {
+            let module = requested_module(&call.params)?;
+            if !matches!(module, ModuleId::Bitcoin | ModuleId::Ethereum) {
+                return Err(invalid_request("external send module is invalid"));
+            }
+            module
+        }
+        _ => return Ok(()),
+    };
+    if *chain != expected_chain
+        || amount.asset != expected_chain.asset()
+        || maximum_fee.asset != expected_chain.asset()
+    {
+        return Err(invalid_request("send approval asset or chain is mismatched"));
+    }
+    Ok(())
 }
 
 fn permission_value(
@@ -806,7 +905,8 @@ fn provider_failure(error: ProviderError) -> ServiceFailure {
         ProviderError::AuthorityNotFound => ServiceErrorCode::AuthorityUnknown,
         ProviderError::DuplicateAuthority
         | ProviderError::AuthorityCapacity
-        | ProviderError::StaleContext => ServiceErrorCode::AuthorityStale,
+        | ProviderError::StaleContext
+        | ProviderError::ClockRollback => ServiceErrorCode::AuthorityStale,
         ProviderError::Unauthorized => ServiceErrorCode::PermissionDenied,
         ProviderError::WalletLocked => ServiceErrorCode::WalletLocked,
         ProviderError::RateLimited => ServiceErrorCode::RateLimited,
