@@ -87,11 +87,14 @@ approval, saves the authorized exact bytes and quote, and activates the input
 reservations. Broadcast re-quotes only those persisted bytes, saves the
 refreshed quote with `RequiresRebroadcast` before submission, and allows at most
 one full reconciliation and one retry for stale or unavailable quote evidence.
-The immutable `hns-script` 0.2 source includes canonical sigop-adjusted fee
-algebra, but that source has not passed consolidated wallet qualification and
-the independent local minimum-fee check is not yet wired. Therefore
-`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains false and no local copy of the
-node formula is used.
+Confirmed wallet coins retain exact inclusion height and canonical covenant
+bytes through encrypted persistence. Final transactions are checked against
+the ordered reconstructed consensus coins: immutable `hns-script` 0.2 computes
+sigops, policy virtual size, minimum fee, and standard weight/sigop bounds,
+while exact input/output sums independently reproduce actual fee. Legacy or
+mismatched evidence fails closed. This source has not passed consolidated
+wallet qualification, so `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains
+false; no local copy of the node formula is used.
 
 Name evidence deliberately preserves the interval-committed Urkel proof/state/
 owner view separately from the node's current state/owner view. The proof root

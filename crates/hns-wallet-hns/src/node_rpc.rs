@@ -1369,6 +1369,7 @@ impl HnsBackend for HnsNodeRpcBackend {
                 .ok_or_else(protocol_error)?;
             let output_address = wallet_address(&row.coin.address)?;
             let covenant = wire_covenant(&row.coin.covenant)?;
+            let covenant_bytes = covenant.encode().map_err(|_| protocol_error())?;
             let outpoint = hns_outpoint(&row.coin.outpoint)?;
             let height = u64::from(row.coin.height);
             if &output_address != expected_address
@@ -1385,7 +1386,9 @@ impl HnsBackend for HnsNodeRpcBackend {
                     outpoint,
                     value: BaseUnits::new(u128::from(row.coin.value)),
                     confirmation_count,
+                    confirmed_height: Some(row.coin.height),
                     coinbase: row.coin.coinbase,
+                    covenant: covenant_bytes,
                     name_locked: !matches!(covenant.kind, CovenantKind::None),
                 },
                 script_index: request_index,
@@ -1709,6 +1712,7 @@ impl HnsBackend for HnsNodeRpcBackend {
     fn quote_transaction_fee(
         &self,
         raw: &[u8],
+        input_coins: &[hns_transaction::Coin],
         target_blocks: u16,
         binding: SnapshotBinding,
         expected_mempool: MempoolSnapshotBinding,
@@ -1771,7 +1775,7 @@ impl HnsBackend for HnsNodeRpcBackend {
         {
             return Err(protocol_error());
         }
-        Ok(HnsTransactionFeeQuote {
+        let quote = HnsTransactionFeeQuote {
             txid: expected_txid,
             binding,
             mempool,
@@ -1787,7 +1791,9 @@ impl HnsBackend for HnsNodeRpcBackend {
             actual_fee,
             meets_minimum_policy_fee: response.meets_minimum_policy_fee,
             minimum_policy_fee_shortfall,
-        })
+        };
+        super::validate_local_fee_quote_evidence(&transaction, input_coins, &quote)?;
+        Ok(quote)
     }
 
     fn estimate_fee_rate(&self, target_blocks: u16) -> Result<BaseUnits, HnsWalletError> {

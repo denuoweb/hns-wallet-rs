@@ -55,7 +55,8 @@ node views.
 ScriptId derivation hashes the canonical address bytes
 `[version, hash_length_u8, hash...]` with BLAKE2b-256, sorts the resulting IDs,
 and retains a checked reverse map to wallet derivations. Response hex is
-lowercase and canonical. Addresses, covenants, raw transactions, txids,
+lowercase and canonical. Addresses, canonical covenant bytes, confirmed UTXO
+inclusion heights, raw transactions, txids,
 outpoint echoes, cursor lengths, collection bounds, fee evidence, inclusion
 counts, optional transaction positions, and optional exact block/admission
 times are validated before projection into wallet types.
@@ -65,7 +66,12 @@ current chain epoch/tip, mempool instance/generation, and requested confirmation
 target. The adapter verifies canonical raw bytes, txid, transaction weight,
 policy virtual bytes, sigop cost, rate source/sample bounds, actual fee,
 minimum fee, shortfall, and the node's `meets_minimum` relationship before
-projecting the quote into wallet state.
+projecting the quote into wallet state. The wallet supplies the exact ordered
+input coins reconstructed from persisted inclusion/address/covenant evidence;
+the adapter and final workflow validator independently recompute weight,
+sigops, sigop-adjusted policy virtual size, minimum fee, and actual fee with the
+pinned `hns-script` implementation. Legacy rows without that evidence and any
+outpoint/covenant/name-lock mismatch are unusable as inputs.
 
 The send and exposed settlement signing paths are wired to sign first and quote
 those exact bytes. Authorization peeks at the authenticated approval without
@@ -77,11 +83,12 @@ refreshed quote and `RequiresRebroadcast` state, and then submits those same
 bytes. A stale snapshot or temporarily unavailable quote input permits exactly
 one complete reconciliation and one quote retry; there is no polling loop.
 
-The reviewed immutable `hns-script` 0.2 source exposes canonical HSD
-sigop-adjusted policy-size/fee algebra, but the wallet has not yet wired and
-qualified its independent minimum check. The wallet must not copy that policy
-formula. `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` therefore remains `false`,
-so the wired quote path cannot authorize value.
+The reviewed immutable `hns-script` 0.2 source now supplies transaction sigops,
+sigop-adjusted policy size, minimum-fee construction, and standard weight/
+sigop bounds directly to the wallet. No local formula is copied. This source
+has not passed consolidated wallet qualification, so
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains `false` and the wired quote
+path still cannot authorize value.
 
 Confirmed coinbase identity is preserved exactly, but coinbase outputs are
 conservatively excluded from selection. No local maturity constant is invented;

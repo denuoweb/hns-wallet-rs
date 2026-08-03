@@ -19,13 +19,15 @@ use hns_covenants::{
     hash_name, validate_name, Covenant, CovenantKind, FinalizeCovenant, NameState, TransferCovenant,
 };
 use hns_primitives::{
-    Dollarydoos, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
+    Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
 };
 use hns_script::{
-    signature_hash, OP_BLAKE160, OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP, OP_DUP, OP_ELSE,
-    OP_ENDIF, OP_EQUALVERIFY, OP_IF, OP_SHA256, SIGHASH_ALL,
+    minimum_policy_fee, signature_hash, transaction_policy_virtual_size, transaction_sigops,
+    FeeRate, MAX_POLICY_TRANSACTION_SIGOPS, MAX_POLICY_TRANSACTION_WEIGHT, OP_BLAKE160,
+    OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_IF,
+    OP_SHA256, SIGHASH_ALL,
 };
-use hns_transaction::{Address, Input, Outpoint, Output, Transaction, Witness};
+use hns_transaction::{Address, Coin, Input, Outpoint, Output, Transaction, Witness};
 use hns_urkel_proof::{ProofKind, UrkelProof};
 use hns_wallet_chain_api::{
     AtomicSettlement, AuthorizeSend, AuthorizedSend, BroadcastReceipt, BroadcastSend, ChainError,
@@ -260,10 +262,19 @@ pub struct WalletCoin {
     pub outpoint: HnsOutpoint,
     pub value: BaseUnits,
     pub confirmation_count: u32,
+    /// Exact active-chain inclusion height supplied by the confirmed wallet
+    /// index. `None` is accepted only while decoding a legacy row; such a row
+    /// cannot become transaction input evidence.
+    #[serde(default)]
+    pub confirmed_height: Option<u32>,
     /// Exact node evidence. Coinbase outputs remain conservatively excluded
     /// until a released canonical maturity policy is wired into selection.
     #[serde(default = "coinbase_evidence_unknown")]
     pub coinbase: bool,
+    /// Canonical encoded Handshake covenant. An empty legacy default is never
+    /// interpreted as `NONE`; conversion to a consensus coin fails closed.
+    #[serde(default)]
+    pub covenant: Vec<u8>,
     pub name_locked: bool,
 }
 
@@ -358,18 +369,20 @@ pub trait HnsBackend {
     ) -> Result<OutpointSpendEvidence, HnsWalletError>;
     fn broadcast_transaction(&self, raw: &[u8]) -> Result<TransactionHash, HnsWalletError>;
     /// Quotes one exact serialized transaction against the complete wallet
-    /// reconciliation binding. Input values, sigops, policy size, and rate
-    /// samples are node-resolved evidence; this method never signs or submits.
+    /// reconciliation binding. The ordered coins are exact wallet evidence;
+    /// the node resolves the same outpoints and returns policy/rate evidence
+    /// for independent local comparison. This method never signs or submits.
     fn quote_transaction_fee(
         &self,
         raw: &[u8],
+        input_coins: &[Coin],
         target_blocks: u16,
         binding: SnapshotBinding,
         expected_mempool: MempoolSnapshotBinding,
     ) -> Result<HnsTransactionFeeQuote, HnsWalletError>;
     /// Node estimate in atomic units per 1,000 HSD policy virtual bytes. The
-    /// dormant wallet fee constructor is not release-qualified to apply this
-    /// rate until canonical sigop-adjusted policy sizing is available.
+    /// wallet applies it only through pinned canonical sigop-adjusted policy
+    /// sizing; the enclosing value gate remains independently unavailable.
     fn estimate_fee_rate(&self, target_blocks: u16) -> Result<BaseUnits, HnsWalletError>;
     /// Returns the interval-committed proof view and current name view without
     /// collapsing them. Every field is tied to the supplied snapshot binding.
@@ -1146,6 +1159,167 @@ pub struct TrackedHnsCoin {
     pub address_program: Vec<u8>,
 }
 
+impl TrackedHnsCoin {
+    /// Reconstruct the exact consensus coin used by script and fee policy.
+    /// Legacy rows and any mismatch between projected and canonical evidence
+    /// are deliberately unusable until a fresh bound reconciliation replaces
+    /// them.
+    pub fn to_canonical_coin(&self) -> Result<Coin, HnsWalletError> {
+        if self.coin.confirmation_count == 0 || self.address_program.len() != 20 {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let covenant = decode_canonical_covenant(&self.coin.covenant)?;
+        if self.coin.name_locked != !matches!(covenant.kind, CovenantKind::None) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        canonical_coin_from_evidence(
+            self.coin.outpoint,
+            self.coin.value,
+            self.coin.confirmed_height,
+            self.coin.coinbase,
+            0,
+            self.address_program.clone(),
+            covenant,
+        )
+    }
+
+    fn to_input_evidence(&self) -> Result<HnsInputCoinEvidence, HnsWalletError> {
+        let canonical = self.to_canonical_coin()?;
+        HnsInputCoinEvidence::from_canonical_coin(&canonical)
+    }
+}
+
+/// Serializable, exact input-coin evidence retained beside signed workflows.
+/// It carries all fields required by canonical script sigop and fee policy so
+/// restart/rebroadcast validation never falls back to a node assertion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HnsInputCoinEvidence {
+    pub outpoint: HnsOutpoint,
+    pub value: BaseUnits,
+    #[serde(default)]
+    pub confirmed_height: Option<u32>,
+    pub coinbase: bool,
+    pub address_version: u8,
+    pub address_hash: Vec<u8>,
+    #[serde(default)]
+    pub covenant: Vec<u8>,
+}
+
+impl HnsInputCoinEvidence {
+    pub fn to_canonical_coin(&self) -> Result<Coin, HnsWalletError> {
+        canonical_coin_from_evidence(
+            self.outpoint,
+            self.value,
+            self.confirmed_height,
+            self.coinbase,
+            self.address_version,
+            self.address_hash.clone(),
+            decode_canonical_covenant(&self.covenant)?,
+        )
+    }
+
+    fn from_canonical_coin(coin: &Coin) -> Result<Self, HnsWalletError> {
+        if coin.outpoint.is_null() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let covenant = coin
+            .covenant
+            .encode()
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        Ok(Self {
+            outpoint: HnsOutpoint {
+                transaction: TransactionHash::new(coin.outpoint.transaction_hash.into_bytes()),
+                output_index: coin.outpoint.index,
+            },
+            value: BaseUnits::new(u128::from(coin.value.get())),
+            confirmed_height: Some(coin.height.get()),
+            coinbase: coin.coinbase,
+            address_version: coin.address.version,
+            address_hash: coin.address.hash.clone(),
+            covenant,
+        })
+    }
+}
+
+fn decode_canonical_covenant(encoded: &[u8]) -> Result<Covenant, HnsWalletError> {
+    if encoded.is_empty() {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let covenant = Covenant::decode(encoded).map_err(|_| HnsWalletError::InvalidEvidence)?;
+    if covenant
+        .encode()
+        .map_err(|_| HnsWalletError::InvalidEvidence)?
+        != encoded
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(covenant)
+}
+
+fn canonical_coin_from_evidence(
+    outpoint: HnsOutpoint,
+    value: BaseUnits,
+    confirmed_height: Option<u32>,
+    coinbase: bool,
+    address_version: u8,
+    address_hash: Vec<u8>,
+    covenant: Covenant,
+) -> Result<Coin, HnsWalletError> {
+    let outpoint = Outpoint {
+        transaction_hash: CanonicalTransactionHash::new(outpoint.transaction.into_bytes()),
+        index: outpoint.output_index,
+    };
+    if outpoint.is_null() || value.is_zero() {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let value = u64::try_from(value.get()).map_err(|_| HnsWalletError::InvalidEvidence)?;
+    let height = confirmed_height.ok_or(HnsWalletError::InvalidEvidence)?;
+    let address =
+        Address::new(address_version, address_hash).map_err(|_| HnsWalletError::InvalidEvidence)?;
+    Ok(Coin {
+        outpoint,
+        value: Dollarydoos::new(value),
+        height: Height::new(height),
+        coinbase,
+        address,
+        covenant,
+    })
+}
+
+pub(crate) fn canonical_input_coins(
+    inputs: &[TrackedHnsCoin],
+) -> Result<Vec<Coin>, HnsWalletError> {
+    if inputs.is_empty() || inputs.len() > MAX_TRANSACTION_INPUTS {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    inputs
+        .iter()
+        .map(TrackedHnsCoin::to_canonical_coin)
+        .collect()
+}
+
+fn canonical_evidence_coins(inputs: &[HnsInputCoinEvidence]) -> Result<Vec<Coin>, HnsWalletError> {
+    if inputs.is_empty() || inputs.len() > MAX_TRANSACTION_INPUTS {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    inputs
+        .iter()
+        .map(HnsInputCoinEvidence::to_canonical_coin)
+        .collect()
+}
+
+fn input_coin_evidence(
+    inputs: &[TrackedHnsCoin],
+) -> Result<Vec<HnsInputCoinEvidence>, HnsWalletError> {
+    if inputs.is_empty() || inputs.len() > MAX_TRANSACTION_INPUTS {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    inputs
+        .iter()
+        .map(TrackedHnsCoin::to_input_evidence)
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HnsTransactionRecord {
     pub summary: TransactionSummary,
@@ -1320,6 +1494,10 @@ struct HnsVerifiedSettlementRecord {
     verified: VerifiedLock,
     output_index: u32,
     script: Vec<u8>,
+    /// Exact confirmed funding output used for local script/fee policy. A
+    /// missing legacy value cannot authorize a settlement spend.
+    #[serde(default)]
+    funding_coin: Option<HnsInputCoinEvidence>,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -1332,6 +1510,10 @@ struct HnsPreparedSettlement {
     stage: HnsSettlementStage,
     transaction: TransactionHash,
     signed_transaction: Vec<u8>,
+    /// Ordered one-for-one with the transaction inputs. Empty legacy evidence
+    /// is retained only so decoding succeeds and validation can fail closed.
+    #[serde(default)]
+    input_coins: Vec<HnsInputCoinEvidence>,
     fee: BaseUnits,
     #[serde(default)]
     maximum_fee: BaseUnits,
@@ -1551,8 +1733,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .fee_quote
             .as_ref()
             .ok_or(HnsWalletError::InvalidWorkflow)?;
+        let input_coins = canonical_input_coins(&stored.state.plan.inputs)?;
         validate_final_fee_quote(
             &raw,
+            &input_coins,
             prior_quote,
             prior_quote.binding,
             prior_quote.mempool,
@@ -1561,6 +1745,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         )?;
         let quote = self.quote_final_transaction(
             &raw,
+            &input_coins,
             stored.state.plan.fee,
             stored.state.plan.maximum_fee,
         )?;
@@ -1827,8 +2012,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .fee_quote
             .as_ref()
             .ok_or(HnsWalletError::InvalidPreparedArtifact)?;
+        let artifact_input_coins = canonical_evidence_coins(&prepared.input_coins)?;
         validate_final_fee_quote(
             &prepared.signed_transaction,
+            &artifact_input_coins,
             artifact_quote,
             artifact_quote.binding,
             artifact_quote.mempool,
@@ -1898,8 +2085,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 .fee_quote
                 .as_ref()
                 .ok_or(HnsWalletError::InvalidWorkflow)?;
+            let input_coins = canonical_evidence_coins(&stored.state.input_coins)?;
             validate_final_fee_quote(
                 &stored.state.signed_transaction,
+                &input_coins,
                 prior_quote,
                 prior_quote.binding,
                 prior_quote.mempool,
@@ -1908,8 +2097,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             )?;
             stored
         };
+        let input_coins = canonical_evidence_coins(&stored.state.input_coins)?;
         let quote = self.quote_final_transaction(
             &stored.state.signed_transaction,
+            &input_coins,
             stored.state.fee,
             stored.state.maximum_fee,
         )?;
@@ -1974,6 +2165,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         session_id: SessionId,
         action: HnsSettlementAction,
         signed_transaction: Vec<u8>,
+        input_coins: Vec<HnsInputCoinEvidence>,
         fee: BaseUnits,
         maximum_fee: BaseUnits,
         fee_quote: HnsTransactionFeeQuote,
@@ -1986,8 +2178,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let transaction = Transaction::decode(&signed_transaction)
             .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
         let transaction = wallet_transaction_hash(&transaction)?;
+        let canonical_input_coins = canonical_evidence_coins(&input_coins)?;
         validate_final_fee_quote(
             &signed_transaction,
+            &canonical_input_coins,
             &fee_quote,
             fee_quote.binding,
             fee_quote.mempool,
@@ -2007,6 +2201,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             stage: HnsSettlementStage::Prepared,
             transaction,
             signed_transaction,
+            input_coins,
             fee,
             maximum_fee,
             fee_quote: Some(fee_quote),
@@ -2129,6 +2324,22 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         .map_err(|_| ChainError::InvalidEvidence)?;
         let previous_value =
             u64::try_from(lock.amount.base_units.get()).map_err(|_| ChainError::InvalidEvidence)?;
+        let funding_coin = record
+            .funding_coin
+            .clone()
+            .ok_or(ChainError::InvalidEvidence)?;
+        let canonical_funding_coin = funding_coin.to_canonical_coin().map_err(map_chain_error)?;
+        if canonical_funding_coin.outpoint.transaction_hash.as_bytes() != lock.funding_id.as_bytes()
+            || canonical_funding_coin.outpoint.index != record.output_index
+            || canonical_funding_coin.value.get() != previous_value
+            || canonical_funding_coin.coinbase
+            || canonical_funding_coin.address.version != 0
+            || canonical_funding_coin.address.hash != Sha3_256::digest(&record.script).to_vec()
+            || canonical_funding_coin.covenant != Covenant::default()
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let input_coins = vec![canonical_funding_coin];
         let sequence = if refund { u32::MAX - 1 } else { u32::MAX };
         let locktime = if refund {
             u32::try_from(lock.absolute_timelock).map_err(|_| ChainError::InvalidEvidence)?
@@ -2164,7 +2375,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             locktime,
         };
         let fee_rate = self.backend.estimate_fee_rate(6).map_err(map_chain_error)?;
-        let fee = transaction_fee(&transaction, fee_rate).map_err(map_chain_error)?;
+        let fee = canonical_policy_minimum_fee(&transaction, &input_coins, fee_rate)
+            .map_err(map_chain_error)?;
         if fee > maximum_fee
             || fee.get() >= u128::from(previous_value)
             || u128::from(previous_value) - fee.get() < config.dust_threshold.get()
@@ -2189,7 +2401,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         validate_witness_only_change(&unsigned_transaction, &signed).map_err(map_chain_error)?;
         drop(store);
         let quote = self
-            .quote_final_transaction(&signed, fee, maximum_fee)
+            .quote_final_transaction(&signed, &input_coins, fee, maximum_fee)
             .map_err(map_chain_error)?;
         if self.cache_read().map_err(map_chain_error)?.account != account {
             return Err(ChainError::InvalidEvidence);
@@ -2207,6 +2419,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             session_id,
             action,
             signed,
+            vec![funding_coin],
             fee,
             maximum_fee,
             quote,
@@ -2260,7 +2473,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 != recovery
                     .last_tip
                     .map(|old_tip| old_tip.height.min(tip.height));
-        let coins = reconcile_coins(indexed_coins, &addresses)?;
+        let coins = reconcile_coins(indexed_coins, &addresses, binding.tip.height)?;
         let transactions = self.reconcile_transactions(
             &history,
             &addresses,
@@ -2512,6 +2725,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 "persisted Handshake send does not match retry",
             ));
         }
+        canonical_input_coins(&state.plan.inputs).map_err(|_| ChainError::InvalidEvidence)?;
         Self::prepared_send_from_plan(&state.plan)
     }
 
@@ -2527,8 +2741,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .fee_quote
             .as_ref()
             .ok_or(HnsWalletError::InvalidPreparedArtifact)?;
+        let input_coins = canonical_evidence_coins(&prepared.input_coins)?;
         validate_final_fee_quote(
             &prepared.signed_transaction,
+            &input_coins,
             fee_quote,
             fee_quote.binding,
             fee_quote.mempool,
@@ -2772,6 +2988,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     fn quote_final_transaction_once(
         &self,
         raw: &[u8],
+        input_coins: &[Coin],
         expected_fee: BaseUnits,
         maximum_fee: BaseUnits,
     ) -> Result<HnsTransactionFeeQuote, HnsWalletError> {
@@ -2781,10 +2998,22 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .mempool_binding
             .ok_or(HnsWalletError::StaleNodeSnapshot)?;
         drop(cache);
-        let quote =
-            self.backend
-                .quote_transaction_fee(raw, DEFAULT_FEE_TARGET_BLOCKS, binding, mempool)?;
-        validate_final_fee_quote(raw, &quote, binding, mempool, expected_fee, maximum_fee)?;
+        let quote = self.backend.quote_transaction_fee(
+            raw,
+            input_coins,
+            DEFAULT_FEE_TARGET_BLOCKS,
+            binding,
+            mempool,
+        )?;
+        validate_final_fee_quote(
+            raw,
+            input_coins,
+            &quote,
+            binding,
+            mempool,
+            expected_fee,
+            maximum_fee,
+        )?;
         Ok(quote)
     }
 
@@ -2793,14 +3022,15 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     fn quote_final_transaction(
         &self,
         raw: &[u8],
+        input_coins: &[Coin],
         expected_fee: BaseUnits,
         maximum_fee: BaseUnits,
     ) -> Result<HnsTransactionFeeQuote, HnsWalletError> {
-        match self.quote_final_transaction_once(raw, expected_fee, maximum_fee) {
+        match self.quote_final_transaction_once(raw, input_coins, expected_fee, maximum_fee) {
             Err(HnsWalletError::StaleNodeSnapshot)
             | Err(HnsWalletError::FeeQuoteInputUnavailable) => {
                 self.reconcile()?;
-                self.quote_final_transaction_once(raw, expected_fee, maximum_fee)
+                self.quote_final_transaction_once(raw, input_coins, expected_fee, maximum_fee)
             }
             result => result,
         }
@@ -3849,6 +4079,7 @@ fn coalesce_transaction_history(
 fn reconcile_coins(
     indexed: Vec<IndexedWalletCoin>,
     addresses: &[DerivedHnsAddress],
+    tip_height: u64,
 ) -> Result<Vec<TrackedHnsCoin>, HnsWalletError> {
     if indexed.len() > MAX_WALLET_COINS {
         return Err(HnsWalletError::InvalidAmount);
@@ -3862,18 +4093,31 @@ fn reconcile_coins(
         let address = addresses
             .get(indexed_coin.script_index as usize)
             .ok_or(HnsWalletError::InvalidEvidence)?;
+        let confirmed_height = indexed_coin
+            .coin
+            .confirmed_height
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        let confirmed_height = u64::from(confirmed_height);
+        let expected_confirmations = tip_height
+            .checked_sub(confirmed_height)
+            .and_then(|depth| depth.checked_add(1))
+            .and_then(|depth| u32::try_from(depth).ok())
+            .ok_or(HnsWalletError::InvalidEvidence)?;
         if indexed_coin.coin.value.is_zero()
+            || indexed_coin.coin.confirmation_count != expected_confirmations
             || indexed_coin.output_address.version != 0
             || indexed_coin.output_address.hash.as_slice() != address.program.as_slice()
             || restore_derivation_key(address.derivation).is_err()
         {
             return Err(HnsWalletError::InvalidEvidence);
         }
-        coins.push(TrackedHnsCoin {
+        let tracked = TrackedHnsCoin {
             coin: indexed_coin.coin,
             derivation: address.derivation,
             address_program: address.program.clone(),
-        });
+        };
+        tracked.to_canonical_coin()?;
+        coins.push(tracked);
     }
     coins.sort_by_key(|coin| coin.coin.outpoint);
     Ok(coins)
@@ -4693,8 +4937,9 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             let txid = wallet_transaction_hash(&transaction).map_err(map_chain_error)?;
             (pending_approval, signed, txid)
         };
+        let input_coins = canonical_input_coins(&plan.inputs).map_err(map_chain_error)?;
         let quote = self
-            .quote_final_transaction(&signed, plan.fee, plan.maximum_fee)
+            .quote_final_transaction(&signed, &input_coins, plan.fee, plan.maximum_fee)
             .map_err(map_chain_error)?;
         let commit_now = self.clock.now_unix().map_err(map_chain_error)?;
         if commit_now >= plan.expires_at_unix {
@@ -4783,8 +5028,11 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
                 .fee_quote
                 .as_ref()
                 .ok_or(ChainError::InvalidEvidence)?;
+            let input_coins =
+                canonical_input_coins(&stored.state.plan.inputs).map_err(map_chain_error)?;
             validate_final_fee_quote(
                 &raw,
+                &input_coins,
                 prior_quote,
                 prior_quote.binding,
                 prior_quote.mempool,
@@ -4799,8 +5047,15 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             .signed_transaction
             .clone()
             .ok_or(ChainError::InvalidEvidence)?;
+        let input_coins =
+            canonical_input_coins(&stored.state.plan.inputs).map_err(map_chain_error)?;
         let quote = self
-            .quote_final_transaction(&raw, stored.state.plan.fee, stored.state.plan.maximum_fee)
+            .quote_final_transaction(
+                &raw,
+                &input_coins,
+                stored.state.plan.fee,
+                stored.state.plan.maximum_fee,
+            )
             .map_err(map_chain_error)?;
         let submission_started_at = self.clock.now_unix().map_err(map_chain_error)?;
         let (submission_revision, submission_state) = {
@@ -5021,8 +5276,11 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
                 .fee_quote
                 .as_ref()
                 .ok_or(ChainError::InvalidEvidence)?;
+            let input_coins =
+                canonical_evidence_coins(&stored.state.input_coins).map_err(map_chain_error)?;
             validate_final_fee_quote(
                 &stored.state.signed_transaction,
+                &input_coins,
                 prior_quote,
                 prior_quote.binding,
                 prior_quote.mempool,
@@ -5104,6 +5362,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             account.config.dust_threshold,
         )
         .map_err(map_chain_error)?;
+        let policy_input_evidence = input_coin_evidence(&selected).map_err(map_chain_error)?;
         let plan = HnsSpendPlan {
             wallet_id: account.config.wallet_id,
             account_id: account.config.account_id,
@@ -5131,9 +5390,10 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         .map_err(map_chain_error)?;
         let signed = sign_payment_plan(&store, &account, &plan).map_err(map_chain_error)?;
         validate_signed_payment_plan(&plan, &signed).map_err(map_chain_error)?;
+        let input_coins = canonical_input_coins(&plan.inputs).map_err(map_chain_error)?;
         drop(store);
         let quote = self
-            .quote_final_transaction(&signed, fee, request.maximum_fee)
+            .quote_final_transaction(&signed, &input_coins, fee, request.maximum_fee)
             .map_err(map_chain_error)?;
         let cache = self.cache_read().map_err(map_chain_error)?;
         if cache.account != account {
@@ -5149,6 +5409,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
                 request.session_id,
                 HnsSettlementAction::Lock,
                 signed,
+                policy_input_evidence,
                 fee,
                 request.maximum_fee,
                 quote,
@@ -5195,6 +5456,9 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         let program = Sha3_256::digest(&script).to_vec();
         let transaction = Transaction::decode(&request.transaction_or_receipt)
             .map_err(|_| ChainError::InvalidEvidence)?;
+        if transaction.is_coinbase() {
+            return Err(ChainError::InvalidEvidence);
+        }
         let txid = wallet_transaction_hash(&transaction).map_err(map_chain_error)?;
         let evidence = self
             .backend
@@ -5234,6 +5498,21 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             return Err(ChainError::InvalidEvidence);
         }
         let output_index = u32::try_from(matches[0]).map_err(|_| ChainError::InvalidEvidence)?;
+        let funding_output = &transaction.outputs[matches[0]];
+        let funding_coin = HnsInputCoinEvidence::from_canonical_coin(&Coin {
+            outpoint: Outpoint {
+                transaction_hash: CanonicalTransactionHash::new(txid.into_bytes()),
+                index: output_index,
+            },
+            value: funding_output.value,
+            height: Height::new(
+                u32::try_from(inclusion.height).map_err(|_| ChainError::InvalidEvidence)?,
+            ),
+            coinbase: false,
+            address: funding_output.address.clone(),
+            covenant: funding_output.covenant.clone(),
+        })
+        .map_err(map_chain_error)?;
         let terms =
             serde_json::to_vec(&request.expected).map_err(|_| ChainError::InvalidEvidence)?;
         let mut evidence_hasher = Sha256::new();
@@ -5265,6 +5544,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             verified: verified.clone(),
             output_index,
             script,
+            funding_coin: Some(funding_coin),
         };
         let now = self.clock.now_unix().map_err(map_chain_error)?;
         let mut store = self.store_lock().map_err(map_chain_error)?;
@@ -5456,8 +5736,114 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HnsLocalFeePolicyEvidence {
+    transaction_weight: usize,
+    transaction_sigops: u32,
+    policy_virtual_size: usize,
+    minimum_fee: BaseUnits,
+}
+
+fn local_fee_policy_evidence(
+    transaction: &Transaction,
+    input_coins: &[Coin],
+    rate_atomic_units_per_1000_policy_vbytes: BaseUnits,
+) -> Result<HnsLocalFeePolicyEvidence, HnsWalletError> {
+    if transaction.inputs.is_empty()
+        || transaction.is_coinbase()
+        || transaction.inputs.len() != input_coins.len()
+        || rate_atomic_units_per_1000_policy_vbytes.is_zero()
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let transaction_weight = transaction
+        .weight()
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+    let transaction_weight_u32 = u32::try_from(transaction_weight)
+        .map_err(|_| HnsWalletError::InvalidFeeQuoteTransaction)?;
+    let transaction_sigops = transaction_sigops(transaction, input_coins)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    if transaction_weight_u32 > MAX_POLICY_TRANSACTION_WEIGHT.get()
+        || transaction_sigops > MAX_POLICY_TRANSACTION_SIGOPS.get()
+    {
+        return Err(HnsWalletError::InvalidFeeQuoteTransaction);
+    }
+    let policy_virtual_size = transaction_policy_virtual_size(transaction, input_coins)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    let rate = u32::try_from(rate_atomic_units_per_1000_policy_vbytes.get())
+        .map_err(|_| HnsWalletError::InvalidFeeQuote)?;
+    let minimum_fee = minimum_policy_fee(policy_virtual_size, FeeRate::new(rate))
+        .map_err(|_| HnsWalletError::Arithmetic)?;
+    let policy_virtual_size = usize::try_from(policy_virtual_size.get())
+        .map_err(|_| HnsWalletError::InvalidFeeQuoteTransaction)?;
+    Ok(HnsLocalFeePolicyEvidence {
+        transaction_weight,
+        transaction_sigops,
+        policy_virtual_size,
+        minimum_fee: BaseUnits::new(u128::from(minimum_fee.get())),
+    })
+}
+
+fn actual_transaction_fee(
+    transaction: &Transaction,
+    input_coins: &[Coin],
+) -> Result<BaseUnits, HnsWalletError> {
+    if transaction.inputs.len() != input_coins.len()
+        || transaction
+            .inputs
+            .iter()
+            .zip(input_coins)
+            .any(|(input, coin)| input.previous_output != coin.outpoint)
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let inputs = input_coins.iter().try_fold(0_u128, |total, coin| {
+        total
+            .checked_add(u128::from(coin.value.get()))
+            .ok_or(HnsWalletError::Arithmetic)
+    })?;
+    let outputs = transaction
+        .outputs
+        .iter()
+        .try_fold(0_u128, |total, output| {
+            total
+                .checked_add(u128::from(output.value.get()))
+                .ok_or(HnsWalletError::Arithmetic)
+        })?;
+    let fee = inputs
+        .checked_sub(outputs)
+        .ok_or(HnsWalletError::InvalidEvidence)?;
+    Ok(BaseUnits::new(fee))
+}
+
+pub(crate) fn validate_local_fee_quote_evidence(
+    transaction: &Transaction,
+    input_coins: &[Coin],
+    quote: &HnsTransactionFeeQuote,
+) -> Result<(), HnsWalletError> {
+    let local = local_fee_policy_evidence(
+        transaction,
+        input_coins,
+        BaseUnits::new(u128::from(quote.rate_atomic_units_per_1000_policy_vbytes)),
+    )?;
+    let actual_fee = actual_transaction_fee(transaction, input_coins)?;
+    let shortfall = local.minimum_fee.get().saturating_sub(actual_fee.get());
+    if quote.transaction_weight != local.transaction_weight
+        || quote.transaction_sigops != local.transaction_sigops
+        || quote.sigop_adjusted_policy_vbytes != local.policy_virtual_size
+        || quote.minimum_policy_fee != local.minimum_fee
+        || quote.actual_fee != actual_fee
+        || quote.meets_minimum_policy_fee != (actual_fee >= local.minimum_fee)
+        || quote.minimum_policy_fee_shortfall.get() != shortfall
+    {
+        return Err(HnsWalletError::InvalidFeeQuote);
+    }
+    Ok(())
+}
+
 fn validate_final_fee_quote(
     raw: &[u8],
+    input_coins: &[Coin],
     quote: &HnsTransactionFeeQuote,
     binding: SnapshotBinding,
     mempool: MempoolSnapshotBinding,
@@ -5474,16 +5860,13 @@ fn validate_final_fee_quote(
         return Err(HnsWalletError::InvalidPreparedArtifact);
     }
     let txid = wallet_transaction_hash(&transaction)?;
-    let weight = transaction
-        .weight()
-        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+    validate_local_fee_quote_evidence(&transaction, input_coins, quote)?;
     if maximum_fee.is_zero()
         || expected_fee > maximum_fee
         || quote.txid != txid
         || quote.binding != binding
         || quote.mempool != mempool
         || quote.target_blocks != DEFAULT_FEE_TARGET_BLOCKS
-        || quote.transaction_weight != weight
         || quote.transaction_weight == 0
         || quote.sigop_adjusted_policy_vbytes == 0
         || quote.rate_atomic_units_per_1000_policy_vbytes == 0
@@ -5584,7 +5967,8 @@ fn build_unsigned_payment(
             Some((change.clone(), 1)),
             amount,
         )?;
-        let change_fee = transaction_fee(&provisional, fee_rate)?;
+        let input_coins = canonical_input_coins(&selected)?;
+        let change_fee = canonical_policy_minimum_fee(&provisional, &input_coins, fee_rate)?;
         let required = u128::from(amount)
             .checked_add(change_fee.get())
             .ok_or(HnsWalletError::Arithmetic)?;
@@ -5608,7 +5992,7 @@ fn build_unsigned_payment(
         }
 
         let no_change = unsigned_payment_transaction(&selected, destination.clone(), None, amount)?;
-        let minimum_fee = transaction_fee(&no_change, fee_rate)?;
+        let minimum_fee = canonical_policy_minimum_fee(&no_change, &input_coins, fee_rate)?;
         let actual_fee = BaseUnits::new(total - u128::from(amount));
         if actual_fee >= minimum_fee && actual_fee <= maximum_fee {
             return Ok((no_change, selected, actual_fee));
@@ -5658,19 +6042,17 @@ fn unsigned_payment_transaction(
     })
 }
 
-fn transaction_fee(
+fn canonical_policy_minimum_fee(
     transaction: &Transaction,
-    unqualified_node_rate_per_kvb: BaseUnits,
+    input_coins: &[Coin],
+    unqualified_node_rate_per_policy_kvb: BaseUnits,
 ) -> Result<BaseUnits, HnsWalletError> {
-    let weight = transaction
-        .weight()
-        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
-    let product = unqualified_node_rate_per_kvb
-        .get()
-        .checked_mul(weight as u128)
-        .ok_or(HnsWalletError::Arithmetic)?;
-    let fee = product.checked_add(999).ok_or(HnsWalletError::Arithmetic)? / 1_000;
-    Ok(BaseUnits::new(fee))
+    local_fee_policy_evidence(
+        transaction,
+        input_coins,
+        unqualified_node_rate_per_policy_kvb,
+    )
+    .map(|evidence| evidence.minimum_fee)
 }
 
 fn sign_payment_plan(
@@ -5678,9 +6060,24 @@ fn sign_payment_plan(
     account: &HnsAccountRecord,
     plan: &HnsSpendPlan,
 ) -> Result<Vec<u8>, HnsWalletError> {
-    let mut transaction = Transaction::decode(&plan.unsigned_transaction)
+    let transaction = Transaction::decode(&plan.unsigned_transaction)
         .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
-    if transaction.inputs.len() != plan.inputs.len() || transaction.inputs.is_empty() {
+    let expected_roles = vec![KeyRole::HnsCoin; plan.inputs.len()];
+    sign_ordered_p2pkh_inputs(store, account, transaction, &plan.inputs, &expected_roles)
+}
+
+pub(crate) fn sign_ordered_p2pkh_inputs(
+    store: &WalletStore,
+    account: &HnsAccountRecord,
+    mut transaction: Transaction,
+    inputs: &[TrackedHnsCoin],
+    expected_roles: &[KeyRole],
+) -> Result<Vec<u8>, HnsWalletError> {
+    if transaction.inputs.is_empty()
+        || transaction.inputs.len() != inputs.len()
+        || inputs.len() != expected_roles.len()
+        || inputs.len() > MAX_TRANSACTION_INPUTS
+    {
         return Err(HnsWalletError::InvalidPreparedArtifact);
     }
     let seed = store
@@ -5689,15 +6086,23 @@ fn sign_payment_plan(
             SecretKind::RecoverySeed,
         )?
         .ok_or(HnsWalletError::MissingSeed)?;
-    for (index, coin) in plan.inputs.iter().enumerate() {
-        let expected = Outpoint {
-            transaction_hash: CanonicalTransactionHash::new(
-                coin.coin.outpoint.transaction.into_bytes(),
-            ),
-            index: coin.coin.outpoint.output_index,
+    for (index, (coin, expected_role)) in inputs.iter().zip(expected_roles).enumerate() {
+        let expected_tag = match *expected_role {
+            KeyRole::HnsCoin => HNS_COIN_DERIVATION_TAG,
+            KeyRole::HnsName => HNS_NAME_DERIVATION_TAG,
+            _ => return Err(HnsWalletError::InvalidPreparedArtifact),
         };
-        if transaction.inputs[index].previous_output != expected
-            || coin.derivation.role != KeyRole::HnsCoin
+        let (actual_tag, _, _) = restore_derivation_key(coin.derivation)?;
+        if coin.derivation.role != *expected_role
+            || coin.derivation.account != account_number(account)
+            || actual_tag != expected_tag
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let canonical = coin.to_canonical_coin()?;
+        if transaction.inputs[index].previous_output != canonical.outpoint
+            || canonical.address.version != 0
+            || canonical.address.hash != coin.address_program
         {
             return Err(HnsWalletError::InvalidPreparedArtifact);
         }
@@ -5712,8 +6117,7 @@ fn sign_payment_plan(
         if public_key_hash(&public_bytes)?.as_slice() != coin.address_program {
             return Err(HnsWalletError::InvalidPreparedArtifact);
         }
-        let previous_value =
-            u64::try_from(coin.coin.value.get()).map_err(|_| HnsWalletError::InvalidAmount)?;
+        let previous_value = canonical.value.get();
         let script = p2pkh_script(&coin.address_program)?;
         let digest = signature_hash(&transaction, index, &script, previous_value, SIGHASH_ALL)
             .map_err(|_| HnsWalletError::Signing)?;
@@ -5921,6 +6325,7 @@ fn same_prepared_settlement(
         && artifact.stage == HnsSettlementStage::Prepared
         && stored.transaction == artifact.transaction
         && stored.signed_transaction == artifact.signed_transaction
+        && stored.input_coins == artifact.input_coins
         && stored.fee == artifact.fee
         && stored.maximum_fee == artifact.maximum_fee
         && stored.expires_at_unix == artifact.expires_at_unix
@@ -5934,6 +6339,7 @@ fn same_verified_settlement_binding(
     stored.expected == candidate.expected
         && stored.output_index == candidate.output_index
         && stored.script == candidate.script
+        && stored.funding_coin == candidate.funding_coin
         && stored.verified.module == candidate.verified.module
         && stored.verified.session_id == candidate.verified.session_id
         && stored.verified.funding_id == candidate.verified.funding_id
@@ -6652,7 +7058,9 @@ mod tests {
                     },
                     value: BaseUnits::new(1_000),
                     confirmation_count: 10,
+                    confirmed_height: Some(491),
                     coinbase: false,
+                    covenant: Covenant::default().encode().expect("covenant"),
                     name_locked: false,
                 },
                 script_index: 0,
@@ -6662,6 +7070,7 @@ mod tests {
                 },
             }],
             &[address],
+            500,
         )
         .expect("track name output");
         assert_eq!(tracked.len(), 1);
@@ -6700,7 +7109,14 @@ mod tests {
                 },
                 value: BaseUnits::new(7),
                 confirmation_count: 1,
+                confirmed_height: Some(500),
                 coinbase: false,
+                covenant: Covenant {
+                    kind: CovenantKind::Update,
+                    items: Vec::new(),
+                }
+                .encode()
+                .expect("name covenant"),
                 name_locked: true,
             },
             WalletCoin {
@@ -6710,7 +7126,9 @@ mod tests {
                 },
                 value: BaseUnits::new(5),
                 confirmation_count: 1,
+                confirmed_height: Some(500),
                 coinbase: false,
+                covenant: Covenant::default().encode().expect("covenant"),
                 name_locked: false,
             },
             WalletCoin {
@@ -6720,7 +7138,9 @@ mod tests {
                 },
                 value: BaseUnits::new(4),
                 confirmation_count: 2,
+                confirmed_height: Some(499),
                 coinbase: false,
+                covenant: Covenant::default().encode().expect("covenant"),
                 name_locked: false,
             },
         ];
@@ -6732,6 +7152,237 @@ mod tests {
             .coins
             .iter()
             .all(|coin| !coin.name_locked && !coin.coinbase));
+    }
+
+    #[test]
+    fn exact_coin_evidence_rejects_legacy_and_mismatched_rows() {
+        let covenant = Covenant::default().encode().expect("covenant");
+        let tracked = TrackedHnsCoin {
+            coin: WalletCoin {
+                outpoint: HnsOutpoint {
+                    transaction: TransactionHash::new([61; 32]),
+                    output_index: 2,
+                },
+                value: BaseUnits::new(50_000),
+                confirmation_count: 4,
+                confirmed_height: Some(497),
+                coinbase: false,
+                covenant: covenant.clone(),
+                name_locked: false,
+            },
+            derivation: DerivationReference {
+                role: KeyRole::HnsCoin,
+                account: 7,
+                change: 0,
+                index: 3,
+            },
+            address_program: vec![62; 20],
+        };
+        let canonical = tracked.to_canonical_coin().expect("canonical coin");
+        assert_eq!(canonical.height, Height::new(497));
+        assert_eq!(canonical.covenant.encode().expect("encode"), covenant);
+        assert_eq!(canonical.address.hash, vec![62; 20]);
+
+        let mut legacy = serde_json::to_value(&tracked).expect("tracked coin");
+        let coin = legacy
+            .get_mut("coin")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("coin object");
+        coin.remove("confirmed_height");
+        coin.remove("covenant");
+        let legacy: TrackedHnsCoin = serde_json::from_value(legacy).expect("legacy row decodes");
+        assert!(matches!(
+            legacy.to_canonical_coin(),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+
+        let mut mismatched = tracked;
+        mismatched.coin.name_locked = true;
+        assert!(matches!(
+            mismatched.to_canonical_coin(),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+    }
+
+    #[test]
+    fn canonical_policy_quote_is_recomputed_from_ordered_input_coins() {
+        let input_coin = Coin {
+            outpoint: Outpoint {
+                transaction_hash: CanonicalTransactionHash::new([71; 32]),
+                index: 0,
+            },
+            value: Dollarydoos::new(100_000),
+            height: Height::new(450),
+            coinbase: false,
+            address: Address::new(0, vec![72; 20]).expect("address"),
+            covenant: Covenant::default(),
+        };
+        let mut transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: input_coin.outpoint,
+                sequence: u32::MAX,
+                witness: Witness {
+                    items: vec![vec![0; 65], vec![0; 33]],
+                },
+            }],
+            outputs: vec![Output {
+                value: input_coin.value,
+                address: Address::new(0, vec![73; 20]).expect("address"),
+                covenant: Covenant::default(),
+            }],
+            locktime: 0,
+        };
+        let rate = BaseUnits::new(1_000);
+        let fee = canonical_policy_minimum_fee(&transaction, &[input_coin.clone()], rate)
+            .expect("minimum fee");
+        transaction.outputs[0].value = Dollarydoos::new(
+            input_coin.value.get() - u64::try_from(fee.get()).expect("bounded fee"),
+        );
+        let local = local_fee_policy_evidence(&transaction, &[input_coin.clone()], rate)
+            .expect("policy evidence");
+        let binding = test_snapshot(8);
+        let mempool = test_mempool(9);
+        let mut quote = HnsTransactionFeeQuote {
+            txid: wallet_transaction_hash(&transaction).expect("txid"),
+            binding,
+            mempool,
+            target_blocks: DEFAULT_FEE_TARGET_BLOCKS,
+            rate_atomic_units_per_1000_policy_vbytes: 1_000,
+            rate_sample_count: 0,
+            rate_source: HnsFeeRateSource::MinimumRelay,
+            transaction_weight: local.transaction_weight,
+            transaction_sigops: local.transaction_sigops,
+            sigop_adjusted_policy_vbytes: local.policy_virtual_size,
+            minimum_policy_fee: local.minimum_fee,
+            actual_fee: fee,
+            meets_minimum_policy_fee: true,
+            minimum_policy_fee_shortfall: BaseUnits::ZERO,
+        };
+        assert!(
+            validate_local_fee_quote_evidence(&transaction, &[input_coin.clone()], &quote).is_ok()
+        );
+        assert!(matches!(
+            validate_final_fee_quote(
+                &transaction.encode().expect("transaction"),
+                &[input_coin.clone()],
+                &quote,
+                binding,
+                mempool,
+                fee,
+                fee,
+            ),
+            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        ));
+        quote.transaction_sigops = quote.transaction_sigops.saturating_add(1);
+        assert!(matches!(
+            validate_local_fee_quote_evidence(&transaction, &[input_coin], &quote),
+            Err(HnsWalletError::InvalidFeeQuote)
+        ));
+    }
+
+    #[test]
+    fn ordered_p2pkh_signer_enforces_coin_and_name_roles() {
+        let mut store = WalletStore::create(":memory:", "passphrase").expect("store");
+        let account = HnsAccountRecord {
+            config: test_runtime_config(),
+            next_receive_index: 0,
+            next_change_index: 0,
+            next_name_index: 0,
+            external_scan_end: 99,
+            internal_scan_end: 99,
+            name_scan_end: 99,
+            last_used_external: None,
+            last_used_internal: None,
+            last_used_name: None,
+        };
+        store
+            .put_secret(
+                account.config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[81; 64],
+                1,
+            )
+            .expect("seed");
+        let make_coin = |role, index, tx_byte, value| {
+            let derivation = DerivationReference {
+                role,
+                account: account_number(&account),
+                change: 0,
+                index,
+            };
+            let public = derive_hns_public_key(&store, account.config.wallet_id, derivation)
+                .expect("public key");
+            let program = public_key_hash(&public).expect("program").to_vec();
+            let covenant = if role == KeyRole::HnsName {
+                Covenant {
+                    kind: CovenantKind::Update,
+                    items: Vec::new(),
+                }
+            } else {
+                Covenant::default()
+            };
+            TrackedHnsCoin {
+                coin: WalletCoin {
+                    outpoint: HnsOutpoint {
+                        transaction: TransactionHash::new([tx_byte; 32]),
+                        output_index: 0,
+                    },
+                    value: BaseUnits::new(value),
+                    confirmation_count: 5,
+                    confirmed_height: Some(496),
+                    coinbase: false,
+                    covenant: covenant.encode().expect("covenant"),
+                    name_locked: role == KeyRole::HnsName,
+                },
+                derivation,
+                address_program: program,
+            }
+        };
+        let name = make_coin(KeyRole::HnsName, 1, 82, 50_000);
+        let fee = make_coin(KeyRole::HnsCoin, 2, 83, 10_000);
+        let inputs = vec![name, fee];
+        let transaction = Transaction {
+            version: 0,
+            inputs: inputs
+                .iter()
+                .map(|coin| Input {
+                    previous_output: coin.to_canonical_coin().expect("coin").outpoint,
+                    sequence: u32::MAX,
+                    witness: Witness::default(),
+                })
+                .collect(),
+            outputs: vec![Output {
+                value: Dollarydoos::new(59_000),
+                address: Address::new(0, vec![84; 20]).expect("address"),
+                covenant: Covenant::default(),
+            }],
+            locktime: 0,
+        };
+        let signed = sign_ordered_p2pkh_inputs(
+            &store,
+            &account,
+            transaction.clone(),
+            &inputs,
+            &[KeyRole::HnsName, KeyRole::HnsCoin],
+        )
+        .expect("ordered signing");
+        let signed = Transaction::decode(&signed).expect("signed transaction");
+        assert!(signed.inputs.iter().all(|input| {
+            input.witness.items.len() == 2
+                && input.witness.items[0].len() == 65
+                && input.witness.items[1].len() == 33
+        }));
+        assert!(matches!(
+            sign_ordered_p2pkh_inputs(
+                &store,
+                &account,
+                transaction,
+                &inputs,
+                &[KeyRole::HnsCoin, KeyRole::HnsCoin],
+            ),
+            Err(HnsWalletError::InvalidPreparedArtifact)
+        ));
     }
 
     #[test]
