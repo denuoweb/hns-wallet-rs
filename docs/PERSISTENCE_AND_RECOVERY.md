@@ -27,7 +27,8 @@ compare-and-swap revisions. Bounded heterogeneous preparation batches
 authenticate every current ciphertext and revision before writing, then commit
 the wallet account, workflow, and all input-reservation saves/deletes together.
 Duplicate `(entity kind, record ID)` operations and stale writers fail before a
-partial batch becomes visible. Secret record kinds are immutable.
+partial batch becomes visible. Secret record IDs cannot change kinds; recovery
+seed bytes are additionally immutable once inserted.
 
 HNS authorization can authenticate and return a pending approval without
 consuming it. After exact signed-byte fee quoting succeeds, a bounded immediate
@@ -133,6 +134,28 @@ descriptor/local-chain/transaction/output authority. The encrypted wallet store
 records an authenticated birthday, a distinct non-genesis new-wallet recovery
 anchor, bounded recent checkpoints, supervisor sequence and phase,
 transaction/output reconciliation mirrors, and signed broadcast intents.
+
+Bitcoin swap keys add an encrypted entity namespace without a plaintext schema
+table or seed copy. Each role allocation atomically writes an immutable
+wallet/session/role binding and redundant binding claim while advancing its
+network/account/role high-water record alongside a fixed namespace anchor. The
+binding authenticates the scheme version, exact reference, compressed public
+key, recovery-seed commitment, opaque frozen-terms commitment, and allocation
+time. Existing exact bindings are idempotent; the store rejects generic single
+or batch deletion of allocation rows. Recovery seeds are insert-once and may be
+reinserted only with identical bytes; replacement or generic deletion is
+rejected. Recovery re-derives from that encrypted seed and requires exact seed-
+commitment and public-key matches before returning the zeroizing in-memory
+secret handle. Counter, reference, record-kind, revision, time, or terms
+mismatch fails closed.
+
+The allocation-specific KDF additionally binds wallet ID, session ID, and terms
+commitment, so a stale or copied counter cannot reuse a key for a different
+logical swap. A full database snapshot rollback cannot be detected solely from
+inside the rolled-back database and can still lose an active binding or choose
+a different numeric reference. Session IDs must never be recycled, and a
+current encrypted database backup is required to recover already active swaps;
+the mnemonic alone is not an allocation journal.
 
 A sync records `synchronizing`, applies the Kyoto update, persists BDK, records
 `reconciling`, applies encrypted mirror changes in bounded chunks, and commits

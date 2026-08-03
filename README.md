@@ -34,7 +34,7 @@ can prove ownership from the committed bytes.
 - `hns-wallet-provider`: hostile-page request, permission, and approval core.
 - `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery schemas.
 - `hns-wallet-market`: price-bound reservations and atomic-swap recovery.
-- `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, separated swap keys, and Bitcoin HTLC adapter.
+- `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, encrypted session-bound swap-key allocation primitive, and Bitcoin HTLC adapter.
 - `hns-wallet-ethereum`: offline native-ETH account derivation plus
   release-gated Helios/HTLC policy.
 - `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.

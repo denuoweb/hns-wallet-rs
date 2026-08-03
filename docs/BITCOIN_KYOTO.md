@@ -122,10 +122,11 @@ separate network code prevents testnet, testnet4, signet, and regtest from
 sharing swap keys. This application-private HKDF scheme is disjoint from BIP84
 at the KDF boundary rather than relying on an unregistered BIP purpose number.
 
-Public recovery vectors below were calculated from the BIP-39 English
+Crate-local context-free regression vectors below were calculated from the BIP-39 English
 `abandon` eleven times followed by `about` mnemonic, its empty-passphrase
 64-byte seed, and the exact salt/info encoding above. They are embedded as
-source conformance assertions; no private material is recorded:
+source conformance assertions; no private material is recorded. These are not
+outputs of the durable allocation API:
 
 | Reference | compressed public key |
 | --- | --- |
@@ -135,15 +136,53 @@ source conformance assertions; no private material is recorded:
 
 The in-memory handle exposes only its role-bound public half, redacts its secret
 in `Debug`, cannot be serialized or cloned, and zeroizes its 32-byte secret on
-drop. A serializable public reference carries the exact recovery coordinates.
-The HTLC constructor can place that public key only in its declared receiver or
-refund position. The serialized reference also binds scheme version 1 and
-rejects other versions. Each swap session must authenticate and durably persist
-the exact scheme version, network, account, role, and key index before an
-irreversible action; deterministic regeneration from known coordinates is not
-a bounded discovery scan. That session allocation/persistence and signed-spend
-integration are still missing, no signing or value permit is exposed, and this
-source does not advertise atomic settlement.
+drop. The serializable numeric reference is only one component of a complete
+allocation; wallet, session, and terms bindings are also required for recovery.
+Raw context-free derivation is crate-private. The role-aware HTLC constructor
+requires the non-serializable derived handle and can place its public key only
+in its declared receiver or refund position. The reference binds scheme
+version 1 and rejects other versions.
+
+The durable allocation KDF uses its own salt and the fixed-width info sequence
+`HSAK || wallet_id || session_id || terms_commitment || scheme_version ||
+coin_type || network_code || account || role || index || counter`. The wallet ID
+is 16 bytes, session and terms commitments are 32 bytes each, the scheme version
+is an unsigned big-endian `u16`, the remaining integers are unsigned big-endian
+`u32`, and the rejection counter is one byte. This prevents the same seed and
+numeric index in a copied or stale profile from producing the same key for a
+different wallet, session, or terms commitment.
+
+The same mnemonic used by the crate-local vectors pins the durable HSAK byte
+contract to this exact allocation vector:
+
+| wallet ID | session ID | terms commitment | reference | compressed public key |
+| --- | --- | --- | --- | --- |
+| `01` repeated 16 bytes | `02` repeated 32 bytes | `03` repeated 32 bytes | regtest, receiver, account 7, index 0, scheme 1 | `03c93cca65310a3c421ab09761fa9ce7ffeae7aa17f3f0974a48536c3ec1d51d9d` |
+
+The allocation primitive requires a nonzero opaque terms commitment and
+durably allocates each receiver/refund role. Its caller remains responsible for
+hashing the complete canonical settlement terms and invoking allocation before
+an irreversible action. The encrypted store commits a namespace anchor,
+monotonic high-water counter, immutable wallet/session/role binding, and binding
+claim in one CAS batch. The binding contains the scheme version, exact
+reference, compressed public key, seed commitment, terms commitment, and
+allocation time; it never contains seed or scalar bytes. Same-session exact-
+term retries are idempotent. Rebinding, counter rollback/wrap, a backward clock,
+corrupt variants, and a second CAS conflict fail closed. Recovery validates all
+four records, the immutable seed commitment, and the re-derived public key
+before returning the zeroizing secret handle.
+
+Recovery-seed insertion is idempotent only for identical bytes; replacement or
+generic deletion fails closed. Allocation rows are also protected from generic
+single or batch deletion. These controls detect isolated mutation, not a whole
+database snapshot rollback. Session IDs must never be recycled, and recovering
+an already active allocation requires its current encrypted database records.
+
+This source addition does not expose a signing or value permit and does not
+advertise atomic settlement. The allocator is not yet wired into the settlement
+supervisor. Signed-spend supervision plus complete restart, reorg,
+multi-connection concurrency, snapshot-rollback, and corruption qualification
+remain missing.
 
 ## HTLC profile
 
@@ -164,8 +203,12 @@ unavailable.
 
 ## Qualification and benchmarks
 
-This tranche was source-only and was not built or tested locally. The prior
-baseline is not evidence for these changes. No benchmark values are estimated.
+On 2026-08-03, the targeted allocation filter passed from a disposable NVMe
+checkout and NVMe target directory: `cargo test --locked -p
+hns-wallet-bitcoin-kyoto swap_key_store::tests -- --test-threads=1` reported 10
+passed, 0 failed, and 8 filtered out. No standalone build/check, full workspace
+gate, optimized RocksDB compilation, network test, or benchmark was run. This
+narrow evidence does not qualify the Bitcoin value runtime.
 
 | Scenario | Disk | Bandwidth | Usable balance | Full scan | Peak mobile memory |
 | --- | ---: | ---: | ---: | ---: | ---: |

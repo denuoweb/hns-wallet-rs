@@ -15,7 +15,7 @@ disabled independently.
 | Provider | exact 43-name vocabulary, secure origin, opaque authority registry, authority-validated permission/tombstone snapshots, typed capability snapshot, ephemeral approvals/replay/rates, forbidden methods | published engine authority adapter, browser-native dispatch, atomic real `hns_requestAccounts` join, and complete trusted approval UI |
 | Shakedex | encrypted/CAS seller, buyer, and recovery schemas; structural legacy v0.1 proof decoding; all creation, discovery, and transition entrypoints hard-disabled | published coherent canonical V2 protocol dependency, signed transaction construction, live node/Denuo V2 integration, trusted approval UI, restart/reorg/regtest qualification |
 | Denuo market | chain-neutral reservations/sessions; canonical V2 protocol implemented in `hns-rs` | released protocol dependency, reporter governance, live relay/board integration |
-| Bitcoin | BDK BIP84 create/load/receive/send primitives; deterministic domain/network/role-separated atomic-swap keys with public recovery vectors; bounded Kyoto tip discovery and supervisor; encrypted birthday/phase/checkpoint journal; BDK-first restart reconciliation; bounded transaction/output mirrors; exact fee-bound pre-broadcast journal; HTLC funding/spend/evidence units | pinned Kyoto durable header/filter/peer API, record archival, durable swap-key allocation, signed-spend/settlement integration, consolidated CI, regtest/restart/reorg/adversarial qualification and benchmarks; value gate remains false |
+| Bitcoin | BDK BIP84 create/load/receive/send primitives; context-bound atomic-swap allocation keys with crate-local regression vectors; encrypted CAS-backed monotonic session/role allocation and authenticated re-derivation; bounded Kyoto tip discovery and supervisor; encrypted birthday/phase/checkpoint journal; BDK-first restart reconciliation; bounded transaction/output mirrors; exact fee-bound pre-broadcast journal; HTLC funding/spend/evidence units | canonical complete-terms caller and settlement-supervisor integration, pinned Kyoto durable header/filter/peer API, record archival, signed-spend integration, consolidated CI, regtest/restart/reorg/adversarial qualification and benchmarks; value gate remains false |
 | Ethereum | separated offline accounts, typed dormant EIP-1559/HTLC and structural evidence primitives, deterministic contract, immutable false synchronization/value/settlement/mainnet gates, opaque runtime permits plus role/address/exact-fee-bound signing types, zeroizing preimages/intermediates, redacted controlled-broadcast artifact | embedded Helios proof source and privately minted evidence authority, persistence/balance/history/nonce/fee/broadcast runtime, redeem/refund verification, local-chain/restart/reorg qualification, approved address and audit |
 | FFI/service/host | ABI v2; canonical framing; random host/service/wallet sessions; one typed provider binding; authority-scoped private capability snapshot distinct from the public website capability result; bounded typed frames; fail-closed subprocess; caller-side owned clock/entropy, hello/restart and dual-direction sequence state, bounded response correlation, authority/approval/binding/event replay state; Draft 2020-12 private/public/manifest schema bundle and bounded vectors | signed released service artifact and verifier trust store, private Chromium launcher and exact capability projection, generated JNI/Swift bindings, published engine join and compatibility E2E; provider/value/browser capability gates remain false |
 | Testkit | deterministic non-mainnet, hostile-input, reorg, and qualification fixtures | full multi-process network harnesses |
@@ -96,11 +96,12 @@ submission.
 The pinned `bip157` 0.6.3 source ignores `data_dir`; exact headers, compact-
 filter headers/filters, and address-book state are not durably exposed. A
 reviewed persistence-capable Kyoto boundary, safe archival at the 4,096-record
-lifetime caps, durable per-session swap-key allocation, signed HTLC spend
-supervision, regtest/restart/reorg/adversarial evidence, trusted-time policy,
-resource measurements, and independent review remain blockers. The new
-domain-separated swap-key source and its unexecuted conformance tests do not
-change the false value-release gate.
+lifetime caps, signed HTLC spend supervision, complete allocation concurrency/
+restart/corruption qualification, regtest/restart/reorg/adversarial evidence,
+trusted-time policy, resource measurements, and independent review remain
+blockers. The domain-separated keys and encrypted monotonic allocation source
+passed only its 10-test targeted NVMe filter; that evidence does not change the
+false value-release gate.
 
 ## Ethereum containment gates
 

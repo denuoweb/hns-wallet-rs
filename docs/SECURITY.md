@@ -77,7 +77,9 @@ IDs, and approval IDs also redact `Debug` and `Display`; only their canonical
 wire serializers reveal the value to the private transport.
 Bitcoin swap-key handles additionally keep their secret half private,
 non-serializable and non-cloneable, redact it from `Debug`, and zeroize the
-32-byte scalar on drop. Their public recovery coordinates contain no secret.
+32-byte scalar on drop. Their public allocation records and numeric references
+contain no secret; the numeric reference alone is not a complete recovery
+context.
 
 ## Money and transaction approval
 
@@ -189,13 +191,27 @@ remain blockers.
 
 Bitcoin swap keys now have a deterministic application-private HKDF domain
 which is disjoint from ordinary BIP84 receive/change derivation and binds the
-coin type, exact network, bounded account/index, and receiver/refund script
-role. The HTLC constructor enforces that local role. This separation does not
-enable settlement: the scheme version and exact key coordinates are not yet
-authenticated and durably allocated with each session, deterministic
-regeneration is not discovery, and signed-spend supervision and the complete
-qualification boundary are still absent. No Bitcoin signing or value permit is
-exposed by this key slice.
+wallet profile, session, opaque frozen-terms commitment, coin type, exact
+network, bounded account/index, and receiver/refund script role. A copied or
+stale counter therefore cannot reuse a key for a different logical swap. The
+encrypted store atomically advances a never-decreasing per-role high-water
+record and writes an immutable binding plus redundant anchor/claim integrity
+records. Exact retries do not advance the counter; rebinding, exhaustion, clock
+rollback, isolated missing/corrupt records, and repeated CAS conflict fail
+closed. Recovery seeds are immutable through the store API, and recovery
+compares both seed commitment and public key before exposing the zeroizing,
+non-serializable handle. Raw derivation is crate-private; the role-aware HTLC
+constructor requires that handle rather than a public record.
+
+The allocator cannot prove that its caller's opaque commitment covers complete
+canonical settlement terms, and it is not yet wired into the settlement
+supervisor. A whole database rollback is not detectable from inside that
+database; session-bound derivation prevents cross-session secret reuse, but
+active-swap recovery still requires current encrypted allocation records and
+non-recycled session IDs. This separation and persistence do not enable
+settlement: signed-spend supervision and the complete qualification boundary
+are still absent, and no Bitcoin signing or value permit is exposed by this key
+slice.
 
 Bitcoin's supervisor does not authorize from a peer status field. A completed
 Kyoto wallet update is committed to BDK SQLite before encrypted transaction and

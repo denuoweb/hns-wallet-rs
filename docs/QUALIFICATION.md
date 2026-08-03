@@ -12,7 +12,7 @@ current commit has no recorded result for that gate.
 | Provider core | pending consolidated gate | encrypted grants/tombstones/approvals/replays implemented | n/a | no installed-browser E2E | no audit | product integration pending |
 | Fixed-price Shakedex | prior unit baseline only | CAS journal source | evidence incomplete | no regtest/Denuo E2E | no audit | unavailable |
 | Market sessions | prior unit baseline only | CAS journal source | evidence incomplete | no pair E2E | no audit | unavailable |
-| Bitcoin Kyoto | current supervisor tranche pending consolidated gate | source includes BDK-first sync journal, bounded reconciliation chunks, restart resume, and pre-broadcast intent; pinned Kyoto header/filter/peer persistence unavailable | source queries exact canonical hash membership within a bounded retained window; no current execution evidence | no regtest/P2P/broadcast run | not measured/no audit | send and settlement hard-disabled |
+| Bitcoin Kyoto | targeted allocation filter PASS on NVMe: 10 passed, 0 failed, 8 filtered; consolidated gate pending | source includes encrypted CAS-backed monotonic session/role swap-key allocation, protected seed/allocation records, authenticated re-derivation, BDK-first sync journal, bounded reconciliation chunks, restart resume, and pre-broadcast intent; allocation database reopen covered by the targeted filter; pinned Kyoto header/filter/peer persistence unavailable | source queries exact canonical hash membership within a bounded retained window; no allocation reorg or snapshot-rollback evidence | no regtest/P2P/broadcast run | not measured/no audit | send and settlement hard-disabled |
 | Ethereum | containment tranche pending consolidated gate | offline derivation and dormant typed primitives only; no synchronization/history persistence | no restart/reorg evidence | deterministic contract compiled only in prior baseline; no embedded Helios/local-chain run; permits unavailable; mainnet denied | no contract audit | synchronization/history/send/signing/settlement unavailable |
 | ABI/host | host/contract tranche pending consolidated gate | source includes exact hello/restart and directional sequencing, bounded response correlation, authority/approval/private-binding/event replay state, and machine-readable private/public/manifest contracts plus bounded vectors | restart reset is implemented in source; no process-restart execution evidence | no platform ABI E2E, signed artifact verifier, launcher, or generated mobile binding | no resource measurement/audit | product integration pending; all browser/provider/value gates remain false |
 | Browser products | separate repositories | platform integration pending | n/a | no installed/signed E2E | no review | unavailable |
@@ -24,11 +24,16 @@ all-target check, warning-denied Clippy, tests, warning-denied docs,
 sibling/forbidden-backend dependency checks, deterministic Solidity artifact
 comparison, and an npm high-severity audit.
 
-This production-hardening and host-contract tranche was not built or tested locally, by explicit
-instruction to avoid redundant build/test sessions. Its next evidence event is
-one consolidated CI invocation of `scripts/check.sh`; do not run separate
-build, check, test, and pre-push copies of the same gate. Record its commit ID,
-runner/platform, full result, test count, and artifact hashes here.
+The Bitcoin allocation subtarget was tested once on 2026-08-03 from a
+disposable NVMe checkout with an NVMe target and temporary directory:
+`cargo test --locked -p hns-wallet-bitcoin-kyoto swap_key_store::tests --
+--test-threads=1`. It passed 10 tests with 0 failures and 8 filtered out. No
+standalone build/check, full workspace gate, optimized RocksDB compilation,
+network test, or benchmark was run. The remainder of this production-hardening
+and host-contract tranche has no new local evidence. Its next broad evidence
+event is one consolidated CI invocation of `scripts/check.sh`; do not run
+separate build, check, test, and pre-push copies of the same gate. Record its
+commit ID, runner/platform, full result, test count, and artifact hashes here.
 
 ## Prior baseline evidence
 

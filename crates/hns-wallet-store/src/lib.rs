@@ -61,6 +61,7 @@ pub enum EntityKind {
     BitcoinFilterHeader,
     BitcoinPeer,
     BitcoinScanState,
+    BitcoinSwapKeyAllocation,
     BitcoinUtxo,
     BitcoinTransaction,
     EthereumAccount,
@@ -92,6 +93,7 @@ impl EntityKind {
             Self::BitcoinFilterHeader => "bitcoin_filter_header",
             Self::BitcoinPeer => "bitcoin_peer",
             Self::BitcoinScanState => "bitcoin_scan_state",
+            Self::BitcoinSwapKeyAllocation => "bitcoin_swap_key_allocation",
             Self::BitcoinUtxo => "bitcoin_utxo",
             Self::BitcoinTransaction => "bitcoin_transaction",
             Self::EthereumAccount => "ethereum_account",
@@ -106,6 +108,10 @@ impl EntityKind {
             Self::PendingApproval => "pending_approval",
             Self::InputReservation => "input_reservation",
         }
+    }
+
+    const fn deletion_protected(self) -> bool {
+        matches!(self, Self::BitcoinSwapKeyAllocation)
     }
 }
 
@@ -373,18 +379,36 @@ impl WalletStore {
             return Err(StoreError::RecordTooLarge);
         }
         let key = self.key.as_ref().ok_or(StoreError::Locked)?;
-        let encrypted = encrypt_record(key, &self.database_id, kind.label(), id, cleartext)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_kind: Option<String> = transaction
-            .query_row("SELECT kind FROM secrets WHERE id=?1", params![id], |row| {
-                row.get(0)
-            })
+        let current: Option<(String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT kind, encrypted_value FROM secrets WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()?;
-        if current_kind.is_some_and(|current| current != kind.label()) {
-            return Err(StoreError::KindMismatch);
+        if let Some((current_kind, current_encrypted)) = current {
+            if current_kind != kind.label() {
+                return Err(StoreError::KindMismatch);
+            }
+            if kind == SecretKind::RecoverySeed {
+                let current_clear = decrypt_record(
+                    key,
+                    &self.database_id,
+                    kind.label(),
+                    id,
+                    &current_encrypted,
+                )?;
+                if current_clear.as_slice() == cleartext {
+                    transaction.commit()?;
+                    return Ok(());
+                }
+                return Err(StoreError::ProtectedSecret);
+            }
         }
+        let encrypted = encrypt_record(key, &self.database_id, kind.label(), id, cleartext)?;
         transaction.execute(
             "INSERT INTO secrets(id, kind, encrypted_value, updated_at_unix) VALUES(?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET encrypted_value=excluded.encrypted_value,
@@ -429,10 +453,23 @@ impl WalletStore {
     pub fn delete_secret(&mut self, id: &[u8]) -> Result<bool, StoreError> {
         validate_id(id)?;
         self.key.as_ref().ok_or(StoreError::Locked)?;
-        Ok(self
+        let transaction = self
             .connection
-            .execute("DELETE FROM secrets WHERE id=?1", params![id])?
-            == 1)
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_kind: Option<String> = transaction
+            .query_row("SELECT kind FROM secrets WHERE id=?1", params![id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(current_kind) = current_kind else {
+            return Ok(false);
+        };
+        if current_kind == SecretKind::RecoverySeed.label() {
+            return Err(StoreError::ProtectedSecret);
+        }
+        transaction.execute("DELETE FROM secrets WHERE id=?1", params![id])?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Saves one typed entity with compare-and-swap semantics. The entity kind,
@@ -585,6 +622,9 @@ impl WalletStore {
         expected_revision: u64,
     ) -> Result<bool, StoreError> {
         validate_id(id)?;
+        if kind.deletion_protected() {
+            return Err(StoreError::ProtectedEntity);
+        }
         let key = self.key.as_ref().ok_or(StoreError::Locked)?;
         if expected_revision == 0 {
             return Err(StoreError::InvalidRevision);
@@ -2136,6 +2176,9 @@ fn authenticate_entity_batch(
     saves: &PreparedEntityBatch,
     deletes: &[EntityBatchDelete],
 ) -> Result<AuthenticatedEntityWrites, StoreError> {
+    if kind.deletion_protected() && !deletes.is_empty() {
+        return Err(StoreError::ProtectedEntity);
+    }
     let mut encrypted_saves = Vec::with_capacity(saves.len());
     for (id, expected_revision, encoded, updated_at) in saves {
         let actual =
@@ -2154,7 +2197,7 @@ fn authenticate_entity_batch(
             &revisioned_aad_id(id, next, *updated_at, None)?,
             encoded,
         )?;
-        encrypted_saves.push((id, next, encrypted, *updated_at));
+        encrypted_saves.push((id.clone(), next, encrypted, *updated_at));
     }
     for delete in deletes {
         let actual =
@@ -2906,6 +2949,8 @@ pub enum StoreError {
     Encryption,
     #[error("secret kind does not match the requested kind")]
     KindMismatch,
+    #[error("wallet recovery seed is immutable and cannot be deleted or replaced")]
+    ProtectedSecret,
     #[error("a workflow identifier cannot change workflow kind")]
     WorkflowKindMismatch,
     #[error("record identifier is invalid")]
@@ -2946,6 +2991,8 @@ pub enum StoreError {
     InvalidListLimit,
     #[error("record revision must be nonzero")]
     InvalidRevision,
+    #[error("managed encrypted entity records cannot be deleted")]
+    ProtectedEntity,
     #[error("entity batch contains duplicate or invalid operations")]
     DuplicateBatchEntity,
     #[error("entity batch exceeds its bounded operation limit")]

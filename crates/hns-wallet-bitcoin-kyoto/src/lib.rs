@@ -2,8 +2,10 @@
 #![forbid(unsafe_code)]
 
 mod runtime;
+mod swap_key_store;
 
 pub use runtime::*;
+pub use swap_key_store::*;
 
 use core::fmt;
 use std::path::PathBuf;
@@ -28,10 +30,9 @@ use bdk_wallet::template::Bip84;
 use bdk_wallet::{KeychainKind, PersistedWallet, SignOptions, Wallet};
 use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
-use hns_wallet_store::{SecretKind, WalletStore};
 use hns_wallet_types::{
     ChainCapabilities, FeeModel, FinalityModel, HashAlgorithm, LocktimeModel, ObjectHash,
-    TransactionHash, WalletId,
+    SessionId, TransactionHash, WalletId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,6 +55,9 @@ pub const MAX_KYOTO_SYNC_TIMEOUT: Duration = Duration::from_secs(86_400);
 pub const BITCOIN_SWAP_DERIVATION_DOMAIN: &[u8] =
     b"hns-wallet-rs/bitcoin-atomic-swap-key/v1";
 const BITCOIN_SWAP_DERIVATION_INFO_TAG: &[u8; 4] = b"HSWP";
+const BITCOIN_SWAP_ALLOCATION_DERIVATION_DOMAIN: &[u8] =
+    b"hns-wallet-rs/bitcoin-atomic-swap-allocation-key/v1";
+const BITCOIN_SWAP_ALLOCATION_DERIVATION_INFO_TAG: &[u8; 4] = b"HSAK";
 /// The source contains value-moving primitives, but the complete Kyoto
 /// persistence and independent release gate have not passed.
 pub const BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
@@ -155,7 +159,9 @@ impl BitcoinSwapKeyRole {
     }
 }
 
-/// Stable recovery coordinates for a Bitcoin atomic-swap key.
+/// Numeric coordinates within a complete encrypted Bitcoin swap-key
+/// allocation. Wallet, session, and frozen-terms bindings are also required to
+/// recover an allocated key; this reference is not sufficient by itself.
 ///
 /// This is deliberately not a BIP-32 path. The HKDF info is the byte sequence
 /// `HSWP || coin_type || network_code || account || role || index || counter`,
@@ -174,7 +180,7 @@ pub struct BitcoinSwapKeyReference {
 }
 
 impl BitcoinSwapKeyReference {
-    pub fn new(
+    pub(crate) fn new(
         network: Network,
         role: BitcoinSwapKeyRole,
         account_index: u32,
@@ -300,24 +306,8 @@ impl fmt::Debug for DerivedBitcoinSwapKey {
     }
 }
 
-/// Recovers a domain-separated Bitcoin atomic-swap key from the encrypted
-/// wallet profile's BIP-39 seed. Ordinary BIP84 descriptor derivations are not
-/// used by this function.
-pub fn derive_bitcoin_swap_key_from_store(
-    store: &WalletStore,
-    wallet_id: WalletId,
-    reference: BitcoinSwapKeyReference,
-) -> Result<DerivedBitcoinSwapKey, BitcoinWalletError> {
-    let seed = store
-        .get_secret(wallet_id.as_bytes(), SecretKind::RecoverySeed)?
-        .ok_or(BitcoinWalletError::MissingRecoverySeed)?;
-    derive_bitcoin_swap_key_from_seed(seed.as_slice(), reference)
-}
-
-/// Recovers a domain-separated Bitcoin atomic-swap key from a mnemonic. The
-/// wallet profile currently uses the empty BIP-39 passphrase consistently with
-/// its ordinary BIP84 descriptor wallet.
-pub fn derive_bitcoin_swap_key(
+/// Context-free mnemonic derivation retained for crate-local vectors.
+pub(crate) fn derive_bitcoin_swap_key(
     mnemonic: &Mnemonic,
     reference: BitcoinSwapKeyReference,
 ) -> Result<DerivedBitcoinSwapKey, BitcoinWalletError> {
@@ -336,6 +326,58 @@ fn derive_bitcoin_swap_key_from_seed(
     let hkdf = Hkdf::<Sha256>::new(Some(BITCOIN_SWAP_DERIVATION_DOMAIN), seed);
     for counter in 0_u8..=u8::MAX {
         let info = reference.derivation_info(counter)?;
+        let mut candidate = Zeroizing::new([0_u8; 32]);
+        hkdf.expand(&info, candidate.as_mut())
+            .map_err(|_| BitcoinWalletError::KeyDerivation)?;
+        let Ok(mut secret_key) = SecretKey::from_slice(candidate.as_slice()) else {
+            continue;
+        };
+        let public_key = PublicKey::new(secret_key.public_key(&Secp256k1::new()));
+        secret_key.non_secure_erase();
+        return Ok(DerivedBitcoinSwapKey {
+            public_key: BitcoinSwapPublicKey {
+                reference,
+                public_key,
+            },
+            _secret_key: BitcoinSwapSecretKey(*candidate),
+        });
+    }
+    Err(BitcoinWalletError::KeyDerivation)
+}
+
+/// Derives the key owned by a durable allocation. The profile, session, and
+/// frozen-terms commitment are part of the HKDF context so a copied seed with
+/// an independent or rolled-back counter cannot reuse a key for another
+/// logical swap.
+fn derive_bitcoin_swap_key_from_seed_for_allocation(
+    seed: &[u8],
+    wallet_id: WalletId,
+    session_id: SessionId,
+    terms_commitment: ObjectHash,
+    reference: BitcoinSwapKeyReference,
+) -> Result<DerivedBitcoinSwapKey, BitcoinWalletError> {
+    reference.validate()?;
+    if seed.len() != 64
+        || wallet_id.as_bytes().iter().all(|byte| *byte == 0)
+        || session_id.as_bytes().iter().all(|byte| *byte == 0)
+        || terms_commitment.as_bytes().iter().all(|byte| *byte == 0)
+    {
+        return Err(BitcoinWalletError::InvalidSwapKeyReference);
+    }
+    let hkdf = Hkdf::<Sha256>::new(Some(BITCOIN_SWAP_ALLOCATION_DERIVATION_DOMAIN), seed);
+    for counter in 0_u8..=u8::MAX {
+        let mut info = [0_u8; 107];
+        info[..4].copy_from_slice(BITCOIN_SWAP_ALLOCATION_DERIVATION_INFO_TAG);
+        info[4..20].copy_from_slice(wallet_id.as_bytes());
+        info[20..52].copy_from_slice(session_id.as_bytes());
+        info[52..84].copy_from_slice(terms_commitment.as_bytes());
+        info[84..86].copy_from_slice(&reference.scheme_version().to_be_bytes());
+        info[86..90].copy_from_slice(&reference.coin_type().to_be_bytes());
+        info[90..94].copy_from_slice(&reference.network_code().to_be_bytes());
+        info[94..98].copy_from_slice(&reference.account_index().to_be_bytes());
+        info[98..102].copy_from_slice(&reference.role().code().to_be_bytes());
+        info[102..106].copy_from_slice(&reference.key_index().to_be_bytes());
+        info[106] = counter;
         let mut candidate = Zeroizing::new([0_u8; 32]);
         hkdf.expand(&info, candidate.as_mut())
             .map_err(|_| BitcoinWalletError::KeyDerivation)?;
@@ -555,12 +597,12 @@ impl BitcoinHtlc {
     /// one counterparty key. This does not sign, fund, or enable settlement.
     pub fn new_with_local_swap_key(
         hashlock: [u8; 32],
-        local_key: &BitcoinSwapPublicKey,
+        local_key: &DerivedBitcoinSwapKey,
         counterparty_public_key: PublicKey,
         refund_height: u32,
     ) -> Result<Self, BitcoinWalletError> {
-        let local_public_key = local_key.bitcoin_public_key()?;
-        match local_key.reference().role() {
+        let local_public_key = local_key.public_key().bitcoin_public_key()?;
+        match local_key.public_key().reference().role() {
             BitcoinSwapKeyRole::Receiver => Self::new(
                 hashlock,
                 local_public_key,
@@ -1050,7 +1092,7 @@ mod tests {
         let preimage = [9_u8; 32];
         let htlc = BitcoinHtlc::new_with_local_swap_key(
             Sha256::digest(preimage).into(),
-            receiver.public_key(),
+            &receiver,
             key(4),
             500,
         )
@@ -1074,7 +1116,7 @@ mod tests {
         let refund = derive_bitcoin_swap_key(&mnemonic, refund_reference).expect("refund key");
         let refund_htlc = BitcoinHtlc::new_with_local_swap_key(
             Sha256::digest(preimage).into(),
-            refund.public_key(),
+            &refund,
             key(3),
             500,
         )

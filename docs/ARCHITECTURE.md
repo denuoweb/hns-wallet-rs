@@ -112,16 +112,28 @@ remains false and HNS value capabilities are not advertised. See
 ## Bitcoin supervisor boundary
 
 Bitcoin ordinary receive/change keys remain exclusively in BDK's BIP84
-descriptor trees. Atomic-swap keys use a wallet-private HKDF-SHA256 domain over
-the recovery seed with separately encoded coin type, exact network, bounded
-account/index, and receiver/refund role. The swap derivation therefore never
-traverses or allocates an ordinary BIP84 child. Only the public half crosses
-into HTLC construction, where its declared role selects the exact script
-branch. The byte-level scheme and public recovery vectors are documented in
-[BITCOIN_KYOTO.md](BITCOIN_KYOTO.md). Allocation persistence and signed-spend
-supervision remain release blockers: every session must authenticate and
-persist its exact scheme version and coordinates, and deterministic
-regeneration is not a bounded discovery scan.
+descriptor trees. Durable atomic-swap allocations use a distinct wallet-private
+HKDF-SHA256 domain over the recovery seed and bind the wallet profile, session,
+opaque frozen-terms commitment, coin type, exact network, bounded account/index,
+and receiver/refund role. The swap derivation therefore never traverses or
+allocates an ordinary BIP84 child, and an independently restored counter cannot
+reuse a key for a different logical swap. One encrypted CAS batch advances a
+monotonic high-water record and writes an immutable wallet/session/role binding;
+redundant namespace-anchor and binding-claim records detect isolated missing or
+relocated records. Exact retries are idempotent, role rebinding and clock
+rollback fail closed, and recovery recomputes the public key before exposing
+the non-serializable, zeroizing secret handle. The role-aware HTLC constructor
+accepts that handle rather than a deserializable public record.
+
+This is an allocation primitive, not a value-path integration. The settlement
+layer must construct the opaque commitment from its complete canonical terms
+and must never recycle a session ID. A whole encrypted-database rollback cannot
+be detected solely by records inside that database; session-bound derivation
+prevents cross-session key reuse, but recovery of already active swaps still
+requires a current encrypted database backup. The byte-level scheme and
+persistence boundary are documented in [BITCOIN_KYOTO.md](BITCOIN_KYOTO.md).
+Signed-spend supervision and complete restart/reorg qualification remain
+release blockers.
 
 The Kyoto module starts from an explicit validated birthday, persists a
 sequence/phase transition before sync, commits each returned update to BDK
