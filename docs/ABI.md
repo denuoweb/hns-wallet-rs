@@ -111,26 +111,35 @@ may contain `hns_requestAccounts` only when the service runtime explicitly
 supports the account selector; the service pairs it with `hns_accounts`, a
 structured approval containing exactly Accounts, and an exact persisted account
 binding. Generic `wallet_requestPermissions` summaries cannot contain Accounts.
-When provider dispatch is absent, `methods` is empty.
+Generic permission creation is advertised only when a currently supported
+permission-bearing runtime method can consume the requested scope. When
+provider dispatch is absent, `methods` is empty.
 
 The website method `wallet_getCapabilities` instead returns only
 `providerApiVersion: 1` and `methods`. Its outer private result binding is
 retained by the native adapter and never projected to the page. A Chromium
 adapter must combine the private snapshot with negotiated service availability
 and project exactly `{abiVersion,available,walletSession,permissionGeneration,methods}`.
-The checked-in subprocess runtime advertises framing/restart/registry/
-structured-prompt/event foundations only. It does not advertise provider
-dispatch, wallet operations, value movement, or browser integration. The
-library can be composed with `WalletStore` for encrypted permission persistence,
-but availability remains false until released runtimes and browser adapters
-complete their independent gates.
+The checked-in subprocess is an existing-database control runtime. It starts
+locked, shares one store/key authority with encrypted provider permissions, and
+advertises wallet operations, persistent permissions, and provider dispatch.
+After ABI unlock its provider subset is exactly `wallet_getCapabilities`,
+`wallet_getStatus`, `wallet_getPermissions`, `wallet_revokePermissions`, and
+`wallet_lock`. Wallet creation/restoration, generic permission creation,
+accounts, chain methods, value movement, and browser integration remain absent.
+The presence of this private control plane does not make a browser provider
+available; a released launcher, engine authority adapter, and independently
+qualified product runtime are still required.
 
-The subprocess reads and writes v2 frames on inherited standard streams. A
-production Chromium launcher must supply private child pipes and a separately
-released signed artifact. Mobile may drive the same state machine in process
-after generated JNI/C bindings exist. Filesystem paths, process commands, raw
-signing, recovery output, private keys, database keys, preimages, and arbitrary
-contract calls are absent from the protocol.
+The subprocess requires exactly `--database <existing-wallet-database>` and
+reads and writes v2 frames on inherited standard streams. The database path is
+trusted launcher configuration, never a website request; the passphrase is
+accepted only as the ABI-owned zeroizing unlock secret. A production Chromium
+launcher must supply private child pipes and a separately released signed
+artifact. Mobile may drive the same state machine in process after generated
+JNI/C bindings exist. Filesystem paths, process commands, raw signing, recovery
+output, private keys, database keys, preimages, and arbitrary contract calls are
+absent from the protocol.
 
 ## Machine-readable contracts
 

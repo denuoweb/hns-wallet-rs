@@ -91,8 +91,11 @@ session dimension before a result is accepted.
 Permission records and encrypted tombstone generations survive service
 restart. Their persistence scope is the exact selected namespace plus logical
 origin, stored under a domain-separated opaque key; the record retains both
-values and must match them when loaded. The service reads the current generation
-from `WalletStore`; it never accepts one from a request. The first grant is
+values and must match them when loaded. The persistent control runtime and
+provider core hold clones of one `SharedWalletStore`, so lock clears their one
+decrypted record key rather than leaving an independently unlocked permission
+connection. The service reads the current generation from that store; it never
+accepts one from a request. The first grant is
 generation one and every later grant/revocation is exactly the stored generation
 plus one. An Accounts grant also retains a bounded exact set of approved
 wallet-local account IDs. A legacy or generic grant that claims Accounts
@@ -108,10 +111,12 @@ Time-bearing provider entry points also reject a process-local wall-clock
 rollback instead of extending authority.
 
 `wallet_lock` is service-owned: the runtime locks first, then the service rotates
-the wallet session and clears approvals and event cursors. If fresh session
-entropy is unavailable, the provider remains locked. Send prompts are accepted
-only when the method, requested module, displayed chain, amount asset, and fee
-asset agree exactly.
+the wallet session and clears approvals and event cursors. Unlock, creation, or
+restoration rotates the wallet session only after the runtime succeeds; if that
+rotation cannot obtain fresh entropy, the service synchronously locks the
+runtime again before returning failure. Send prompts are accepted only when the
+method, requested module, displayed chain, amount asset, and fee asset agree
+exactly.
 
 The 43 method names remain the closed vocabulary, but presence in that
 vocabulary is not availability. Wallet types own the single canonical wire-name
@@ -123,14 +128,22 @@ uses the authority-scoped private ABI capability request whose snapshot is
 permissionGeneration,methods}`. The native adapter retains its result binding;
 it must never project that private envelope to website code. Chromium must
 project exactly `{abiVersion,available,walletSession,permissionGeneration,
-methods}` from private negotiation. With provider dispatch unavailable, the
-private method set is empty and `available` remains false.
+methods}` from private negotiation. The checked-in persistent control runtime
+has provider dispatch but no browser integration. After unlock its private set
+is exactly `wallet_getCapabilities`, `wallet_getStatus`,
+`wallet_getPermissions`, `wallet_revokePermissions`, and `wallet_lock`;
+Chromium `available` remains false until the separate browser/runtime gates
+succeed.
 
 Generation zero is valid only before the first grant or revocation;
 `wallet_getPermissions` preserves a nonzero tombstone generation with an empty
-capability list. An unimplemented method returns `unsupportedCapability`. The
-checked-in subprocess does not advertise provider dispatch, value movement, or
-browser integration.
+capability list. Generic `wallet_requestPermissions` is advertised and executed
+only when at least one currently supported permission-bearing runtime method
+can consume the requested non-Accounts scope; this prevents the control-only
+runtime from persisting dormant authority for a later upgrade. An unimplemented
+method returns `unsupportedCapability`. The checked-in subprocess advertises
+only the private control subset and does not advertise value movement or browser
+integration.
 
 The service source now defines the atomic `hns_requestAccounts` join. Only an
 explicit runtime account-selector capability may advertise it. After the
@@ -140,10 +153,10 @@ same ID in the approval-bound permission generation. `hns_accounts` is then a
 service-owned projection of only those persisted IDs; both methods return the
 IDs as ordered 32-character lowercase hexadecimal strings. Null or an empty
 object are the only accepted parameters, and generic `wallet_requestPermissions`
-cannot create Accounts authority. The checked-in subprocess still uses
-`UnavailableRuntime`, advertises neither method, and has no concrete
-`HnsWalletRuntime`/browser product adapter, so this source contract is not
-product availability.
+cannot create Accounts authority. The checked-in subprocess uses
+`PersistentControlRuntime`, advertises neither HNS account method, and has no
+concrete `HnsWalletRuntime`/browser product adapter, so this source contract is
+not product availability.
 
 ## Explicitly forbidden
 

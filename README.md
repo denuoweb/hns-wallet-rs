@@ -13,6 +13,14 @@ length-prefixed wallet-service ABI, a fail-closed host-side protocol state
 machine, and machine-readable contracts for separately released browser
 adapters.
 
+The checked-in service executable now requires an explicit existing wallet
+database, opens it through the platform filesystem checks in a locked state,
+and shares one decrypted-key authority between runtime control and encrypted
+provider permissions. ABI wallet status/unlock/lock and a narrow provider
+control surface are implemented. Wallet creation/restoration, account
+selection, chain reads, browser integration, and every value path remain
+unavailable in that executable.
+
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
 settlement remain release-gated. The HNS runtime rejects configurations that
@@ -48,7 +56,8 @@ qualification are incomplete.
 ## Crates
 
 - `hns-wallet-types`: wallet-local identifiers and UI-safe summaries.
-- `hns-wallet-store`: SQLite migrations and authenticated encryption.
+- `hns-wallet-store`: SQLite migrations, authenticated encryption, and one
+  cloneable process-local lock/key authority.
 - `hns-wallet-chain-api`: modular chain and settlement capability traits.
 - `hns-wallet-hns`: Handshake account/name workflows and node backend.
 - `hns-wallet-provider`: hostile-page request, permission, and approval core.
@@ -58,7 +67,8 @@ qualification are incomplete.
 - `hns-wallet-ethereum`: offline native-ETH account derivation plus
   release-gated Helios/HTLC policy.
 - `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.
-- `hns-wallet-service`: private session/authority registry and subprocess composition boundary.
+- `hns-wallet-service`: private session/authority registry plus the locked,
+  existing-database provider control subprocess.
 - `hns-wallet-host`: caller-side negotiation, correlation, authority, approval,
   binding, and event-replay state for trusted browser/mobile adapters.
 - `hns-wallet-testkit`: deterministic, non-mainnet fixtures.

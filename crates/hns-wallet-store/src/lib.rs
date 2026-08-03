@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
@@ -259,6 +260,83 @@ pub struct WalletStore {
     salt: [u8; SALT_BYTES],
     kdf: KdfConfig,
     key: Option<Zeroizing<[u8; KEY_BYTES]>>,
+}
+
+/// One cloneable process-local authority over a wallet database and its
+/// decrypted record key. Provider persistence and wallet execution must share
+/// this handle so locking cannot leave a second independently unlocked store
+/// connection behind.
+///
+/// The handle deliberately has no `Debug` implementation. Callers use the
+/// bounded closure methods instead of retaining a mutex guard across another
+/// wallet component or an external call.
+#[derive(Clone)]
+pub struct SharedWalletStore {
+    inner: Arc<Mutex<WalletStore>>,
+}
+
+impl SharedWalletStore {
+    pub fn new(store: WalletStore) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(store)),
+        }
+    }
+
+    pub fn with_store<T>(
+        &self,
+        operation: impl FnOnce(&WalletStore) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let store = match self.inner.lock() {
+            Ok(store) => store,
+            Err(poisoned) => {
+                let mut store = poisoned.into_inner();
+                store.lock();
+                return Err(StoreError::Concurrency);
+            }
+        };
+        operation(&store)
+    }
+
+    pub fn with_store_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut WalletStore) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut store = match self.inner.lock() {
+            Ok(store) => store,
+            Err(poisoned) => {
+                let mut store = poisoned.into_inner();
+                store.lock();
+                return Err(StoreError::Concurrency);
+            }
+        };
+        operation(&mut store)
+    }
+
+    pub fn unlock(&self, passphrase: &str) -> Result<(), StoreError> {
+        self.with_store_mut(|store| store.unlock(passphrase))
+    }
+
+    /// Clear the shared record key before returning. If another operation
+    /// poisoned the mutex, recover the contained store only long enough to
+    /// clear its key, then report the concurrency failure so callers still
+    /// fail closed.
+    pub fn lock(&self) -> Result<(), StoreError> {
+        match self.inner.lock() {
+            Ok(mut store) => {
+                store.lock();
+                Ok(())
+            }
+            Err(poisoned) => {
+                let mut store = poisoned.into_inner();
+                store.lock();
+                Err(StoreError::Concurrency)
+            }
+        }
+    }
+
+    pub fn is_locked(&self) -> Result<bool, StoreError> {
+        self.with_store(|store| Ok(store.is_locked()))
+    }
 }
 
 impl WalletStore {
@@ -3198,6 +3276,8 @@ pub enum StoreError {
     UnsafeFilesystemBoundary,
     #[error("wallet filesystem ownership validation is unsupported on this platform")]
     UnsupportedFilesystemBoundary,
+    #[error("shared wallet store access failed")]
+    Concurrency,
 }
 
 #[cfg(test)]

@@ -266,6 +266,19 @@ The product runtime must:
 12. determine refund eligibility from validated local chain time; and
 13. surface user actions without automatically moving value.
 
+The checked-in subprocess now implements the locked existing-database control
+subset of this sequence. It requires an explicit trusted-launcher
+`--database` path, securely opens and migrates that database, rejects a
+persistent composition whose store is already unlocked, creates fresh service
+and wallet sessions, and accepts the passphrase only through the zeroizing ABI
+unlock request. Provider state and runtime control share one store/key
+authority. Unlock completes any authenticated plaintext-removal checkpoint
+before rotating the wallet session; failure to rotate immediately re-locks the
+store. Permission records and tombstone generations can then be loaded, while
+authorities, approvals, replays, rate windows, request IDs, and event cursors
+remain process-local. Chain/account loading and steps 6 through 13 are not
+composed into this subprocess yet.
+
 The HNS source implements the concrete synchronous authenticated node adapter,
 bounded coin/name/Shakedex-role chain/mempool snapshot reconciliation, and
 prepared-transaction recovery. The learned durable chain epoch,
@@ -358,6 +371,12 @@ On Linux, persistent database opening requires an owner-only regular file in an
 owner-only directory and uses SQLite's no-follow flag. Non-Linux persistent
 opening intentionally fails until an equivalent native secure-open and
 ownership policy exists. In-memory stores remain available for bounded tests.
+The shared process handle has no diagnostic representation and exposes the
+store only through bounded locked closures. Detecting a poisoned shared lock
+clears the record key before reporting failure. The service-specific persistent
+constructor accepts only that shared handle and rejects an already-unlocked
+store, preventing its initial locked provider posture from diverging from the
+actual key state.
 
 Copying a live SQLite file without its WAL is not a supported backup procedure.
 The passphrase is not a substitute for platform device security. Product backup

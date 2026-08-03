@@ -10,14 +10,14 @@ use hns_wallet_ffi::{
     ProviderEventEnvelope, ProviderEventPayload, ProviderNamespace, ServiceCapability,
     ServiceErrorCode, ServiceFailure, ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest,
     ServiceResponse, SessionEnvelope, WALLET_ABI_VERSION, WalletRequest, WalletResponse,
-    encode_service_frame,
+    WalletRuntimeStatus, encode_service_frame,
 };
 use hns_wallet_provider::{
     ApprovedCall, HostAuthorityRegistration, Origin, PROVIDER_API_VERSION, PendingApproval,
     PermissionSnapshot, ProviderAction, ProviderCore, ProviderError, ProviderMethod,
     ProviderStateStore, SelectedNamespace,
 };
-use hns_wallet_store::WalletStore;
+use hns_wallet_store::{SharedWalletStore, StoreError};
 use hns_wallet_types::{
     ApprovalId, ApprovalKind, HostAuthorityHandleId, HostSessionId, ModuleId, PermissionCapability,
     ProviderApprovalId, ProviderRequestId, WalletServiceSessionId, WalletSessionId,
@@ -28,9 +28,9 @@ use thiserror::Error;
 pub const MAX_SEEN_REQUEST_IDS: usize = 4_096;
 pub const MAX_SERVICE_PENDING_APPROVALS: usize = 128;
 
-/// Execution boundary supplied by a wallet composition. The checked-in
-/// subprocess uses [`UnavailableRuntime`], so no provider, value movement, or
-/// browser capability is advertised merely because protocol source exists.
+/// Execution boundary supplied by a wallet composition. Runtime method support
+/// is checked independently from the closed provider vocabulary, and value or
+/// browser capability is never inferred merely because protocol source exists.
 pub trait ServiceRuntime {
     fn capabilities(&self) -> BTreeSet<ServiceCapability>;
 
@@ -86,6 +86,94 @@ impl ServiceRuntime for UnavailableRuntime {
 
     fn execute_wallet(&mut self, _: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
         Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations))
+    }
+}
+
+/// Existing-database control plane used by the checked-in subprocess. It owns
+/// no chain adapter or account selector and cannot move value. The same shared
+/// store handle is installed in `ProviderCore`, so `wallet_lock` clears the one
+/// decrypted record key used by both runtime control and permission state.
+pub struct PersistentControlRuntime {
+    store: SharedWalletStore,
+}
+
+impl PersistentControlRuntime {
+    fn new(store: SharedWalletStore) -> Self {
+        Self { store }
+    }
+
+    fn status(&self) -> Result<WalletRuntimeStatus, ServiceFailure> {
+        Ok(WalletRuntimeStatus {
+            locked: self.store.is_locked().map_err(persistent_store_failure)?,
+            active_wallet: None,
+            enabled_modules: BTreeSet::new(),
+            mainnet_settlement_enabled: false,
+        })
+    }
+}
+
+impl ServiceRuntime for PersistentControlRuntime {
+    fn capabilities(&self) -> BTreeSet<ServiceCapability> {
+        BTreeSet::from([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::ProviderDispatch,
+        ])
+    }
+
+    fn supports_provider_method(&self, method: ProviderMethod) -> bool {
+        method == ProviderMethod::WalletGetStatus
+    }
+
+    fn prepare_approval(
+        &mut self,
+        _: &PendingApproval,
+    ) -> Result<ApprovalSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    fn execute_provider(&mut self, call: ApprovedCall) -> Result<Value, ServiceFailure> {
+        if call.method != ProviderMethod::WalletGetStatus {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ));
+        }
+        validate_empty_params(&call.params)?;
+        serde_json::to_value(self.status()?)
+            .map_err(|_| invalid_request("wallet status encoding failed"))
+    }
+
+    fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+        self.store.lock().map_err(persistent_store_failure)
+    }
+
+    fn execute_wallet(&mut self, request: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
+        match request {
+            WalletRequest::Status => Ok(WalletResponse::Status {
+                status: self.status()?,
+            }),
+            WalletRequest::Unlock { passphrase } => {
+                self.store
+                    .unlock(passphrase.expose_secret())
+                    .map_err(persistent_store_failure)?;
+                Ok(WalletResponse::Unlocked)
+            }
+            WalletRequest::Lock => {
+                self.lock_wallet()?;
+                Ok(WalletResponse::Locked)
+            }
+            WalletRequest::CreateWallet { .. }
+            | WalletRequest::RestoreWallet { .. }
+            | WalletRequest::ListAccounts
+            | WalletRequest::Balance { .. }
+            | WalletRequest::ReceiveTarget { .. }
+            | WalletRequest::TransactionHistory { .. }
+            | WalletRequest::ModuleStatus { .. }
+            | WalletRequest::WorkflowStatus { .. } => Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            )),
+        }
     }
 }
 
@@ -438,9 +526,18 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                         .map_err(ServiceFailure::from)?,
                     WalletResponse::Unlocked
                     | WalletResponse::WalletCreated { .. }
-                    | WalletResponse::WalletRestored { .. } => self
-                        .rotate_wallet_session(false)
-                        .map_err(ServiceFailure::from)?,
+                    | WalletResponse::WalletRestored { .. } => {
+                        if let Err(error) = self.rotate_wallet_session(false) {
+                            // The runtime has already exposed decrypted state.
+                            // If fresh session entropy is unavailable, clear
+                            // that state synchronously before returning the
+                            // rotation failure. `rotate_wallet_session` has
+                            // independently put ProviderCore in its locked
+                            // posture and cleared its ephemeral registries.
+                            self.runtime.lock_wallet()?;
+                            return Err(ServiceFailure::from(error));
+                        }
+                    }
                     _ => {}
                 }
                 Ok(ServiceResponse::Wallet { response })
@@ -495,6 +592,24 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
         ) {
             validate_empty_params(&params)?;
+        }
+        if matches!(
+            method,
+            ProviderMethod::WalletGetCapabilities
+                | ProviderMethod::WalletGetPermissions
+                | ProviderMethod::WalletGetStatus
+                | ProviderMethod::WalletRevokePermissions
+                | ProviderMethod::WalletLock
+        ) {
+            validate_empty_params(&params)?;
+        }
+        if method == ProviderMethod::WalletRequestPermissions {
+            let requested = requested_capabilities_from_params(&params)?;
+            if !requested.is_subset(&self.grantable_permission_capabilities()) {
+                return Err(ServiceFailure::unsupported(
+                    ServiceCapability::ProviderDispatch,
+                ));
+            }
         }
         if method == ProviderMethod::WalletLock
             && !self
@@ -789,6 +904,11 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             }
             ProviderMethod::WalletRequestPermissions => {
                 let capabilities = requested_capabilities(&call)?;
+                if !capabilities.is_subset(&self.grantable_permission_capabilities()) {
+                    return Err(ServiceFailure::unsupported(
+                        ServiceCapability::ProviderDispatch,
+                    ));
+                }
                 let expected_generation =
                     expected_permission_generation.ok_or_else(stale_approval)?;
                 let permission = self
@@ -859,6 +979,9 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         ProviderMethod::ALL
             .into_iter()
             .filter(|method| {
+                if *method == ProviderMethod::WalletRequestPermissions {
+                    return !self.grantable_permission_capabilities().is_empty();
+                }
                 if matches!(
                     method,
                     ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
@@ -883,6 +1006,24 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 }
                 service_owned_method(*method) || self.runtime.supports_provider_method(*method)
             })
+            .collect()
+    }
+
+    fn grantable_permission_capabilities(&self) -> BTreeSet<PermissionCapability> {
+        ProviderMethod::ALL
+            .into_iter()
+            .filter(|method| {
+                !matches!(
+                    method,
+                    ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
+                ) && self.runtime.supports_provider_method(*method)
+                    && (!method.approval().is_some_and(value_movement_approval)
+                        || self
+                            .capabilities
+                            .contains(&ServiceCapability::ValueMovement))
+            })
+            .filter_map(ProviderMethod::permission)
+            .filter(|capability| *capability != PermissionCapability::Accounts)
             .collect()
     }
 
@@ -989,8 +1130,15 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
     }
 }
 
-impl<R: ServiceRuntime> WalletService<WalletStore, R> {
-    pub fn new_persistent(store: WalletStore, runtime: R) -> Result<Self, ServiceError> {
+impl WalletService<SharedWalletStore, PersistentControlRuntime> {
+    /// Compose the existing-database subprocess around one locked store
+    /// authority. Constructing the runtime here prevents callers from pairing
+    /// ProviderCore with a different independently unlocked database handle.
+    pub fn new_persistent_control(store: SharedWalletStore) -> Result<Self, ServiceError> {
+        if !store.is_locked()? {
+            return Err(ServiceError::PersistentStoreMustStartLocked);
+        }
+        let runtime = PersistentControlRuntime::new(store.clone());
         Self::new(store, runtime, true)
     }
 }
@@ -1046,10 +1194,15 @@ fn requested_capabilities(
     if call.method == ProviderMethod::HnsRequestAccounts {
         return Ok(BTreeSet::from([PermissionCapability::Accounts]));
     }
-    let value = call
-        .params
+    requested_capabilities_from_params(&call.params)
+}
+
+fn requested_capabilities_from_params(
+    params: &Value,
+) -> Result<BTreeSet<PermissionCapability>, ServiceFailure> {
+    let value = params
         .get("capabilities")
-        .or_else(|| call.params.get("scopes"))
+        .or_else(|| params.get("scopes"))
         .cloned()
         .ok_or_else(|| invalid_request("permission capabilities are required"))?;
     let capabilities: BTreeSet<PermissionCapability> = serde_json::from_value(value)
@@ -1225,6 +1378,19 @@ fn provider_failure(error: ProviderError) -> ServiceFailure {
     }
 }
 
+fn persistent_store_failure(error: StoreError) -> ServiceFailure {
+    let code = match &error {
+        StoreError::Locked => ServiceErrorCode::WalletLocked,
+        StoreError::InvalidPassphrase => ServiceErrorCode::PermissionDenied,
+        _ => ServiceErrorCode::PersistenceFailure,
+    };
+    ServiceFailure {
+        code,
+        message: error.to_string(),
+        unsupported_capability: None,
+    }
+}
+
 impl From<ServiceError> for ServiceFailure {
     fn from(error: ServiceError) -> Self {
         Self {
@@ -1243,6 +1409,10 @@ pub enum ServiceError {
     Abi(#[from] hns_wallet_ffi::AbiError),
     #[error("provider authority or state rejected an operation: {0}")]
     Provider(#[from] ProviderError),
+    #[error("wallet persistence failed: {0}")]
+    Store(#[from] StoreError),
+    #[error("persistent wallet service must start with a locked store")]
+    PersistentStoreMustStartLocked,
     #[error("host must negotiate a private service session first")]
     HandshakeRequired,
     #[error("wallet service session was already negotiated")]
@@ -1262,6 +1432,7 @@ mod tests {
     use super::*;
     use hns_wallet_ffi::{HostHello, decode_service_frame, encode_host_frame};
     use hns_wallet_provider::MemoryProviderState;
+    use hns_wallet_store::WalletStore;
     use hns_wallet_types::{AccountId, BrowserRuntimeSessionId, ProviderAuthorityFingerprint};
 
     const NOW_MS: u64 = 100_000;
@@ -1361,6 +1532,10 @@ mod tests {
 
     fn handle() -> HostAuthorityHandleId {
         HostAuthorityHandleId::from_bytes([2_u8; 32]).expect("handle")
+    }
+
+    fn restart_handle() -> HostAuthorityHandleId {
+        HostAuthorityHandleId::from_bytes([6_u8; 32]).expect("restart handle")
     }
 
     fn registration() -> HostAuthorityRegistration {
@@ -1471,6 +1646,206 @@ mod tests {
     }
 
     #[test]
+    fn production_tranche_persistent_control_reopens_locked_and_preserves_only_permission_authority()
+    {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = tempfile::tempdir().expect("temporary wallet directory");
+        let database_path = directory.path().join("wallet.sqlite3");
+        let first_store = SharedWalletStore::new(
+            WalletStore::create(&database_path, PASSPHRASE).expect("create store"),
+        );
+        assert!(matches!(
+            WalletService::new_persistent_control(first_store.clone()),
+            Err(ServiceError::PersistentStoreMustStartLocked)
+        ));
+        first_store.lock().expect("lock created store");
+        let mut first = WalletService::new_persistent_control(first_store.clone())
+            .expect("first persistent service");
+        assert!(first_store.is_locked().expect("first lock state"));
+        assert!(
+            first
+                .capabilities
+                .contains(&ServiceCapability::PersistentPermissions)
+        );
+        assert!(!first.capabilities.contains(&ServiceCapability::ValueMovement));
+        assert!(!first.capabilities.contains(&ServiceCapability::BrowserIntegration));
+        first
+            .provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("first authority");
+        assert!(matches!(
+            first.provider_capabilities(handle(), 1, NOW_MS),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PersistenceFailure,
+                ..
+            })
+        ));
+
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Unlocked,
+        } = first
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Unlock {
+                        passphrase: hns_wallet_ffi::SecretString::new(PASSPHRASE.to_owned()),
+                    },
+                },
+                NOW_MS,
+            )
+            .expect("unlock first service")
+        else {
+            panic!("unlock response")
+        };
+        assert!(!first_store.is_locked().expect("unlocked first store"));
+        let ServiceResponse::ProviderCapabilities { capabilities, .. } = first
+            .provider_capabilities(handle(), 1, NOW_MS + 1)
+            .expect("first capabilities")
+        else {
+            panic!("first capabilities response")
+        };
+        assert_eq!(
+            capabilities.methods,
+            BTreeSet::from([
+                "wallet_getCapabilities".to_owned(),
+                "wallet_getPermissions".to_owned(),
+                "wallet_getStatus".to_owned(),
+                "wallet_lock".to_owned(),
+                "wallet_revokePermissions".to_owned(),
+            ])
+        );
+        assert!(!capabilities.methods.contains("wallet_requestPermissions"));
+        assert!(matches!(
+            first.provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::WalletRequestPermissions
+                    .wire_name()
+                    .to_owned(),
+                json!({ "capabilities": ["balance"] }),
+                NOW_MS + 2,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::UnsupportedCapability,
+                ..
+            })
+        ));
+
+        first
+            .provider
+            .grant_permissions(
+                handle(),
+                1,
+                BTreeSet::from([PermissionCapability::Balance]),
+                BTreeSet::new(),
+                NOW_MS + 3,
+                None,
+            )
+            .expect("seed persisted permission");
+        let ServiceResponse::ProviderResult { binding, value } = first
+            .provider_request(
+                handle(),
+                1,
+                2,
+                ProviderMethod::WalletRevokePermissions
+                    .wire_name()
+                    .to_owned(),
+                Value::Null,
+                NOW_MS + 4,
+            )
+            .expect("persist tombstone")
+        else {
+            panic!("tombstone response")
+        };
+        assert_eq!(binding.permission_generation, 2);
+        assert_eq!(value["permissionGeneration"], json!(2));
+
+        let first_service_session = first.service_session_id;
+        let first_wallet_session = first.wallet_session_id;
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Locked,
+        } = first
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Lock,
+                },
+                NOW_MS + 5,
+            )
+            .expect("lock first service")
+        else {
+            panic!("lock response")
+        };
+        assert!(first_store.is_locked().expect("locked first store"));
+        drop(first);
+        drop(first_store);
+
+        let second_store = SharedWalletStore::new(
+            WalletStore::open(&database_path).expect("reopen locked store"),
+        );
+        let mut second = WalletService::new_persistent_control(second_store.clone())
+            .expect("second persistent service");
+        assert!(second_store.is_locked().expect("restart lock state"));
+        assert_ne!(second.service_session_id, first_service_session);
+        assert_ne!(second.wallet_session_id, first_wallet_session);
+        assert!(second.pending.is_empty());
+        assert!(second.event_sequences.is_empty());
+        assert!(second.seen_request_ids.is_empty());
+        assert!(second.request_order.is_empty());
+        assert!(matches!(
+            second.provider_capabilities(handle(), 1, NOW_MS + 6),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::AuthorityUnknown,
+                ..
+            })
+        ));
+        second
+            .provider
+            .register_authority(restart_handle(), registration(), NOW_MS + 6)
+            .expect("fresh restart authority");
+        assert!(matches!(
+            second.provider_capabilities(restart_handle(), 1, NOW_MS + 6),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::WalletLocked,
+                ..
+            })
+        ));
+
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Unlocked,
+        } = second
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Unlock {
+                        passphrase: hns_wallet_ffi::SecretString::new(PASSPHRASE.to_owned()),
+                    },
+                },
+                NOW_MS + 7,
+            )
+            .expect("unlock restarted service")
+        else {
+            panic!("restart unlock response")
+        };
+        let ServiceResponse::ProviderCapabilities {
+            binding,
+            capabilities,
+        } = second
+            .provider_capabilities(restart_handle(), 1, NOW_MS + 8)
+            .expect("restart capabilities")
+        else {
+            panic!("restart capabilities response")
+        };
+        assert_eq!(binding.permission_generation, 2);
+        assert_eq!(capabilities.permission_generation, 2);
+        assert!(!capabilities.methods.contains("wallet_requestPermissions"));
+        let permission = second
+            .provider
+            .permission_snapshot(restart_handle(), 1, NOW_MS + 8)
+            .expect("restart permission snapshot");
+        assert_eq!(permission.generation, 2);
+        assert!(permission.record.is_none());
+    }
+
+    #[test]
     fn private_provider_capabilities_are_typed_exact_and_bound() {
         let mut service = provider_service();
         let response = service
@@ -1494,7 +1869,6 @@ mod tests {
             BTreeSet::from([
                 "wallet_getCapabilities".to_owned(),
                 "wallet_getPermissions".to_owned(),
-                "wallet_requestPermissions".to_owned(),
                 "wallet_revokePermissions".to_owned(),
             ])
         );

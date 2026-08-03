@@ -922,6 +922,7 @@ dependencies = [
  "hns-wallet-store",
  "hns-wallet-types",
  "serde_json",
+ "tempfile",
  "thiserror",
  "zeroize",
 ]

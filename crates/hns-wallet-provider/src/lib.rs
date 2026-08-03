@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hns_wallet_store::{StoreError, WalletStore};
+use hns_wallet_store::{SharedWalletStore, StoreError, WalletStore};
 use hns_wallet_types::{
     AccountId, ApprovalId, ApprovalKind, BrowserRuntimeSessionId, HostAuthorityHandleId,
     PROVIDER_METHOD_WIRE_NAMES, PermissionCapability, ProviderAuthorityFingerprint,
@@ -458,6 +458,53 @@ impl ProviderStateStore for WalletStore {
         Ok(())
     }
 
+}
+
+impl ProviderStateStore for SharedWalletStore {
+    fn permission(&self, scope: &str) -> Result<Option<PermissionRecord>, ProviderError> {
+        self.with_store(|store| store.provider_permission(scope))?
+            .map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(ProviderError::from))
+            .transpose()
+    }
+
+    fn permission_generation(&self, scope: &str) -> Result<Option<u64>, ProviderError> {
+        Ok(self.with_store(|store| store.provider_permission_generation(scope))?)
+    }
+
+    fn save_permission(
+        &mut self,
+        scope: &str,
+        record: &PermissionRecord,
+    ) -> Result<(), ProviderError> {
+        let encoded = serde_json::to_vec(record)?;
+        self.with_store_mut(|store| {
+            store.put_provider_permission(
+                scope,
+                record.generation,
+                &encoded,
+                record.created_at_unix,
+            )
+        })?;
+        Ok(())
+    }
+
+    fn revoke_permission(
+        &mut self,
+        scope: &str,
+        expected_generation: u64,
+        next_generation: u64,
+        now_unix: u64,
+    ) -> Result<(), ProviderError> {
+        self.with_store_mut(|store| {
+            store.revoke_provider_permission(
+                scope,
+                expected_generation,
+                next_generation,
+                now_unix,
+            )
+        })?;
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -1292,6 +1339,7 @@ impl From<StoreError> for ProviderError {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::Replay => Self::Replay,
+            StoreError::Locked => Self::WalletLocked,
             _ => Self::Persistence,
         }
     }

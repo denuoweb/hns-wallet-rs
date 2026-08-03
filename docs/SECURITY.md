@@ -61,6 +61,15 @@ The store rejects empty passphrases and inputs larger than 1,024 bytes at its
 own API boundary; this is a resource/safety bound, not a substitute for device
 key wrapping or a password-strength policy.
 
+The persistent subprocess gives runtime control and provider persistence clones
+of one non-debuggable `SharedWalletStore`; it does not open a second unlocked
+permission connection or retain a second derived record key. Construction
+requires that shared store to be locked. Unlock completes migration cleanup
+before the service rotates its wallet session, and a session-entropy failure
+synchronously clears the shared key again. Lock clears that key before the
+provider session is rotated. Detection of a poisoned store mutex recovers it
+only long enough to clear the key and then fails closed.
+
 This is authenticated record encryption, not whole-file encryption. Table
 names, row counts, indexes, selected authenticated metadata, filenames, SQLite
 journals, and access patterns may be visible. On Linux, persistent opening
@@ -159,7 +168,10 @@ fail closed. The account result is validated and bounded before the scoped
 grant is persisted against the exact generation authenticated by the approval;
 a generation mismatch fails stale. `hns_accounts` reads only that stored set,
 and both account methods fail unavailable if the runtime selector is absent or
-later withdrawn. The checked-in unavailable runtime cannot advertise the join.
+later withdrawn. The checked-in persistent control runtime cannot advertise the
+join. It also cannot advertise or execute generic permission creation because
+none of its currently supported methods consumes a permission scope; this
+prevents dormant grants from gaining meaning after a runtime upgrade.
 Host restart/reset independently drops every service-derived handle revision,
 pending request and approval, private binding, and event cursor. A response
 kind mismatch, stale session, sequence gap/replay, unknown request ID, or stale

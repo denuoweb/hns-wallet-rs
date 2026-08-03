@@ -1,18 +1,19 @@
 #![forbid(unsafe_code)]
 
+use std::ffi::OsStr;
 use std::io::{self, ErrorKind, Read, Write};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hns_wallet_ffi::{declared_payload_len, LENGTH_PREFIX_BYTES};
-use hns_wallet_provider::MemoryProviderState;
-use hns_wallet_service::{UnavailableRuntime, WalletService};
+use hns_wallet_service::WalletService;
+use hns_wallet_store::{SharedWalletStore, WalletStore};
 use zeroize::Zeroizing;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut service = WalletService::new_ephemeral(
-        MemoryProviderState::default(),
-        UnavailableRuntime,
-    )?;
+    let database_path = wallet_database_path()?;
+    let store = SharedWalletStore::new(WalletStore::open(database_path)?);
+    let mut service = WalletService::new_persistent_control(store)?;
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     loop {
@@ -38,4 +39,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output.write_all(&response)?;
         output.flush()?;
     }
+}
+
+fn wallet_database_path() -> io::Result<PathBuf> {
+    let mut arguments = std::env::args_os().skip(1);
+    let flag = arguments.next();
+    let path = arguments.next().ok_or_else(invalid_arguments)?;
+    if flag.as_deref() != Some(OsStr::new("--database"))
+        || path.is_empty()
+        || arguments.next().is_some()
+    {
+        return Err(invalid_arguments());
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn invalid_arguments() -> io::Error {
+    io::Error::new(
+        ErrorKind::InvalidInput,
+        "usage: hns-wallet-service --database <existing-wallet-database>",
+    )
 }

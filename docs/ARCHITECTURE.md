@@ -33,7 +33,7 @@ application workflows.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `hns-wallet-types` | IDs, integer amounts, capabilities, UI-safe summaries | consensus/wire types |
-| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, complete bounded binary-prefix entity and opaque-workflow reads, atomic approval-consume/workflow/reservation commits, provider permission tombstones, persisted workflow approvals/replays | browser storage, ABI v2 authority handles, or remote truth |
+| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, complete bounded binary-prefix entity and opaque-workflow reads, atomic approval-consume/workflow/reservation commits, provider permission tombstones, persisted workflow approvals/replays, one cloneable process-local lock/key authority | browser storage, ABI v2 authority handles, or remote truth |
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, three-branch restoration, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
@@ -42,7 +42,7 @@ application workflows.
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events | raw keys/native commands or engine authority objects |
-| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition, runtime-selected atomic HNS account grant and minimized persisted account projection | concrete HNS runtime composition, browser engine policy, or availability claims |
+| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition, locked existing-database control runtime, runtime-selected atomic HNS account grant and minimized persisted account projection | concrete HNS chain/account runtime composition, browser engine policy, or product availability claims |
 | `hns-wallet-host` | host-owned negotiation, identifiers/nonces, bounded request correlation, authority revisions, approval ownership, private provider bindings, and event replay cursors | platform process launch, engine policy, page injection, artifact trust, or availability claims |
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
 
