@@ -61,6 +61,20 @@ admission policy remain required for a live relay. The cache does not persist
 an action capability; current locking-coin/network/time authority must be
 reacquired before a listing can drive value behavior.
 
+Dormant Shakedex transaction plans use the encrypted seller or buyer workflow
+journal and its exact expected revision. Fulfillment plans retain the canonical
+seller-controlled prefix and caller-supplied buyer suffix; recovery plans bind
+the exact lock descriptor and explicit recovery recipient. Script-controlled
+FINALIZE construction is typed but remains memory-only until a durable plan is
+added. Exact retries may revalidate the same persisted plan, while a stale
+revision or changed canonical plan fails instead of replacing previously
+prepared bytes. This CAS state is crash-recovery and audit data only. On every
+resume, the product must reacquire current/unspent lock evidence, active-chain
+NameState and renewal evidence, authoritative parent MTP, wallet funding and
+reservations, signing approval, fee evidence, and broadcast/reorg state. A
+persisted or newly supplied Coin, MTP, or NameState never restores those
+authorities.
+
 HNS authorization can authenticate and return a pending approval without
 consuming it. After exact signed-byte fee quoting succeeds, a bounded immediate
 transaction re-authenticates that unchanged approval together with the current
@@ -175,7 +189,8 @@ The product runtime must:
 9. expire price rounds, intents, fill grants, persisted workflow approvals, and replay rows only
    after their authenticated metadata verifies;
 10. restore swap sessions and independently verify every recorded funding,
-   redemption, and refund;
+   redemption, refund, and Shakedex plan against newly acquired chain
+   authority;
 11. extract an on-chain preimage only from the exact verified spend/event;
 12. determine refund eligibility from validated local chain time; and
 13. surface user actions without automatically moving value.

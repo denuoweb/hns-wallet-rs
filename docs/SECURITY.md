@@ -210,6 +210,22 @@ network and genesis identity, current owner inclusion, candidate height,
 ordered eligibility reasons, lockup, renewal window/hash, and absence of an
 owner spender. Persisted action context is audit/recovery evidence only.
 
+Shakedex fulfillment, explicit-recipient recovery, and script-controlled
+FINALIZE adapters enforce canonical transaction shape. Encrypted workflow CAS
+persists signed fulfillment and recovery plans; script-controlled FINALIZE
+remains memory-only. Persisted plan CAS prevents a restart or stale writer from
+silently substituting different planned bytes; it does not make the plan safe
+to submit. Ordinary funding inputs require exact P2PKH witness layout and
+`SIGHASH_ALL`; output suffixes must remain bounded ordinary P2PKH outputs.
+Script-controlled FINALIZE additionally binds its TRANSFER coin to output zero
+of a fully verified fulfillment or recovery parent that spends the exact lock.
+A supplied Coin, wall time, parent MTP, NameState, renewal block, funding input,
+or funding output is untrusted structural input until the HNS
+adapter reacquires it from one current chain/mempool authority. Wallet coin
+selection, reservations, signing, fee approval, broadcast ordering, conflict
+and reorg supervision, and live Denuo transport remain unavailable, and no
+Shakedex release gate is enabled.
+
 Ethereum has no embedded Helios proof producer in this revision. Its exact
 synchronization, value-runtime, settlement-runtime, and mainnet gates are
 immutable and false; history shares the synchronization gate. Opaque permits

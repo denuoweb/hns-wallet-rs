@@ -25,7 +25,8 @@ protocol-verification boundary and encrypted replay/tombstone board state. Node
 indexes and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
 remains in `hns-dane-engine`. Browser JavaScript and platform UI remain in the
 browser repositories. This workspace owns keys, encrypted local state, wallet
-semantics, approvals, and recoverable application workflows.
+semantics, approvals, typed canonical transaction planning, and recoverable
+application workflows.
 
 ## Crate boundaries
 
@@ -36,7 +37,7 @@ semantics, approvals, and recoverable application workflows.
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | HNS key roles, address/coin/name evidence and workflows | canonical encodings |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
-| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact listing/cancellation protocol verification, canonical Denuo adapter, encrypted sequence/tombstone board | proof/listing/Denuo codecs or caller-asserted chain truth |
+| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact listing/cancellation protocol verification, canonical fulfillment/recovery/script-FINALIZE planning, encrypted plan CAS, canonical Denuo adapter, encrypted sequence/tombstone board | proof/listing/Denuo codecs, HNS key ownership, coin selection/signing/broadcast, or caller-asserted chain truth |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
@@ -111,6 +112,18 @@ outgoing transfers are distinguished. Reconciliation replaces this encrypted
 cache across restart/reorg, while legacy rows stay explicitly watch-only until
 fresh evidence succeeds. Cache state cannot authorize an action: the runtime
 must reacquire a non-serializable authority at the exact current snapshot.
+
+The Shakedex transaction adapters are a canonical construction boundary, not a
+chain adapter. They can bind an authenticated listing or lock descriptor to a
+supplied Coin, check fulfillment against a supplied parent MTP, construct an
+explicit-recipient recovery, and construct script-controlled FINALIZE from a
+supplied TRANSFER coin, NameState, and renewal block. Encrypted workflow CAS can
+retain signed fulfillment and recovery plans across restart; script-controlled
+FINALIZE is memory-only until its own durable plan lands. The enclosing HNS runtime must still
+replace every supplied Coin/MTP/NameState fact with fresh current/unspent and
+active-chain authority before funding, signing, reservation, fee approval, or
+broadcast; later reconciliation must supervise conflicts and reorgs. Live
+Denuo transport remains a separate unavailable boundary.
 
 Wallet-owned name actions additionally consume the node's versioned
 `name_action_context` for the exact chain epoch, tip, mempool instance and

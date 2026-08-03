@@ -929,9 +929,11 @@ dependencies = [
 name = "hns-wallet-shakedex"
 version = "0.1.0"
 dependencies = [
+ "blake2",
  "hns-covenants",
  "hns-marketplace-protocol",
  "hns-primitives",
+ "hns-script",
  "hns-swap",
  "hns-transaction",
  "hns-wallet-store",

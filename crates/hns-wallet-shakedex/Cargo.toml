@@ -8,7 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hns-covenants.workspace = true
 hns-marketplace-protocol.workspace = true
+hns-primitives.workspace = true
+hns-script.workspace = true
 hns-swap.workspace = true
 hns-transaction.workspace = true
 hns-wallet-store.workspace = true
@@ -17,8 +20,7 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-hns-covenants.workspace = true
-hns-primitives.workspace = true
+blake2.workspace = true
 k256.workspace = true
 
 [lints]

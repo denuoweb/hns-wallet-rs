@@ -3,6 +3,8 @@
 
 mod board;
 mod canonical;
+mod plans;
+mod transactions;
 
 pub use board::{
     BoardOfferStatus, NameMarketBoard, PersistedBoardOffer, StoredNameMarketBoard,
@@ -14,6 +16,21 @@ pub use canonical::{
     decode_denuo_inventory, decode_denuo_offer, decode_denuo_request, encode_denuo_cancellation,
     encode_denuo_inventory, encode_denuo_offer, encode_denuo_request, verify_fixed_price_listing,
     verify_listing_cancellation,
+};
+pub use plans::{
+    BuyerLockPlan, BuyerLockPlanState, MAX_SHAKEDEX_TRANSACTION_PLANS, SellerLockPlan,
+    SellerLockPlanState, StoredBuyerLockPlan, StoredSellerLockPlan, list_buyer_lock_plans,
+    list_seller_lock_plans, load_buyer_lock_plan, load_seller_lock_plan, save_buyer_lock_plan,
+    save_seller_lock_plan,
+};
+pub use transactions::{
+    MAX_SHAKEDEX_FUNDING_INPUTS, PreparedBuyerFulfillment, PreparedScriptFinalize,
+    PreparedSellerRecovery, SellerAuthorizedRecovery, SuppliedShakedexLock,
+    VerifiedBuyerFulfillment, VerifiedScriptFinalize, VerifiedSellerRecovery,
+    VerifiedShakedexTransfer,
+    prepare_buyer_fulfillment, prepare_script_finalize, prepare_seller_recovery,
+    verify_signed_buyer_fulfillment, verify_signed_script_finalize,
+    verify_signed_seller_recovery,
 };
 
 use hns_swap::{FixedPriceListing, MAX_FIXED_PRICE_LISTING_SIZE};

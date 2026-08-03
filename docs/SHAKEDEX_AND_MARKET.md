@@ -24,6 +24,35 @@ without pretending those bytes prove current ownership. Denuo offer and
 cancellation decoders return typed protocol results rather than
 unauthenticated wire objects.
 
+The dormant value-planning boundary now has typed canonical adapters for the
+three script-controlled transaction shapes needed after a name reaches its
+Shakedex lock. Buyer fulfillment is reconstructed through the signed proof's
+canonical fulfillment builder, with the seller input and payment kept in their
+fixed positions. Seller recovery is reconstructed through the exact lock
+descriptor and an explicit recovery recipient. Script-controlled FINALIZE is
+constructed from a supplied TRANSFER coin and NameState and installs the
+descriptor's script-only finalize witness. Fulfillment preparation rechecks
+the listing at the supplied current wall time and checks the proof's encoded
+time lock against the separately supplied parent MTP. FINALIZE preparation
+requires a verified fulfillment or recovery parent and binds the supplied
+TRANSFER coin to that parent's exact transaction ID and output zero. These
+adapters accept explicit funding suffixes only as bounded transaction-building
+inputs; they do not select wallet funds, reserve inputs, or sign buyer or
+seller keys. Prepared results bind ordered input coins and outpoints, exact
+fees, expected recipients, and canonical bytes; signed-result verification
+requires exact `SIGHASH_ALL` P2PKH funding witnesses and rechecks bounded
+ordinary outputs, covenant links, and standard witness execution rather than
+trusting a caller success flag.
+
+Signed fulfillment and recovery results can be retained as encrypted buyer or
+seller workflow plan state under the compare-and-swap journal. A persisted plan
+binds its canonical terms and transaction bytes so a restart can reject a
+changed or stale plan instead of silently rebuilding different bytes.
+Script-controlled FINALIZE remains memory-only. Persisting or revalidating a
+plan is not chain authorization: the supplied Coin, parent MTP, NameState,
+renewal block, and funding suffix are caller inputs, not proof that they are
+fresh, current, unspent, or on the active chain.
+
 The encrypted `DenuoBoardObject` namespace now has a versioned, bounded board
 reducer and CAS load/save boundary. It persists canonical listing and
 cancellation bytes, content hashes, network/genesis, name hash, seller key,
@@ -48,18 +77,20 @@ check these gates before validation or mutation. Existing sessions restored
 from legacy persisted records therefore cannot bypass the boundary.
 The Denuo gate governs live transport, relay publication, and product
 discovery. Offline canonical envelope parsing and encrypted cache reduction do
-not enable those runtime paths or advertise the feature.
+not enable those runtime paths or advertise the feature. Typed transaction
+planning and encrypted plan CAS likewise do not enable a value workflow.
 
 The wallet now has coherent canonical V2 source plus exact NameState/resource/
 owner-output validation and ephemeral account ownership authority. Those are
 prerequisites, not Shakedex authorization. Wallet-owned P2PKH TRANSFER/direct
 FINALIZE is implemented behind HNS gates, but Shakedex cannot reuse that
-authority. Locked-name/script-controlled transfer/finalize, wallet-owned typed
-signing, funded fulfillment and recovery orchestration, authenticated
-parent-MTP and unspent-coin evidence, live Denuo transport, trusted browser
-approval, consolidated protocol qualification, and restart/reorg/regtest
-evidence are still required before any gate can change. Reverse Dutch is
-deferred.
+authority. Canonical fulfillment, recovery, and script-controlled FINALIZE
+planning is present, but authenticated current/unspent lock acquisition,
+wallet-owned key allocation and signing, ordinary-coin selection and
+reservation, exact fee approval, broadcast supervision, active-chain
+NameState/renewal evidence, parent-MTP authority, live Denuo transport, trusted
+browser approval, and restart/reorg/regtest qualification are still required
+before any gate can change. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 
