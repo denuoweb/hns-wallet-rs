@@ -17,6 +17,7 @@ hkdf.workspace = true
 hns-covenants.workspace = true
 hns-primitives.workspace = true
 hns-script.workspace = true
+hns-swap.workspace = true
 hns-transaction.workspace = true
 hns-urkel-proof.workspace = true
 hns-wallet-chain-api.workspace = true

@@ -8,12 +8,12 @@ use std::path::Path;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use hmac::{Hmac, Mac};
 use hns_wallet_types::{ApprovalId, WorkflowId, WorkflowKind};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
@@ -56,6 +56,7 @@ pub enum EntityKind {
     NameOwnerOutpoint,
     NameTransfer,
     Shakedex,
+    HnsShakedexKeyAllocation,
     DenuoBoardObject,
     BitcoinHeader,
     BitcoinFilterHeader,
@@ -88,6 +89,7 @@ impl EntityKind {
             Self::NameOwnerOutpoint => "name_owner_outpoint",
             Self::NameTransfer => "name_transfer",
             Self::Shakedex => "shakedex",
+            Self::HnsShakedexKeyAllocation => "hns_shakedex_key_allocation",
             Self::DenuoBoardObject => "denuo_board_object",
             Self::BitcoinHeader => "bitcoin_header",
             Self::BitcoinFilterHeader => "bitcoin_filter_header",
@@ -111,7 +113,10 @@ impl EntityKind {
     }
 
     const fn deletion_protected(self) -> bool {
-        matches!(self, Self::BitcoinSwapKeyAllocation)
+        matches!(
+            self,
+            Self::HnsShakedexKeyAllocation | Self::BitcoinSwapKeyAllocation
+        )
     }
 }
 
@@ -1305,6 +1310,68 @@ impl WalletStore {
         )?;
         transaction.commit()?;
         Ok((next, account_next))
+    }
+
+    /// Atomically advances one wallet account together with a bounded entity
+    /// batch. Both namespaces are authenticated and every expected revision
+    /// is checked under the same immediate transaction before the first write.
+    pub fn apply_account_and_entity_batch<A: Serialize, E: Serialize>(
+        &mut self,
+        account_save: &EntityBatchSave<A>,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+    ) -> Result<u64, StoreError> {
+        if entity_kind == EntityKind::WalletAccount {
+            return Err(StoreError::DuplicateBatchEntity);
+        }
+        let operation_count = 1_usize
+            .checked_add(saves.len())
+            .and_then(|count| count.checked_add(deletes.len()))
+            .ok_or(StoreError::BatchCapacity)?;
+        if operation_count > MAX_ENTITY_BATCH_OPERATIONS {
+            return Err(StoreError::BatchCapacity);
+        }
+        let prepared_account = prepare_entity_batch(std::slice::from_ref(account_save), &[])?;
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authenticated_account = authenticate_entity_batch(
+            &transaction,
+            key,
+            &self.database_id,
+            EntityKind::WalletAccount,
+            &prepared_account,
+            &[],
+        )?;
+        let authenticated_entities = authenticate_entity_batch(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+        let account_next = authenticated_account
+            .first()
+            .map(|(_, revision, _, _)| *revision)
+            .ok_or(StoreError::CorruptMetadata)?;
+        write_entity_batch_in_transaction(
+            &transaction,
+            EntityKind::WalletAccount,
+            &authenticated_account,
+            &[],
+        )?;
+        write_entity_batch_in_transaction(
+            &transaction,
+            entity_kind,
+            &authenticated_entities,
+            deletes,
+        )?;
+        transaction.commit()?;
+        Ok(account_next)
     }
 
     pub fn apply_entity_batch<E: Serialize>(
@@ -3156,9 +3223,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("raw envelope");
-        assert!(!raw
-            .windows(b"never persist me clear".len())
-            .any(|window| window == b"never persist me clear"));
+        assert!(
+            !raw.windows(b"never persist me clear".len())
+                .any(|window| window == b"never persist me clear")
+        );
         assert_eq!(
             store
                 .get_secret(b"seed", SecretKind::RecoverySeed)
@@ -3261,19 +3329,23 @@ mod tests {
             .expect("take approval")
             .expect("live approval");
         assert_eq!(approval.request_json.as_slice(), b"approval commitment");
-        assert!(store
-            .take_pending_approval(id, 10)
-            .expect("second take")
-            .is_none());
+        assert!(
+            store
+                .take_pending_approval(id, 10)
+                .expect("second take")
+                .is_none()
+        );
 
         let expired = ApprovalId::new([8; 16]);
         store
             .put_pending_approval(expired, "https://wallet.example", b"expired", 20, 30)
             .expect("put expired approval");
-        assert!(store
-            .take_pending_approval(expired, 30)
-            .expect("expire approval")
-            .is_none());
+        assert!(
+            store
+                .take_pending_approval(expired, 30)
+                .expect("expire approval")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3332,10 +3404,12 @@ mod tests {
             .expect("account present");
         assert_eq!(account.revision, 1);
         assert_eq!(account.value["next_change"], 0);
-        assert!(store
-            .load_workflow::<serde_json::Value>(workflow_id)
-            .expect("load workflow")
-            .is_none());
+        assert!(
+            store
+                .load_workflow::<serde_json::Value>(workflow_id)
+                .expect("load workflow")
+                .is_none()
+        );
 
         let reservation = EntityBatchSave {
             id: vec![3_u8; 36],
@@ -3366,14 +3440,18 @@ mod tests {
                 .value["next_change"],
             1
         );
-        assert!(store
-            .load_workflow::<serde_json::Value>(workflow_id)
-            .expect("load workflow")
-            .is_some());
-        assert!(store
-            .input_reservation::<serde_json::Value>(&[3_u8; 36])
-            .expect("load reservation")
-            .is_some());
+        assert!(
+            store
+                .load_workflow::<serde_json::Value>(workflow_id)
+                .expect("load workflow")
+                .is_some()
+        );
+        assert!(
+            store
+                .input_reservation::<serde_json::Value>(&[3_u8; 36])
+                .expect("load reservation")
+                .is_some()
+        );
     }
 
     #[test]

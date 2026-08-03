@@ -2,7 +2,7 @@
 
 `HnsNodeRpcBackend` is the concrete synchronous wallet-side adapter for the
 authenticated `hns-node-rs` wallet RPC v1 contract frozen at node commit
-`e5f95c05f72095484a2a33eb00aa7d1695eae4fb`. It implements `HnsBackend`; the
+`c1b633d1aa7f1be290d20ecf5b653f396a9b0e6c`. It implements `HnsBackend`; the
 node supplies canonical chain evidence and broadcast admission while the wallet
 alone derives keys, signs, approves, and persists workflows. The node never
 signs.
@@ -46,11 +46,17 @@ add a nonzero process-instance nonce and generation; both remain exact across
 all continuations, gap-limit expansion, transaction/parent reads, and workflow
 reconciliation. Any difference discards the partial snapshot.
 
+Every current tip also carries the HSD-compatible median time past computed by
+the node from that tip and up to ten ancestors inside the same immutable read.
+The wallet wire field is mandatory. Legacy persisted bindings decode with zero
+only for compatibility and cannot authorize Shakedex execution until a fresh
+node snapshot replaces them.
+
 The ordinary receive/change branches and the domain-separated `HnsName` branch
-use separate bounded script queries. The name query is accepted only under the
-exact chain binding and mempool binding learned by the coin query, so neither
-query can reduce the other's lookahead or combine observations from different
-node views.
+and `HnsShakedex` 32-byte lock branch use separate bounded script queries. Each
+later query is accepted only under the exact chain and mempool bindings learned
+by the coin query, so no branch reduces another's lookahead or combines
+observations from different node views.
 
 ScriptId derivation hashes the canonical address bytes
 `[version, hash_length_u8, hash...]` with BLAKE2b-256, sorts the resulting IDs,
@@ -147,8 +153,13 @@ authorize value. `verify_name_ownership`
 reacquires a non-serializable authority from the exact live snapshot and only
 for a registered, unexpired, unrevoked, non-transferring owner output matching a
 persisted `HnsName` derivation. Shakedex/HTLC descriptor or preimage transport
-remains unavailable until protocol qualification, canonical fee-quote
-qualification, product integration, and the recorded gates land. Ordinary HNS
+remains unavailable as a value path. The wallet can now reacquire non-
+serializable current/unspent Shakedex lock and TRANSFER authorities, including
+tip MTP and FINALIZE renewal evidence. TRANSFER authority additionally binds
+the preserved output-zero owner program back to the descriptor's seller script
+and canonical name hash. Funding reservation, approval,
+broadcast/reorg supervision, protocol qualification, product integration, and
+the recorded gates remain outstanding. Ordinary HNS
 send, the exposed settlement lock/redeem/refund paths, and wallet-owned P2PKH
 TRANSFER/direct-FINALIZE source workflows are within the exact quote boundary.
 Provider dispatch and release qualification remain incomplete.

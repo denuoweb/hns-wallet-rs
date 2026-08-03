@@ -215,16 +215,33 @@ FINALIZE adapters enforce canonical transaction shape. Encrypted workflow CAS
 persists signed fulfillment and recovery plans; script-controlled FINALIZE
 remains memory-only. Persisted plan CAS prevents a restart or stale writer from
 silently substituting different planned bytes; it does not make the plan safe
-to submit. Ordinary funding inputs require exact P2PKH witness layout and
+to submit. Seller keys are allocated through a deletion-protected encrypted
+namespace with an account-global CAS high-water, immutable workflow/name/terms
+binding, seed commitment, and no persisted scalar. The recovered signer is
+non-cloneable, non-serializable, redacted, and has no arbitrary-digest method.
+The allocation transaction advances WalletAccount and protected high-water
+together, while a durable scan-required/scanning gate prevents a second
+writer to the same wallet database from allocating before mnemonic restoration
+commits. The signer
+recomputes the canonical payment, price, deadline, and fee commitment from
+every proof before signing, and proof/listing signing accepts the current-lock
+capability instead of a caller-supplied Coin. A protected recovery signature
+additionally requires a current-lock preparation and the exact current-lock
+capability at the authorization call; freshness before irreversible use remains
+the enclosing runtime's responsibility.
+Ordinary funding inputs require exact P2PKH witness layout and
 `SIGHASH_ALL`; output suffixes must remain bounded ordinary P2PKH outputs.
 Script-controlled FINALIZE additionally binds its TRANSFER coin to output zero
 of a fully verified fulfillment or recovery parent that spends the exact lock.
-A supplied Coin, wall time, parent MTP, NameState, renewal block, funding input,
-or funding output is untrusted structural input until the HNS
-adapter reacquires it from one current chain/mempool authority. Wallet coin
-selection, reservations, signing, fee approval, broadcast ordering, conflict
-and reorg supervision, and live Denuo transport remain unavailable, and no
-Shakedex release gate is enabled.
+The HNS current-lock and current-TRANSFER authorities replace supplied Coin,
+parent MTP, NameState, and renewal facts with one fresh chain/mempool-bound
+capability and require both confirmed and mempool unspentness. Current
+TRANSFER authority also requires its preserved owner program to equal the
+descriptor seller-key script hash. Wall time and
+funding inputs/outputs remain untrusted structural inputs until the enclosing
+workflow validates them. Wallet coin selection, reservations, funding signing,
+fee approval, broadcast ordering, conflict/reorg supervision, and live Denuo
+transport remain unavailable, and no Shakedex release gate is enabled.
 
 Ethereum has no embedded Helios proof producer in this revision. Its exact
 synchronization, value-runtime, settlement-runtime, and mainnet gates are
@@ -243,7 +260,7 @@ adapter and canonical HNS name-state/resource ownership source are present, but
 their consolidated qualification, a published canonical HNS settlement
 profile, consolidated qualification of the integrated HSD fee algebra and
 name-action context, Bitcoin supervisor qualification, embedded Helios proof
-construction/persistence, name-role scan
+construction/persistence, three-branch HNS restoration and Shakedex-key
 qualification, restart/reorg
 demonstrations, real-chain tests, resource benchmarks, and independent review
 remain blockers.

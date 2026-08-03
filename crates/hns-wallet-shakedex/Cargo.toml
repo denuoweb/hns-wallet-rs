@@ -14,6 +14,7 @@ hns-primitives.workspace = true
 hns-script.workspace = true
 hns-swap.workspace = true
 hns-transaction.workspace = true
+hns-wallet-hns.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
 serde.workspace = true

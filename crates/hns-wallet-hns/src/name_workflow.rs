@@ -215,6 +215,123 @@ pub struct NameActionContextEvidence {
     pub mempool_spender: Option<TransactionHash>,
 }
 
+/// Ephemeral current-chain authority for one canonical, unspent Shakedex
+/// FINALIZE lock. It is deliberately non-cloneable and non-serializable; a
+/// restart, reorg, or mempool-generation change requires reacquisition.
+pub struct VerifiedCurrentShakedexLock {
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+    descriptor: hns_swap::ShakedexLockDescriptor,
+    locking_coin: Coin,
+    current_state: NameState,
+}
+
+impl VerifiedCurrentShakedexLock {
+    pub const fn binding(&self) -> SnapshotBinding {
+        self.binding
+    }
+
+    pub const fn mempool_binding(&self) -> MempoolSnapshotBinding {
+        self.mempool
+    }
+
+    pub const fn parent_median_time(&self) -> u64 {
+        self.binding.tip.median_time_past
+    }
+
+    pub const fn descriptor(&self) -> &hns_swap::ShakedexLockDescriptor {
+        &self.descriptor
+    }
+
+    pub const fn locking_coin(&self) -> &Coin {
+        &self.locking_coin
+    }
+
+    pub const fn current_name_state(&self) -> &NameState {
+        &self.current_state
+    }
+}
+
+impl fmt::Debug for VerifiedCurrentShakedexLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedCurrentShakedexLock")
+            .field("binding", &self.binding)
+            .field("mempool", &self.mempool)
+            .field("locking_outpoint", &self.locking_coin.outpoint)
+            .field(
+                "name_hash",
+                &hex::encode(self.current_state.name_hash.as_bytes()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Ephemeral current-chain authority for the exact unspent TRANSFER created
+/// from a Shakedex lock. It additionally binds canonical FINALIZE renewal
+/// evidence under the same chain/mempool snapshot.
+pub struct VerifiedCurrentShakedexTransfer {
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+    descriptor: hns_swap::ShakedexLockDescriptor,
+    transfer_transaction: Transaction,
+    transfer_coin: Coin,
+    current_state: NameState,
+    renewal_block_height: u64,
+    renewal_block_hash: [u8; 32],
+}
+
+impl VerifiedCurrentShakedexTransfer {
+    pub const fn binding(&self) -> SnapshotBinding {
+        self.binding
+    }
+
+    pub const fn mempool_binding(&self) -> MempoolSnapshotBinding {
+        self.mempool
+    }
+
+    pub const fn descriptor(&self) -> &hns_swap::ShakedexLockDescriptor {
+        &self.descriptor
+    }
+
+    pub const fn transfer_transaction(&self) -> &Transaction {
+        &self.transfer_transaction
+    }
+
+    pub const fn transfer_coin(&self) -> &Coin {
+        &self.transfer_coin
+    }
+
+    pub const fn current_name_state(&self) -> &NameState {
+        &self.current_state
+    }
+
+    pub const fn renewal_block_height(&self) -> u64 {
+        self.renewal_block_height
+    }
+
+    pub const fn renewal_block_hash(&self) -> [u8; 32] {
+        self.renewal_block_hash
+    }
+}
+
+impl fmt::Debug for VerifiedCurrentShakedexTransfer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedCurrentShakedexTransfer")
+            .field("binding", &self.binding)
+            .field("mempool", &self.mempool)
+            .field("transfer_outpoint", &self.transfer_coin.outpoint)
+            .field(
+                "name_hash",
+                &hex::encode(self.current_state.name_hash.as_bytes()),
+            )
+            .field("renewal_block_height", &self.renewal_block_height)
+            .field("renewal_block_hash", &hex::encode(self.renewal_block_hash))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Non-serializable authorization to spend one confirmed outgoing TRANSFER.
 /// The old owner-address key signs direct FINALIZE; merely being the incoming
 /// recipient does not confer signing authority.
@@ -424,7 +541,9 @@ fn ensure_name_value_ready(cache: &HnsRuntimeCache) -> Result<(), HnsWalletError
     Ok(())
 }
 
-fn expected_chain_identity(network: HnsNetwork) -> Result<(u8, [u8; 32]), HnsWalletError> {
+pub(super) fn expected_chain_identity(
+    network: HnsNetwork,
+) -> Result<(u8, [u8; 32]), HnsWalletError> {
     let (network_id, encoded) = match network {
         HnsNetwork::Mainnet => (
             0,
@@ -1208,6 +1327,46 @@ fn project_name_operation(
     })
 }
 
+fn require_current_owner_unspent<B: HnsBackend>(
+    backend: &B,
+    owner_outpoint: HnsOutpoint,
+    binding: SnapshotBinding,
+) -> Result<(), HnsWalletError> {
+    let evidence = backend.get_outpoint_spend_evidence(&[owner_outpoint], binding)?;
+    validate_spend_evidence(&evidence, binding, &[owner_outpoint])?;
+    if evidence.entries[0].spending.is_some() {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(())
+}
+
+fn canonical_current_name_coin(
+    owner: &ValidatedNameOwner,
+) -> Result<(Transaction, Coin), HnsWalletError> {
+    let transaction =
+        decode_transaction_for_id(&owner.raw_transaction, owner.outpoint.transaction)?;
+    if transaction.inputs.is_empty()
+        || transaction
+            .inputs
+            .iter()
+            .any(|input| input.previous_output.is_null())
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let confirmed_height =
+        u32::try_from(owner.inclusion.height).map_err(|_| HnsWalletError::InvalidEvidence)?;
+    let coin = canonical_coin_from_evidence(
+        owner.outpoint,
+        BaseUnits::new(u128::from(owner.output.value.get())),
+        Some(confirmed_height),
+        false,
+        owner.output.address.version,
+        owner.output.address.hash.clone(),
+        owner.output.covenant.clone(),
+    )?;
+    Ok((transaction, coin))
+}
+
 fn confirmed_transfer_spend_kind<B: HnsBackend>(
     backend: &B,
     transfer_transaction: &Transaction,
@@ -1419,8 +1578,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     && source.action_context.renewal_period == Some(expected.renewal_period)
                     && source.action_context.renewal_block_height
                         == Some(expected.renewal_block_height)
-                    && source.action_context.renewal_block_hash
-                        == Some(expected.renewal_block_hash)
+                    && source.action_context.renewal_block_hash == Some(expected.renewal_block_hash)
             }
         };
         if !stable_source_matches || !action_terms_match {
@@ -2384,6 +2542,147 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         )
     }
 
+    /// Reacquire current, unspent chain authority for one exact Shakedex lock.
+    /// The canonical node supplies NameState, owner, active-chain, mempool, and
+    /// MTP evidence; the wallet independently binds the supplied seller key to
+    /// the consensus FINALIZE coin's 32-byte lock program.
+    pub fn verify_current_shakedex_lock(
+        &self,
+        name: &[u8],
+        seller_public_key: [u8; 33],
+    ) -> Result<VerifiedCurrentShakedexLock, HnsWalletError> {
+        let cache = self.cache_read()?;
+        let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let mempool = cache
+            .mempool_binding
+            .ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        if binding.tip.median_time_past == 0 {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let validated = validated_name_evidence(&self.backend, name, binding, None)?;
+        let current = validated.current.ok_or(HnsWalletError::InvalidEvidence)?;
+        let owner = current.owner.ok_or(HnsWalletError::InvalidEvidence)?;
+        if owner.output.covenant.kind != CovenantKind::Finalize {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        self.require_action_context(
+            &config,
+            HnsNameAction::Transfer,
+            validated.known_name.name_hash,
+            owner.outpoint,
+            owner.inclusion,
+            binding,
+            mempool,
+            &current.state,
+            true,
+        )?;
+        require_current_owner_unspent(&self.backend, owner.outpoint, binding)?;
+        let (_, locking_coin) = canonical_current_name_coin(&owner)?;
+        let descriptor = hns_swap::ShakedexLockDescriptor::from_locking_coin(
+            shakedex_network_binding(config.network)?,
+            &locking_coin,
+            seller_public_key,
+        )
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        let cache = self.cache_read()?;
+        if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok(VerifiedCurrentShakedexLock {
+            binding,
+            mempool,
+            descriptor,
+            locking_coin,
+            current_state: current.state,
+        })
+    }
+
+    /// Reacquire current, unspent FINALIZE authority for the exact TRANSFER at
+    /// output zero that spends a previously authenticated Shakedex lock.
+    pub fn verify_current_shakedex_transfer(
+        &self,
+        descriptor: &hns_swap::ShakedexLockDescriptor,
+        expected_transfer: TransactionHash,
+    ) -> Result<VerifiedCurrentShakedexTransfer, HnsWalletError> {
+        let cache = self.cache_read()?;
+        let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let mempool = cache
+            .mempool_binding
+            .ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        let expected_network = shakedex_network_binding(config.network)?;
+        descriptor
+            .validate()
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        if descriptor.network != expected_network
+            || expected_transfer.as_bytes().iter().all(|byte| *byte == 0)
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let validated = validated_name_evidence(&self.backend, &descriptor.name, binding, None)?;
+        let current = validated.current.ok_or(HnsWalletError::InvalidEvidence)?;
+        let owner = current.owner.ok_or(HnsWalletError::InvalidEvidence)?;
+        if owner.output.covenant.kind != CovenantKind::Transfer
+            || owner.outpoint.transaction != expected_transfer
+            || owner.outpoint.output_index != 0
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let context = self.require_action_context(
+            &config,
+            HnsNameAction::Finalize,
+            validated.known_name.name_hash,
+            owner.outpoint,
+            owner.inclusion,
+            binding,
+            mempool,
+            &current.state,
+            true,
+        )?;
+        require_current_owner_unspent(&self.backend, owner.outpoint, binding)?;
+        let (transfer_transaction, transfer_coin) = canonical_current_name_coin(&owner)?;
+        let expected_lock_script = descriptor
+            .lock_script_identifier()
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        let transfer = TransferCovenant::try_from(&transfer_coin.covenant)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        let expected_name_hash =
+            hash_name(&descriptor.name).map_err(|_| HnsWalletError::InvalidEvidence)?;
+        if transfer_transaction
+            .inputs
+            .first()
+            .is_none_or(|input| input.previous_output != descriptor.locking_outpoint)
+            || transfer_coin.address.version != 0
+            || transfer_coin.address.hash.as_slice() != expected_lock_script.as_slice()
+            || transfer.name_hash != expected_name_hash
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let renewal_block_height = context
+            .renewal_block_height
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        let renewal_block_hash = context
+            .renewal_block_hash
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        let cache = self.cache_read()?;
+        if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok(VerifiedCurrentShakedexTransfer {
+            binding,
+            mempool,
+            descriptor: descriptor.clone(),
+            transfer_transaction,
+            transfer_coin,
+            current_state: current.state,
+            renewal_block_height,
+            renewal_block_hash,
+        })
+    }
+
     /// Reacquire direct-FINALIZE authority for an exact, confirmed outgoing
     /// TRANSFER. Incoming recipient classification is tracking evidence only.
     pub fn verify_outgoing_name_transfer(
@@ -2623,12 +2922,17 @@ mod tests {
                 next_receive_index: 0,
                 next_change_index: 0,
                 next_name_index: 1,
+                next_shakedex_index: 0,
                 external_scan_end: 99,
                 internal_scan_end: 99,
                 name_scan_end: 99,
+                shakedex_scan_end: 99,
+                shakedex_scan_complete: true,
+                shakedex_scan_in_progress: false,
                 last_used_external: None,
                 last_used_internal: None,
                 last_used_name: Some(0),
+                last_used_shakedex: None,
             },
         )
     }
@@ -2953,6 +3257,7 @@ mod tests {
                 height: 409,
                 block_hash: [78; 32],
                 tree_root: [79; 32],
+                median_time_past: 1_700_000_000,
             },
             chain_epoch: 9,
         };
@@ -3011,20 +3316,22 @@ mod tests {
 
         let mut mismatch = context.clone();
         mismatch.finalize_eligible_height = Some(411);
-        assert!(validate_name_action_context(
-            &account.config,
-            HnsNameAction::Finalize,
-            state.name_hash.into_bytes(),
-            owner_outpoint,
-            mismatch.owner_inclusion,
-            binding,
-            mempool,
-            &state,
-            &mismatch,
-            true,
-            true,
-        )
-        .is_err());
+        assert!(
+            validate_name_action_context(
+                &account.config,
+                HnsNameAction::Finalize,
+                state.name_hash.into_bytes(),
+                owner_outpoint,
+                mismatch.owner_inclusion,
+                binding,
+                mempool,
+                &state,
+                &mismatch,
+                true,
+                true,
+            )
+            .is_err()
+        );
 
         let mut spent = context;
         spent.action_eligible = false;
@@ -3044,19 +3351,21 @@ mod tests {
             false,
         )
         .expect("tracking accepts a bound mempool spender");
-        assert!(validate_name_action_context(
-            &account.config,
-            HnsNameAction::Finalize,
-            state.name_hash.into_bytes(),
-            owner_outpoint,
-            spent.owner_inclusion,
-            binding,
-            mempool,
-            &state,
-            &spent,
-            true,
-            true,
-        )
-        .is_err());
+        assert!(
+            validate_name_action_context(
+                &account.config,
+                HnsNameAction::Finalize,
+                state.name_hash.into_bytes(),
+                owner_outpoint,
+                spent.owner_inclusion,
+                binding,
+                mempool,
+                &state,
+                &spent,
+                true,
+                true,
+            )
+            .is_err()
+        );
     }
 }

@@ -24,12 +24,12 @@ pub use plans::{
     save_seller_lock_plan,
 };
 pub use transactions::{
-    MAX_SHAKEDEX_FUNDING_INPUTS, PreparedBuyerFulfillment, PreparedScriptFinalize,
-    PreparedSellerRecovery, SellerAuthorizedRecovery, SuppliedShakedexLock,
+    CurrentPreparedSellerRecovery, MAX_SHAKEDEX_FUNDING_INPUTS, PreparedBuyerFulfillment,
+    PreparedScriptFinalize, PreparedSellerRecovery, SellerAuthorizedRecovery, SuppliedShakedexLock,
     VerifiedBuyerFulfillment, VerifiedScriptFinalize, VerifiedSellerRecovery,
-    VerifiedShakedexTransfer,
-    prepare_buyer_fulfillment, prepare_script_finalize, prepare_seller_recovery,
-    verify_signed_buyer_fulfillment, verify_signed_script_finalize,
+    VerifiedShakedexTransfer, prepare_buyer_fulfillment, prepare_current_buyer_fulfillment,
+    prepare_current_script_finalize, prepare_current_seller_recovery, prepare_script_finalize,
+    prepare_seller_recovery, verify_signed_buyer_fulfillment, verify_signed_script_finalize,
     verify_signed_seller_recovery,
 };
 

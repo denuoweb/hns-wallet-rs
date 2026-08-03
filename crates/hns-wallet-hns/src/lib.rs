@@ -3,13 +3,19 @@
 
 mod name_workflow;
 mod node_rpc;
+mod shakedex_key;
 
 pub use name_workflow::{
     AuthorizedNameOperation, HnsNameAction, HnsNameLifecycle, NameActionContextEvidence,
     NameActionIneligibility, NameOperation, NameOperationState, PrepareNameFinalize,
-    PrepareNameTransfer, PreparedNameOperation, VerifiedOutgoingNameTransfer,
+    PrepareNameTransfer, PreparedNameOperation, VerifiedCurrentShakedexLock,
+    VerifiedCurrentShakedexTransfer, VerifiedOutgoingNameTransfer,
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
+pub use shakedex_key::{
+    HnsShakedexKeyAllocation, HnsShakedexKeyAllocationError, HnsShakedexKeyAllocationRequest,
+    HnsShakedexSellerTerms, HnsShakedexSigner,
+};
 
 use name_workflow::{HnsInputReservationKind, HnsNameWorkflow};
 
@@ -18,23 +24,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bech32::{segwit, Hrp};
+use bech32::{Hrp, segwit};
 use bip39::{Language, Mnemonic};
-use blake2::digest::VariableOutput;
 use blake2::Blake2bVar;
+use blake2::digest::VariableOutput;
 use hkdf::Hkdf;
 use hns_covenants::{
-    hash_name, validate_name, Covenant, CovenantKind, FinalizeCovenant, NameState, TransferCovenant,
+    Covenant, CovenantKind, FinalizeCovenant, NameState, TransferCovenant, hash_name, validate_name,
 };
 use hns_primitives::{
-    Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
+    BlockHash, Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
 };
 use hns_script::{
-    minimum_policy_fee, signature_hash, transaction_policy_virtual_size, transaction_sigops,
     FeeRate, MAX_POLICY_TRANSACTION_SIGOPS, MAX_POLICY_TRANSACTION_WEIGHT, OP_BLAKE160,
     OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_IF,
-    OP_SHA256, SIGHASH_ALL,
+    OP_SHA256, SIGHASH_ALL, minimum_policy_fee, signature_hash, transaction_policy_virtual_size,
+    transaction_sigops,
 };
+use hns_swap::{NetworkBinding, lock_script_hash};
 use hns_transaction::{Address, Coin, Input, Outpoint, Output, Transaction, Witness};
 use hns_urkel_proof::{ProofKind, UrkelProof};
 use hns_wallet_chain_api::{
@@ -70,10 +77,10 @@ pub const HNS_DERIVATION_DOMAIN: &[u8] = b"hns-wallet-rs/hns-role-key/v1";
 pub const HNS_SETTLEMENT_KEY_DOMAIN: &[u8] = b"hns-wallet-rs/hns-settlement-key/v1";
 pub const MAX_RESTORE_LOOKAHEAD: u32 = 10_000;
 pub const MAX_RESTORE_SCRIPTS_PER_QUERY: usize = 10_000;
-/// The coin and dedicated name branches are queried separately so neither
-/// branch reduces the other's bounded lookahead. Persisted address records
+/// The coin, dedicated name, and Shakedex lock branches are queried separately
+/// so no branch reduces another's bounded lookahead. Persisted address records
 /// are nevertheless bounded as one account-owned collection.
-pub const MAX_RESTORE_ADDRESS_RECORDS: usize = MAX_RESTORE_SCRIPTS_PER_QUERY * 2;
+pub const MAX_RESTORE_ADDRESS_RECORDS: usize = MAX_RESTORE_SCRIPTS_PER_QUERY * 3;
 pub const DEFAULT_RESTORE_LOOKAHEAD: u32 = 100;
 pub const MAX_WALLET_COINS: usize = 10_000;
 pub const MAX_HISTORY_RESULTS: usize = 10_000;
@@ -116,6 +123,20 @@ impl HnsNetwork {
             Self::Simnet => "ss",
         }
     }
+}
+
+fn shakedex_network_binding(network: HnsNetwork) -> Result<NetworkBinding, HnsWalletError> {
+    let (_, genesis_hash) = name_workflow::expected_chain_identity(network)?;
+    let magic = match network {
+        HnsNetwork::Mainnet => 0x5b6e_f2d3,
+        HnsNetwork::Testnet => 0xb152_0dd2,
+        HnsNetwork::Regtest => 0xae38_95cf,
+        HnsNetwork::Simnet => 0x0e64_8edc,
+    };
+    Ok(NetworkBinding {
+        magic,
+        genesis: BlockHash::new(genesis_hash),
+    })
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -261,8 +282,12 @@ pub fn receive_address(
     compressed_public_key: &[u8; 33],
 ) -> Result<String, HnsWalletError> {
     let program = public_key_hash(compressed_public_key)?;
+    encode_v0_address(network, &program)
+}
+
+fn encode_v0_address(network: HnsNetwork, program: &[u8]) -> Result<String, HnsWalletError> {
     let hrp = Hrp::parse(network.hrp()).map_err(|_| HnsWalletError::Address)?;
-    segwit::encode_v0(hrp, &program).map_err(|_| HnsWalletError::Address)
+    segwit::encode_v0(hrp, program).map_err(|_| HnsWalletError::Address)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -416,6 +441,11 @@ pub struct ChainTip {
     pub height: u64,
     pub block_hash: [u8; 32],
     pub tree_root: [u8; 32],
+    /// Median time past of this exact tip. For a candidate transaction this
+    /// is the consensus parent time used by Shakedex absolute-lock checks.
+    /// A zero from legacy persisted data is non-authoritative until refreshed.
+    #[serde(default)]
+    pub median_time_past: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -473,7 +503,8 @@ pub struct IndexedWalletCoin {
 }
 
 /// Exact canonical Handshake address input for the node's ScriptId conversion.
-/// The current wallet derives version-0 public-key-hash addresses only.
+/// Restoration derives version-0 20-byte coin/name programs and separated
+/// 32-byte Shakedex lock-script programs.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct WalletAddressKey {
     pub version: u8,
@@ -1125,15 +1156,33 @@ pub struct HnsAccountRecord {
     /// it does not establish ownership without canonical NameState evidence.
     #[serde(default)]
     pub next_name_index: u32,
+    /// Next separated Shakedex seller-key derivation. The protected allocation
+    /// high-water remains authoritative and reconciliation may only advance
+    /// this restoration projection.
+    #[serde(default)]
+    pub next_shakedex_index: u32,
     pub external_scan_end: u32,
     pub internal_scan_end: u32,
     /// Inclusive end of the independent `HnsName`, change-zero scan branch.
     #[serde(default)]
     pub name_scan_end: u32,
+    /// Inclusive end of the independent `HnsShakedex`, change-zero scan branch.
+    #[serde(default)]
+    pub shakedex_scan_end: u32,
+    /// True only after a complete bounded Shakedex branch scan has committed.
+    /// Missing legacy state fails closed until the first successful scan.
+    #[serde(default)]
+    pub shakedex_scan_complete: bool,
+    /// Durable cross-runtime fence set before Shakedex address discovery and
+    /// cleared only by the same revision line after a complete scan commits.
+    #[serde(default)]
+    pub shakedex_scan_in_progress: bool,
     pub last_used_external: Option<u32>,
     pub last_used_internal: Option<u32>,
     #[serde(default)]
     pub last_used_name: Option<u32>,
+    #[serde(default)]
+    pub last_used_shakedex: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1158,7 +1207,9 @@ impl TrackedHnsCoin {
     /// are deliberately unusable until a fresh bound reconciliation replaces
     /// them.
     pub fn to_canonical_coin(&self) -> Result<Coin, HnsWalletError> {
-        if self.coin.confirmation_count == 0 || self.address_program.len() != 20 {
+        if self.coin.confirmation_count == 0
+            || validate_restore_program(self.derivation, &self.address_program).is_err()
+        {
             return Err(HnsWalletError::InvalidEvidence);
         }
         let covenant = decode_canonical_covenant(&self.coin.covenant)?;
@@ -1596,12 +1647,17 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     next_receive_index: 0,
                     next_change_index: 0,
                     next_name_index: 0,
+                    next_shakedex_index: 0,
                     external_scan_end,
                     internal_scan_end: external_scan_end,
                     name_scan_end: external_scan_end,
+                    shakedex_scan_end: external_scan_end,
+                    shakedex_scan_complete: false,
+                    shakedex_scan_in_progress: false,
                     last_used_external: None,
                     last_used_internal: None,
                     last_used_name: None,
+                    last_used_shakedex: None,
                 };
                 let revision = store.save_wallet_account(
                     &account_entity_id(&account.config),
@@ -1849,6 +1905,89 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .store_lock()?
             .known_name::<KnownName>(&namespaced_name_id(&config, name_hash))?
             .map(|stored| stored.value))
+    }
+
+    /// Allocate one immutable seller key from the separated Shakedex role.
+    /// This atomically changes protected encrypted key metadata and the
+    /// account's restoration projection; it does not enable a value path,
+    /// create a listing, reserve funds, sign, or broadcast.
+    pub fn allocate_shakedex_key(
+        &self,
+        request: &HnsShakedexKeyAllocationRequest,
+    ) -> Result<HnsShakedexKeyAllocation, HnsShakedexKeyAllocationError> {
+        let config = self
+            .cache_read()
+            .map_err(HnsShakedexKeyAllocationError::Wallet)?
+            .account
+            .config
+            .clone();
+        let now_unix = self
+            .clock
+            .now_unix()
+            .map_err(HnsShakedexKeyAllocationError::Wallet)?;
+        let mut store = self
+            .store_lock()
+            .map_err(HnsShakedexKeyAllocationError::Wallet)?;
+        let committed =
+            shakedex_key::allocate_hns_shakedex_key(&mut store, &config, request, now_unix)?;
+        drop(store);
+        self.install_loaded_account(committed.account)
+            .map_err(HnsShakedexKeyAllocationError::Wallet)?;
+        Ok(committed.allocation)
+    }
+
+    /// Re-authenticate an immutable public Shakedex key binding after restart.
+    pub fn load_shakedex_key_allocation(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<HnsShakedexKeyAllocation>, HnsShakedexKeyAllocationError> {
+        let wallet_id = self
+            .cache_read()
+            .map_err(HnsShakedexKeyAllocationError::Wallet)?
+            .account
+            .config
+            .wallet_id;
+        let store = self
+            .store_lock()
+            .map_err(HnsShakedexKeyAllocationError::Wallet)?;
+        shakedex_key::load_hns_shakedex_key_allocation(&store, wallet_id, workflow_id)
+    }
+
+    /// Re-derive a purpose-bound, redacted seller signer after authenticating
+    /// the complete protected allocation topology and recovery-seed binding.
+    pub fn load_shakedex_signer(
+        &self,
+        request: &HnsShakedexKeyAllocationRequest,
+    ) -> Result<HnsShakedexSigner, HnsShakedexKeyAllocationError> {
+        let config = self
+            .cache_read()
+            .map_err(HnsShakedexKeyAllocationError::Wallet)?
+            .account
+            .config
+            .clone();
+        let store = self
+            .store_lock()
+            .map_err(HnsShakedexKeyAllocationError::Wallet)?;
+        shakedex_key::load_hns_shakedex_signer(&store, &config, request)
+    }
+
+    /// Bind a protected seller allocation to the exact current, unspent
+    /// Shakedex lock and snapshot-authoritative parent median time.
+    pub fn verify_allocated_current_shakedex_lock(
+        &self,
+        request: &HnsShakedexKeyAllocationRequest,
+    ) -> Result<VerifiedCurrentShakedexLock, HnsShakedexKeyAllocationError> {
+        let allocation = self
+            .load_shakedex_key_allocation(request.workflow_id)?
+            .ok_or(HnsShakedexKeyAllocationError::AllocationNotFound)?;
+        if allocation.name() != request.name
+            || allocation.terms_commitment() != request.terms_commitment()?
+        {
+            return Err(HnsShakedexKeyAllocationError::BindingConflict);
+        }
+        let signer = self.load_shakedex_signer(request)?;
+        self.verify_current_shakedex_lock(request.name.as_slice(), *signer.compressed_public_key())
+            .map_err(HnsShakedexKeyAllocationError::Wallet)
     }
 
     /// Reacquire ephemeral action authority from the exact current snapshot.
@@ -2788,12 +2927,38 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         ),
         HnsWalletError,
     > {
+        // Fence allocation before the first Shakedex discovery read. A stale
+        // concurrent allocator or scan loses this WalletAccount CAS before it
+        // can derive or commit a seller key. A failed/crashed scan leaves the
+        // fence set; a later scan can take over with a new revision, while key
+        // allocation remains fail-closed.
+        account.shakedex_scan_in_progress = true;
+        let expected_account_revision = store.save_wallet_account(
+            &account_entity_id(&account.config),
+            expected_account_revision,
+            &account,
+            now_unix,
+        )?;
+        let allocated_next = shakedex_key::allocation_next_index(store, &account.config).map_err(
+            |error| match error {
+                HnsShakedexKeyAllocationError::MissingRecoverySeed => HnsWalletError::MissingSeed,
+                HnsShakedexKeyAllocationError::Store(_) => HnsWalletError::Store,
+                HnsShakedexKeyAllocationError::Wallet(error) => error,
+                _ => HnsWalletError::InvalidEvidence,
+            },
+        )?;
+        if allocated_next >= MAX_RESTORE_LOOKAHEAD {
+            return Err(HnsWalletError::ScanCapacityExhausted);
+        }
+        account.next_shakedex_index = account.next_shakedex_index.max(allocated_next);
         if account.external_scan_end >= MAX_RESTORE_LOOKAHEAD
             || account.internal_scan_end >= MAX_RESTORE_LOOKAHEAD
             || account.name_scan_end >= MAX_RESTORE_LOOKAHEAD
+            || account.shakedex_scan_end >= MAX_RESTORE_LOOKAHEAD
             || account.next_receive_index >= MAX_RESTORE_LOOKAHEAD
             || account.next_change_index >= MAX_RESTORE_LOOKAHEAD
             || account.next_name_index >= MAX_RESTORE_LOOKAHEAD
+            || account.next_shakedex_index >= MAX_RESTORE_LOOKAHEAD
         {
             return Err(HnsWalletError::InvalidLookahead);
         }
@@ -2810,16 +2975,27 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .next_name_index
             .saturating_add(gap - 1)
             .min(MAX_RESTORE_LOOKAHEAD - 1);
+        let minimum_shakedex_end = account
+            .next_shakedex_index
+            .saturating_add(gap - 1)
+            .min(MAX_RESTORE_LOOKAHEAD - 1);
         account.external_scan_end = account.external_scan_end.max(minimum_external_end);
         account.internal_scan_end = account.internal_scan_end.max(minimum_internal_end);
         account.name_scan_end = account.name_scan_end.max(minimum_name_end);
+        account.shakedex_scan_end = account.shakedex_scan_end.max(minimum_shakedex_end);
 
         let mut expected_binding = None;
         let mut expected_mempool = None;
         let (mut addresses, mut history, indexed_coins, binding, mempool_binding) = loop {
             let coin_addresses = derive_restore_addresses(store, &account, KeyRole::HnsCoin)?;
             let name_addresses = derive_restore_addresses(store, &account, KeyRole::HnsName)?;
-            validate_disjoint_restore_programs(&coin_addresses, &name_addresses)?;
+            let shakedex_addresses =
+                derive_restore_addresses(store, &account, KeyRole::HnsShakedex)?;
+            validate_disjoint_restore_programs(
+                &coin_addresses,
+                &name_addresses,
+                &shakedex_addresses,
+            )?;
 
             let (coin_scripts, coin_index_remap) = sorted_restore_scripts(&coin_addresses)?;
             let (binding, mempool_binding, coin_history, coin_coins) = load_wallet_snapshot(
@@ -2853,6 +3029,24 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 name_binding,
                 name_mempool_binding,
             )?;
+
+            let (shakedex_scripts, shakedex_index_remap) =
+                sorted_restore_scripts(&shakedex_addresses)?;
+            let (shakedex_binding, shakedex_mempool_binding, shakedex_history, shakedex_coins) =
+                load_wallet_snapshot(
+                    &self.backend,
+                    &shakedex_scripts,
+                    &shakedex_index_remap,
+                    expected_tip,
+                    Some(binding),
+                    Some(mempool_binding),
+                )?;
+            validate_same_restore_snapshot(
+                binding,
+                mempool_binding,
+                shakedex_binding,
+                shakedex_mempool_binding,
+            )?;
             expected_binding = Some(binding);
             expected_mempool = Some(mempool_binding);
 
@@ -2875,10 +3069,19 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 name_history,
                 name_coins,
             )?;
+            append_restore_branch(
+                &mut addresses,
+                &mut history,
+                &mut indexed_coins,
+                shakedex_addresses,
+                shakedex_history,
+                shakedex_coins,
+            )?;
 
             let mut last_external = None;
             let mut last_internal = None;
             let mut last_name = None;
+            let mut last_shakedex = None;
             for entry in &history {
                 let derivation = addresses
                     .get(entry.script_index as usize)
@@ -2896,28 +3099,38 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     (HNS_NAME_DERIVATION_TAG, 0, index) => {
                         last_name = Some(last_name.map_or(index, |last: u32| last.max(index)))
                     }
+                    (HNS_SHAKEDEX_DERIVATION_TAG, 0, index) => {
+                        last_shakedex =
+                            Some(last_shakedex.map_or(index, |last: u32| last.max(index)))
+                    }
                     _ => return Err(HnsWalletError::InvalidEvidence),
                 }
             }
             ensure_trailing_gap(last_external, gap)?;
             ensure_trailing_gap(last_internal, gap)?;
             ensure_trailing_gap(last_name, gap)?;
+            ensure_trailing_gap(last_shakedex, gap)?;
             let required_external =
                 required_scan_end(last_external, account.external_scan_end, gap);
             let required_internal =
                 required_scan_end(last_internal, account.internal_scan_end, gap);
             let required_name = required_scan_end(last_name, account.name_scan_end, gap);
+            let required_shakedex =
+                required_scan_end(last_shakedex, account.shakedex_scan_end, gap);
             checked_scan_address_count(&[required_external, required_internal])?;
             checked_scan_address_count(&[required_name])?;
+            checked_scan_address_count(&[required_shakedex])?;
             if required_external <= account.external_scan_end
                 && required_internal <= account.internal_scan_end
                 && required_name <= account.name_scan_end
+                && required_shakedex <= account.shakedex_scan_end
             {
                 break (addresses, history, indexed_coins, binding, mempool_binding);
             }
             account.external_scan_end = required_external;
             account.internal_scan_end = required_internal;
             account.name_scan_end = required_name;
+            account.shakedex_scan_end = required_shakedex;
         };
 
         let used: BTreeSet<(u8, u32, u32)> = history
@@ -2945,12 +3158,21 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .filter(|(role, change, _)| *role == HNS_NAME_DERIVATION_TAG && *change == 0)
             .map(|(_, _, index)| *index)
             .max();
+        account.last_used_shakedex = used
+            .iter()
+            .filter(|(role, change, _)| *role == HNS_SHAKEDEX_DERIVATION_TAG && *change == 0)
+            .map(|(_, _, index)| *index)
+            .max();
         account.next_receive_index =
             advance_next_derivation_index(account.next_receive_index, account.last_used_external);
         account.next_change_index =
             advance_next_derivation_index(account.next_change_index, account.last_used_internal);
         account.next_name_index =
             advance_next_derivation_index(account.next_name_index, account.last_used_name);
+        account.next_shakedex_index =
+            advance_next_derivation_index(account.next_shakedex_index, account.last_used_shakedex);
+        account.shakedex_scan_complete = true;
+        account.shakedex_scan_in_progress = false;
         persist_derived_addresses(store, &account.config, &addresses, now_unix)?;
         let account_revision = store.save_wallet_account(
             &account_entity_id(&account.config),
@@ -3068,7 +3290,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .iter()
             .map(|address| address.program.clone())
             .collect();
-        if programs.len() != addresses.len() || programs.iter().any(|program| program.len() != 20) {
+        if programs.len() != addresses.len()
+            || addresses.iter().any(|address| {
+                validate_restore_program(address.derivation, &address.program).is_err()
+            })
+        {
             return Err(HnsWalletError::InvalidEvidence);
         }
         let previous: BTreeMap<TransactionHash, TransactionSummary> = self
@@ -3632,9 +3858,12 @@ fn validate_authoritative_reconcile_account(
         || authoritative.next_receive_index < cached.next_receive_index
         || authoritative.next_change_index < cached.next_change_index
         || authoritative.next_name_index < cached.next_name_index
+        || authoritative.next_shakedex_index < cached.next_shakedex_index
+        || (cached.shakedex_scan_complete && !authoritative.shakedex_scan_complete)
         || authoritative.external_scan_end < cached.external_scan_end
         || authoritative.internal_scan_end < cached.internal_scan_end
         || authoritative.name_scan_end < cached.name_scan_end
+        || authoritative.shakedex_scan_end < cached.shakedex_scan_end
     {
         return Err(HnsWalletError::InvalidEvidence);
     }
@@ -3667,6 +3896,7 @@ fn advance_next_derivation_index(current: u32, last_used: Option<u32>) -> u32 {
 
 const HNS_COIN_DERIVATION_TAG: u8 = 0;
 const HNS_NAME_DERIVATION_TAG: u8 = 1;
+const HNS_SHAKEDEX_DERIVATION_TAG: u8 = 2;
 
 fn restore_derivation_key(
     derivation: DerivationReference,
@@ -3679,8 +3909,25 @@ fn restore_derivation_key(
             Ok((HNS_COIN_DERIVATION_TAG, change, derivation.index))
         }
         (KeyRole::HnsName, 0) => Ok((HNS_NAME_DERIVATION_TAG, 0, derivation.index)),
+        (KeyRole::HnsShakedex, 0) => Ok((HNS_SHAKEDEX_DERIVATION_TAG, 0, derivation.index)),
         _ => Err(HnsWalletError::InvalidEvidence),
     }
+}
+
+fn validate_restore_program(
+    derivation: DerivationReference,
+    program: &[u8],
+) -> Result<(), HnsWalletError> {
+    let (tag, _, _) = restore_derivation_key(derivation)?;
+    let expected_length = match tag {
+        HNS_COIN_DERIVATION_TAG | HNS_NAME_DERIVATION_TAG => 20,
+        HNS_SHAKEDEX_DERIVATION_TAG => 32,
+        _ => return Err(HnsWalletError::InvalidEvidence),
+    };
+    if program.len() != expected_length {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(())
 }
 
 fn checked_scan_address_count(scan_ends: &[u32]) -> Result<usize, HnsWalletError> {
@@ -3716,6 +3963,7 @@ fn derive_restore_addresses(
             (1, account.internal_scan_end),
         ],
         KeyRole::HnsName => vec![(0, account.name_scan_end)],
+        KeyRole::HnsShakedex => vec![(0, account.shakedex_scan_end)],
         _ => return Err(HnsWalletError::InvalidEvidence),
     };
     let scan_ends: Vec<u32> = branches.iter().map(|(_, scan_end)| *scan_end).collect();
@@ -3732,11 +3980,15 @@ fn derive_restore_addresses(
             let id = derived_address_record_id(&account.config, derivation)?;
             let persisted = store.derived_address::<DerivedHnsAddress>(&id)?;
             let public_key = derive_hns_public_key(store, account.config.wallet_id, derivation)?;
-            let program = public_key_hash(&public_key)?.to_vec();
+            let program = match role {
+                KeyRole::HnsCoin | KeyRole::HnsName => public_key_hash(&public_key)?.to_vec(),
+                KeyRole::HnsShakedex => lock_script_hash(&public_key).to_vec(),
+                _ => return Err(HnsWalletError::InvalidEvidence),
+            };
             let derived = DerivedHnsAddress {
                 account_id: account.config.account_id,
                 derivation,
-                address: receive_address(account.config.network, &public_key)?,
+                address: encode_v0_address(account.config.network, &program)?,
                 program,
                 used: persisted.as_ref().is_some_and(|address| address.value.used),
             };
@@ -3758,18 +4010,24 @@ fn derive_restore_addresses(
 fn validate_disjoint_restore_programs(
     coin_addresses: &[DerivedHnsAddress],
     name_addresses: &[DerivedHnsAddress],
+    shakedex_addresses: &[DerivedHnsAddress],
 ) -> Result<(), HnsWalletError> {
     let combined = coin_addresses
         .len()
         .checked_add(name_addresses.len())
+        .and_then(|count| count.checked_add(shakedex_addresses.len()))
         .ok_or(HnsWalletError::ScanCapacityExhausted)?;
     if combined == 0 || combined > MAX_RESTORE_ADDRESS_RECORDS {
         return Err(HnsWalletError::ScanCapacityExhausted);
     }
     let mut programs = BTreeSet::new();
-    for address in coin_addresses.iter().chain(name_addresses) {
-        restore_derivation_key(address.derivation)?;
-        if address.program.len() != 20 || !programs.insert(address.program.clone()) {
+    for address in coin_addresses
+        .iter()
+        .chain(name_addresses)
+        .chain(shakedex_addresses)
+    {
+        validate_restore_program(address.derivation, &address.program)?;
+        if !programs.insert(address.program.clone()) {
             return Err(HnsWalletError::InvalidEvidence);
         }
     }
@@ -3926,7 +4184,7 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
         || !scripts.windows(2).all(|pair| pair[0] < pair[1])
         || scripts
             .iter()
-            .any(|script| script.version != 0 || script.hash.len() != 20)
+            .any(|script| script.version != 0 || !matches!(script.hash.len(), 20 | 32))
     {
         return Err(HnsWalletError::InvalidEvidence);
     }
@@ -4455,6 +4713,15 @@ fn name_derived_address_prefix(config: &HnsRuntimeConfig) -> [u8; 33] {
     prefix
 }
 
+fn shakedex_derived_address_id(config: &HnsRuntimeConfig, change: u32, index: u32) -> [u8; 41] {
+    let mut id = [0_u8; 41];
+    id[..32].copy_from_slice(&account_entity_prefix(config));
+    id[32] = HNS_SHAKEDEX_DERIVATION_TAG;
+    id[33..37].copy_from_slice(&change.to_be_bytes());
+    id[37..].copy_from_slice(&index.to_be_bytes());
+    id
+}
+
 fn derived_address_record_id(
     config: &HnsRuntimeConfig,
     derivation: DerivationReference,
@@ -4468,6 +4735,9 @@ fn derived_address_record_id(
         }
         (HNS_NAME_DERIVATION_TAG, change, index) => {
             Ok(name_derived_address_id(config, change, index).to_vec())
+        }
+        (HNS_SHAKEDEX_DERIVATION_TAG, change, index) => {
+            Ok(shakedex_derived_address_id(config, change, index).to_vec())
         }
         _ => Err(HnsWalletError::InvalidEvidence),
     }
@@ -4534,7 +4804,7 @@ fn persist_derived_addresses(
     let mut programs = BTreeSet::new();
     for address in addresses {
         if address.account_id != config.account_id
-            || address.program.len() != 20
+            || validate_restore_program(address.derivation, &address.program).is_err()
             || !programs.insert(address.program.clone())
         {
             return Err(HnsWalletError::InvalidEvidence);
@@ -6614,6 +6884,7 @@ mod tests {
 
     fn test_derived_address(role: KeyRole, program: u8) -> DerivedHnsAddress {
         let config = test_runtime_config();
+        let program_length = if role == KeyRole::HnsShakedex { 32 } else { 20 };
         DerivedHnsAddress {
             account_id: config.account_id,
             derivation: DerivationReference {
@@ -6623,7 +6894,7 @@ mod tests {
                 index: 0,
             },
             address: format!("test-address-{program}"),
-            program: vec![program; 20],
+            program: vec![program; program_length],
             used: false,
         }
     }
@@ -6634,6 +6905,7 @@ mod tests {
                 height: 500,
                 block_hash: [21; 32],
                 tree_root: [22; 32],
+                median_time_past: 1_700_000_000,
             },
             chain_epoch: epoch,
         }
@@ -6767,19 +7039,21 @@ mod tests {
             output_index: 1,
             ..outpoint
         };
-        assert!(validate_canonical_name_state(
-            &name,
-            state.name_hash.into_bytes(),
-            Some(&raw_state),
-            Some(wrong_outpoint),
-            Some(&raw_transaction),
-            Some(TransactionInclusion {
-                block_hash: [24; 32],
-                height: 1,
-                transaction_index: Some(0),
-            }),
-        )
-        .is_err());
+        assert!(
+            validate_canonical_name_state(
+                &name,
+                state.name_hash.into_bytes(),
+                Some(&raw_state),
+                Some(wrong_outpoint),
+                Some(&raw_transaction),
+                Some(TransactionInclusion {
+                    block_hash: [24; 32],
+                    height: 1,
+                    transaction_index: Some(0),
+                }),
+            )
+            .is_err()
+        );
 
         let mut wrong_value_transaction = transaction.clone();
         wrong_value_transaction.outputs[0].value = Dollarydoos::new(state.value.get() + 1);
@@ -6788,16 +7062,18 @@ mod tests {
             .expect("wrong-value hash");
         let mut wrong_value_state = state.clone();
         wrong_value_state.owner.transaction_hash = wrong_value_hash;
-        assert!(validate_test_name_view(
-            &name,
-            &wrong_value_state,
-            &wrong_value_transaction,
-            HnsOutpoint {
-                transaction: TransactionHash::new(wrong_value_hash.into_bytes()),
-                output_index: 0,
-            },
-        )
-        .is_err());
+        assert!(
+            validate_test_name_view(
+                &name,
+                &wrong_value_state,
+                &wrong_value_transaction,
+                HnsOutpoint {
+                    transaction: TransactionHash::new(wrong_value_hash.into_bytes()),
+                    output_index: 0,
+                },
+            )
+            .is_err()
+        );
 
         let mut wrong_covenant_transaction = transaction;
         wrong_covenant_transaction.outputs[0].covenant.items[0] = vec![7; 32];
@@ -6806,16 +7082,18 @@ mod tests {
             .expect("wrong-covenant hash");
         let mut wrong_covenant_state = state;
         wrong_covenant_state.owner.transaction_hash = wrong_covenant_hash;
-        assert!(validate_test_name_view(
-            &name,
-            &wrong_covenant_state,
-            &wrong_covenant_transaction,
-            HnsOutpoint {
-                transaction: TransactionHash::new(wrong_covenant_hash.into_bytes()),
-                output_index: 0,
-            },
-        )
-        .is_err());
+        assert!(
+            validate_test_name_view(
+                &name,
+                &wrong_covenant_state,
+                &wrong_covenant_transaction,
+                HnsOutpoint {
+                    transaction: TransactionHash::new(wrong_covenant_hash.into_bytes()),
+                    output_index: 0,
+                },
+            )
+            .is_err()
+        );
 
         let (name, state, transaction, outpoint) =
             canonical_name_view(address.program, vec![1], None);
@@ -7028,12 +7306,17 @@ mod tests {
             next_receive_index: 3,
             next_change_index: 4,
             next_name_index: 5,
+            next_shakedex_index: 6,
             external_scan_end: 102,
             internal_scan_end: 103,
             name_scan_end: 104,
+            shakedex_scan_end: 105,
+            shakedex_scan_complete: true,
+            shakedex_scan_in_progress: false,
             last_used_external: Some(2),
             last_used_internal: Some(3),
             last_used_name: Some(4),
+            last_used_shakedex: Some(5),
         };
         assert!(validate_authoritative_reconcile_account(&cached, 7, &cached, 7).is_ok());
 
@@ -7066,35 +7349,50 @@ mod tests {
     }
 
     #[test]
-    fn legacy_account_state_defaults_the_independent_name_scan() {
+    fn legacy_account_state_defaults_the_independent_name_and_shakedex_scans() {
         let account = HnsAccountRecord {
             config: test_runtime_config(),
             next_receive_index: 3,
             next_change_index: 4,
             next_name_index: 8,
+            next_shakedex_index: 9,
             external_scan_end: 102,
             internal_scan_end: 103,
             name_scan_end: 107,
+            shakedex_scan_end: 108,
+            shakedex_scan_complete: true,
+            shakedex_scan_in_progress: false,
             last_used_external: Some(2),
             last_used_internal: Some(3),
             last_used_name: Some(7),
+            last_used_shakedex: Some(8),
         };
         let mut encoded = serde_json::to_value(account).expect("encode account");
         let object = encoded.as_object_mut().expect("account object");
         object.remove("next_name_index");
         object.remove("name_scan_end");
         object.remove("last_used_name");
+        object.remove("next_shakedex_index");
+        object.remove("shakedex_scan_end");
+        object.remove("shakedex_scan_complete");
+        object.remove("shakedex_scan_in_progress");
+        object.remove("last_used_shakedex");
         let decoded: HnsAccountRecord =
             serde_json::from_value(encoded).expect("decode legacy account");
         assert_eq!(decoded.next_name_index, 0);
         assert_eq!(decoded.name_scan_end, 0);
         assert_eq!(decoded.last_used_name, None);
+        assert_eq!(decoded.next_shakedex_index, 0);
+        assert_eq!(decoded.shakedex_scan_end, 0);
+        assert!(!decoded.shakedex_scan_complete);
+        assert!(!decoded.shakedex_scan_in_progress);
+        assert_eq!(decoded.last_used_shakedex, None);
         assert_eq!(decoded.next_receive_index, 3);
         assert_eq!(decoded.external_scan_end, 102);
     }
 
     #[test]
-    fn name_address_ids_are_role_discriminated_without_changing_coin_ids() {
+    fn name_and_shakedex_address_ids_are_role_discriminated_without_changing_coin_ids() {
         let config = test_runtime_config();
         let coin = DerivationReference {
             role: KeyRole::HnsCoin,
@@ -7106,14 +7404,33 @@ mod tests {
             role: KeyRole::HnsName,
             ..coin
         };
+        let shakedex = DerivationReference {
+            role: KeyRole::HnsShakedex,
+            ..coin
+        };
         let coin_id = derived_address_record_id(&config, coin).expect("coin id");
         let name_id = derived_address_record_id(&config, name).expect("name id");
+        let shakedex_id =
+            derived_address_record_id(&config, shakedex).expect("Shakedex address id");
         assert_eq!(coin_id, derived_address_id(&config, 0, 9).to_vec());
         assert_eq!(coin_id.len(), 40);
         assert_eq!(name_id.len(), 41);
+        assert_eq!(shakedex_id.len(), 41);
         assert_ne!(coin_id, name_id);
+        assert_ne!(coin_id, shakedex_id);
+        assert_ne!(name_id, shakedex_id);
         assert!(
             derived_address_record_id(&config, DerivationReference { change: 1, ..name }).is_err()
+        );
+        assert!(
+            derived_address_record_id(
+                &config,
+                DerivationReference {
+                    change: 1,
+                    ..shakedex
+                }
+            )
+            .is_err()
         );
     }
 
@@ -7136,7 +7453,18 @@ mod tests {
     }
 
     #[test]
-    fn name_gap_and_next_index_never_shrink_after_restart_or_reorg() {
+    fn hns_shakedex_legacy_snapshot_time_defaults_fail_closed() {
+        let mut encoded = serde_json::to_value(test_snapshot(4).tip).expect("encode tip");
+        encoded
+            .as_object_mut()
+            .expect("tip object")
+            .remove("median_time_past");
+        let decoded: ChainTip = serde_json::from_value(encoded).expect("decode legacy tip");
+        assert_eq!(decoded.median_time_past, 0);
+    }
+
+    #[test]
+    fn separated_gap_and_next_indexes_never_shrink_after_restart_or_reorg() {
         assert_eq!(required_scan_end(None, 500, 100), 500);
         assert_eq!(required_scan_end(Some(3), 500, 100), 500);
         assert_eq!(required_scan_end(Some(550), 500, 100), 650);
@@ -7154,61 +7482,67 @@ mod tests {
         assert!(checked_scan_address_count(&[5_000, 5_000]).is_err());
         assert_eq!(
             MAX_RESTORE_ADDRESS_RECORDS,
-            MAX_RESTORE_SCRIPTS_PER_QUERY * 2
+            MAX_RESTORE_SCRIPTS_PER_QUERY * 3
         );
     }
 
     #[test]
-    fn name_outputs_are_tracked_but_never_ordinary_spend_candidates() {
-        let address = test_derived_address(KeyRole::HnsName, 31);
-        let tracked = reconcile_coins(
-            vec![IndexedWalletCoin {
-                coin: WalletCoin {
-                    outpoint: HnsOutpoint {
-                        transaction: TransactionHash::new([32; 32]),
-                        output_index: 1,
+    fn name_and_shakedex_outputs_are_tracked_but_never_ordinary_spend_candidates() {
+        for (role, byte) in [(KeyRole::HnsName, 31), (KeyRole::HnsShakedex, 32)] {
+            let address = test_derived_address(role, byte);
+            let tracked = reconcile_coins(
+                vec![IndexedWalletCoin {
+                    coin: WalletCoin {
+                        outpoint: HnsOutpoint {
+                            transaction: TransactionHash::new([byte; 32]),
+                            output_index: 1,
+                        },
+                        value: BaseUnits::new(1_000),
+                        confirmation_count: 10,
+                        confirmed_height: Some(491),
+                        coinbase: false,
+                        covenant: Covenant::default().encode().expect("covenant"),
+                        name_locked: false,
                     },
-                    value: BaseUnits::new(1_000),
-                    confirmation_count: 10,
-                    confirmed_height: Some(491),
-                    coinbase: false,
-                    covenant: Covenant::default().encode().expect("covenant"),
-                    name_locked: false,
-                },
-                script_index: 0,
-                output_address: WalletAddressKey {
-                    version: 0,
-                    hash: address.program.clone(),
-                },
-            }],
-            &[address],
-            500,
-        )
-        .expect("track name output");
-        assert_eq!(tracked.len(), 1);
-        assert_eq!(tracked[0].derivation.role, KeyRole::HnsName);
-        assert!(!is_ordinary_hns_spend_candidate(&tracked[0]));
+                    script_index: 0,
+                    output_address: WalletAddressKey {
+                        version: 0,
+                        hash: address.program.clone(),
+                    },
+                }],
+                &[address],
+                500,
+            )
+            .expect("track separated output");
+            assert_eq!(tracked.len(), 1);
+            assert_eq!(tracked[0].derivation.role, role);
+            assert!(!is_ordinary_hns_spend_candidate(&tracked[0]));
+        }
     }
 
     #[test]
     fn duplicate_programs_and_unsupported_name_branches_fail_closed() {
         let coin = test_derived_address(KeyRole::HnsCoin, 41);
         let name = test_derived_address(KeyRole::HnsName, 41);
-        assert!(validate_disjoint_restore_programs(&[coin], &[name]).is_err());
-        assert!(restore_derivation_key(DerivationReference {
-            role: KeyRole::HnsName,
-            account: 7,
-            change: 1,
-            index: 0,
-        })
-        .is_err());
-        assert!(restore_derivation_key(DerivationReference {
-            role: KeyRole::HnsShakedex,
-            account: 7,
-            change: 0,
-            index: 0,
-        })
-        .is_err());
+        assert!(validate_disjoint_restore_programs(&[coin], &[name], &[]).is_err());
+        assert!(
+            restore_derivation_key(DerivationReference {
+                role: KeyRole::HnsName,
+                account: 7,
+                change: 1,
+                index: 0,
+            })
+            .is_err()
+        );
+        assert!(
+            restore_derivation_key(DerivationReference {
+                role: KeyRole::HnsShakedex,
+                account: 7,
+                change: 1,
+                index: 0,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -7260,10 +7594,12 @@ mod tests {
         assert_eq!(selected.coins.len(), 2);
         assert_eq!(selected.total, BaseUnits::new(9));
         assert_eq!(selected.change, BaseUnits::new(1));
-        assert!(selected
-            .coins
-            .iter()
-            .all(|coin| !coin.name_locked && !coin.coinbase));
+        assert!(
+            selected
+                .coins
+                .iter()
+                .all(|coin| !coin.name_locked && !coin.coinbase)
+        );
     }
 
     #[test]
@@ -7401,12 +7737,17 @@ mod tests {
             next_receive_index: 0,
             next_change_index: 0,
             next_name_index: 0,
+            next_shakedex_index: 0,
             external_scan_end: 99,
             internal_scan_end: 99,
             name_scan_end: 99,
+            shakedex_scan_end: 99,
+            shakedex_scan_complete: true,
+            shakedex_scan_in_progress: false,
             last_used_external: None,
             last_used_internal: None,
             last_used_name: None,
+            last_used_shakedex: None,
         };
         store
             .put_secret(
@@ -7498,7 +7839,7 @@ mod tests {
     }
 
     #[test]
-    fn role_separation_changes_public_keys_and_address_networks() {
+    fn hns_shakedex_role_separation_has_stable_recovery_vector() {
         let seed = [7_u8; 64];
         let coin = derive_secret(
             &seed,
@@ -7520,18 +7861,60 @@ mod tests {
             },
         )
         .expect("name key");
+        let shakedex = derive_secret(
+            &seed,
+            DerivationReference {
+                role: KeyRole::HnsShakedex,
+                account: 0,
+                change: 0,
+                index: 0,
+            },
+        )
+        .expect("Shakedex key");
         assert_ne!(*coin, *name);
+        assert_ne!(*coin, *shakedex);
+        assert_ne!(*name, *shakedex);
+        assert_eq!(
+            hex::encode(shakedex.as_slice()),
+            "c1f343c505fbf40e41d41b4ad3571fb93c49f7687d197568ab901678a44c4d49"
+        );
+        let shakedex_signing =
+            SigningKey::from_slice(shakedex.as_slice()).expect("Shakedex signing key");
+        let shakedex_public: [u8; 33] = shakedex_signing
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .expect("compressed Shakedex key");
+        assert_eq!(
+            hex::encode(shakedex_public),
+            "02479c879e5f2e087a998d5fa57ad1720ab8d56171b13f191beae222ddae20fb4a"
+        );
+        let shakedex_program = lock_script_hash(&shakedex_public);
+        assert_eq!(
+            hex::encode(shakedex_program),
+            "b1194ad181a74b263cc84b8e80ca9078e32c15e72128c3473700f23c46ed9cca"
+        );
+        assert_eq!(
+            encode_v0_address(HnsNetwork::Regtest, &shakedex_program)
+                .expect("Shakedex lock address"),
+            "rs1qkyv545vp5a9jv0xgfw8gpj5s0r3jc908yy5vx3ehqrerc3hdnn9qj0j5a4"
+        );
         let signing = SigningKey::from_slice(coin.as_slice()).expect("signing key");
         let public: [u8; 33] = VerifyingKey::from(&signing)
             .to_encoded_point(true)
             .as_bytes()
             .try_into()
             .expect("compressed key");
-        assert!(receive_address(HnsNetwork::Mainnet, &public)
-            .expect("mainnet")
-            .starts_with("hs1"));
-        assert!(receive_address(HnsNetwork::Regtest, &public)
-            .expect("regtest")
-            .starts_with("rs1"));
+        assert!(
+            receive_address(HnsNetwork::Mainnet, &public)
+                .expect("mainnet")
+                .starts_with("hs1")
+        );
+        assert!(
+            receive_address(HnsNetwork::Regtest, &public)
+                .expect("regtest")
+                .starts_with("rs1")
+        );
     }
 }

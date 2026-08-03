@@ -23,7 +23,16 @@ recorded in [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
 never a mainnet authorization signal. Shakedex creation, discovery, and state
 transitions are likewise fail-closed behind canonical V2, Denuo V2, and value
 runtime release gates. HNS name-role keys are scanned and persisted separately,
-and the wallet now decodes canonical NameState/resource bytes, verifies every
+and the protected `HnsShakedex` allocation high-water feeds an independent
+32-byte lock-script restore scan. A durable scan fence and atomic account/key
+CAS prevent another process from allocating through an incomplete mnemonic
+scan. Canonical payment, price, deadline, and fee terms are recomputed before
+the redacted purpose-bound signer can authorize a seller object. The node
+snapshot now includes HSD-compatible
+median time past, allowing non-serializable current/unspent Shakedex lock and
+TRANSFER authorities without caller-asserted chain time. These source
+boundaries do not change any release gate. The wallet now decodes canonical
+NameState/resource bytes, verifies every
 node projection and exact owner output, and binds current control only to a
 persisted `HnsName` derivation. TRANSFER owners must also bind the canonical
 transfer height to the active-chain owner-transaction inclusion height.

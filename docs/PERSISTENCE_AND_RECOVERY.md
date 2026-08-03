@@ -41,6 +41,22 @@ Duplicate `(entity kind, record ID)` operations and stale writers fail before a
 partial batch becomes visible. Secret record IDs cannot change kinds; recovery
 seed bytes are additionally immutable once inserted.
 
+HNS Shakedex seller keys have a dedicated deletion-protected encrypted entity
+namespace. A legacy-defaulted WalletAccount gate starts as scan-required. The
+runtime CAS-saves a durable scanning fence before the first 32-byte script
+query and clears it only when the complete bounded scan commits; a later scan
+can take over a crashed fence by advancing the account revision. New key
+allocation is denied while the gate is required or scanning. One immediate
+transaction then advances the WalletAccount projection and writes the
+namespace anchor, account-global high-water, immutable workflow/name/canonical
+economic-terms binding, and binding claim. No scalar is stored. Exact retry
+returns the existing binding; changed context, a seed-commitment mismatch,
+partial topology, clock rollback, or a second CAS conflict fails closed. The
+next allocation takes the maximum of this durable high-water and the account's
+restored on-chain Shakedex index, and reserves the configured trailing scan
+gap, so concurrent writers to one wallet store cannot allocate through an
+incomplete mnemonic scan and reuse a discovered lock key.
+
 The fixed-price Denuo board is one versioned encrypted `DenuoBoardObject` with
 an explicit 4,096-offer/watermark bound and a store-owned CAS revision. It
 retains one canonical latest listing/cancellation record plus network/genesis,
@@ -69,11 +85,11 @@ FINALIZE construction is typed but remains memory-only until a durable plan is
 added. Exact retries may revalidate the same persisted plan, while a stale
 revision or changed canonical plan fails instead of replacing previously
 prepared bytes. This CAS state is crash-recovery and audit data only. On every
-resume, the product must reacquire current/unspent lock evidence, active-chain
-NameState and renewal evidence, authoritative parent MTP, wallet funding and
-reservations, signing approval, fee evidence, and broadcast/reorg state. A
-persisted or newly supplied Coin, MTP, or NameState never restores those
-authorities.
+resume, the product must reacquire the HNS runtime's non-serializable current/
+unspent lock or TRANSFER authority, active-chain NameState and renewal evidence,
+authoritative parent MTP, wallet funding and reservations, signing approval,
+fee evidence, and broadcast/reorg state. Persisted Coin, MTP, or NameState
+bytes never restore those authorities.
 
 HNS authorization can authenticate and return a pending approval without
 consuming it. After exact signed-byte fee quoting succeeds, a bounded immediate
@@ -183,9 +199,11 @@ The product runtime must:
    selected embedded adapter is implemented and qualified;
 7. reconcile mempools, confirmations, replacements, and reorgs from atomic,
    validated evidence;
-8. restore the bounded name-role scan, revalidate split committed-proof/current
-   name views, replace legacy watch-only rows with exact canonical summaries,
-   and reacquire rather than restore any ephemeral ownership authority;
+8. restore the bounded coin, name-role, and 32-byte Shakedex-lock scans under
+   one exact chain/mempool binding; advance separated counters without rollback;
+   revalidate split committed-proof/current name views; replace legacy watch-
+   only rows with exact canonical summaries; and reacquire rather than restore
+   any ephemeral ownership or Shakedex spend authority;
 9. expire price rounds, intents, fill grants, persisted workflow approvals, and replay rows only
    after their authenticated metadata verifies;
 10. restore swap sessions and independently verify every recorded funding,
@@ -196,9 +214,10 @@ The product runtime must:
 13. surface user actions without automatically moving value.
 
 The HNS source implements the concrete synchronous authenticated node adapter,
-bounded coin/name-role chain/mempool snapshot reconciliation, and prepared-
-transaction recovery. The learned durable chain epoch and process-instance/
-generation pair remain exact across both scans, gap expansion, and all point
+bounded coin/name/Shakedex-role chain/mempool snapshot reconciliation, and
+prepared-transaction recovery. The learned durable chain epoch,
+HSD-compatible tip median time, and process-instance/generation pair remain
+exact across all three scans, gap expansion, and all point
 reads in one reconciliation;
 they are intentionally reacquired after process restart rather than persisted
 as timeless authority. Exact final-signed fee quotes are wired and persisted;

@@ -12,14 +12,14 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use blake2::digest::{Update as BlakeUpdate, VariableOutput};
 use blake2::Blake2bVar;
+use blake2::digest::{Update as BlakeUpdate, VariableOutput};
 use hns_covenants::{
-    Covenant, CovenantKind, NameState, MAX_COVENANT_ITEMS, MAX_COVENANT_ITEM_SIZE,
-    MAX_NAME_STATE_SIZE,
+    Covenant, CovenantKind, MAX_COVENANT_ITEM_SIZE, MAX_COVENANT_ITEMS, MAX_NAME_STATE_SIZE,
+    NameState,
 };
 use hns_primitives::{Dollarydoos, NameHash};
-use hns_transaction::{Address, Output, Transaction, MAX_TRANSACTION_RAW_SIZE};
+use hns_transaction::{Address, MAX_TRANSACTION_RAW_SIZE, Output, Transaction};
 use hns_wallet_types::{BaseUnits, TransactionHash};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -29,13 +29,13 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     BlockHashEvidence, ChainTip, ConfirmedWalletPage, ConfirmedWalletPageRequest, HistoryEntry,
     HnsBackend, HnsFeeRateSource, HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsOutpoint,
-    HnsTransactionFeeQuote, HnsWalletError, IndexedWalletCoin, MempoolSnapshotBinding,
-    MempoolWalletPage, MempoolWalletPageRequest, NameActionContextEvidence,
-    NameActionIneligibility, NameEvidence, NameProofResponse, OutpointSpendEntry,
-    OutpointSpendEvidence, SnapshotBinding, SpendingTransactionEvidence, TransactionEvidence,
-    TransactionInclusion, TransactionStatus, WalletAddressKey, WalletCoin, MAX_HISTORY_RESULTS,
+    HnsTransactionFeeQuote, HnsWalletError, IndexedWalletCoin, MAX_HISTORY_RESULTS,
     MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH, MAX_RESTORE_SCRIPTS_PER_QUERY,
-    MAX_SCAN_CURSOR_BYTES, MAX_SCAN_PAGE_RESULTS,
+    MAX_SCAN_CURSOR_BYTES, MAX_SCAN_PAGE_RESULTS, MempoolSnapshotBinding, MempoolWalletPage,
+    MempoolWalletPageRequest, NameActionContextEvidence, NameActionIneligibility, NameEvidence,
+    NameProofResponse, OutpointSpendEntry, OutpointSpendEvidence, SnapshotBinding,
+    SpendingTransactionEvidence, TransactionEvidence, TransactionInclusion, TransactionStatus,
+    WalletAddressKey, WalletCoin,
 };
 
 const WALLET_RPC_API_VERSION: u16 = 1;
@@ -813,6 +813,7 @@ struct WireTip {
     hash: String,
     height: u32,
     tree_root: String,
+    median_time_past: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1232,10 +1233,14 @@ fn encode_cursor(cursor: Option<&[u8]>) -> Result<Option<String>, HnsWalletError
 }
 
 fn chain_tip(wire: WireTip) -> Result<ChainTip, HnsWalletError> {
+    if wire.median_time_past == 0 {
+        return Err(protocol_error());
+    }
     Ok(ChainTip {
         height: u64::from(wire.height),
         block_hash: decode_hex_32(&wire.hash)?,
         tree_root: decode_hex_32(&wire.tree_root)?,
+        median_time_past: wire.median_time_past,
     })
 }
 
@@ -2452,7 +2457,8 @@ mod tests {
             "tip": {
                 "hash": hex::encode([4; 32]),
                 "height": 409,
-                "tree_root": hex::encode([5; 32])
+                "tree_root": hex::encode([5; 32]),
+                "median_time_past": 1_700_000_000_u64
             },
             "candidate_inclusion_height": 410,
             "mempool": {
@@ -2502,10 +2508,18 @@ mod tests {
             serde_json::from_value(response.clone()).expect("closed response schema");
         assert_eq!(parsed.action, HnsNameAction::Finalize);
         assert_eq!(parsed.lifecycle, HnsNameLifecycle::Closed);
+        assert_eq!(parsed.tip.median_time_past, 1_700_000_000);
         assert_eq!(
             parsed.eligibility.reasons,
             vec![NameActionIneligibility::TransferNotMature]
         );
+
+        let mut missing_median_time = response.clone();
+        missing_median_time["tip"]
+            .as_object_mut()
+            .expect("tip object")
+            .remove("median_time_past");
+        assert!(serde_json::from_value::<WireNameActionContext>(missing_median_time).is_err());
 
         let mut unknown_reason = response.clone();
         unknown_reason["eligibility"]["reasons"][0] = serde_json::json!("unknown_reason");

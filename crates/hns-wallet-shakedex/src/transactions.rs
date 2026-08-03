@@ -6,6 +6,9 @@ use hns_transaction::{
     Address, Coin, Input, Output, Transaction, Witness, build_finalize_transaction,
     build_transfer_output, verify_covenant_links, verify_finalize_at_index_zero,
 };
+use hns_wallet_hns::{
+    HnsShakedexSigner, VerifiedCurrentShakedexLock, VerifiedCurrentShakedexTransfer,
+};
 use hns_wallet_types::TransactionHash;
 
 use crate::{AuthenticatedFixedPriceListing, ShakedexError, VerifiedFixedPriceListing};
@@ -55,6 +58,21 @@ impl SuppliedShakedexLock {
     pub const fn locking_coin(&self) -> &Coin {
         &self.locking_coin
     }
+}
+
+fn supplied_lock_from_current(
+    current: &VerifiedCurrentShakedexLock,
+) -> Result<SuppliedShakedexLock, ShakedexError> {
+    let descriptor = current.descriptor();
+    let supplied = SuppliedShakedexLock::verify(
+        descriptor.network,
+        current.locking_coin().clone(),
+        descriptor.seller_public_key,
+    )?;
+    if supplied.descriptor() != descriptor {
+        return Err(ShakedexError::InvalidEvidence);
+    }
+    Ok(supplied)
 }
 
 /// Unsigned buyer funding suffix around an already seller-signed canonical
@@ -193,6 +211,34 @@ pub fn prepare_buyer_fulfillment(
     })
 }
 
+/// Build a buyer fulfillment from an HNS-runtime authority that has already
+/// bound the exact lock, active NameState, confirmed/mempool unspentness, and
+/// parent median time to one current snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_current_buyer_fulfillment(
+    listing: &VerifiedFixedPriceListing,
+    current_lock: &VerifiedCurrentShakedexLock,
+    now_unix: u64,
+    expected_recipient: Address,
+    buyer_inputs: Vec<Input>,
+    buyer_input_coins: Vec<Coin>,
+    buyer_outputs: Vec<Output>,
+    expected_fee_base_units: u64,
+) -> Result<PreparedBuyerFulfillment, ShakedexError> {
+    let supplied_lock = supplied_lock_from_current(current_lock)?;
+    prepare_buyer_fulfillment(
+        listing,
+        &supplied_lock,
+        now_unix,
+        current_lock.parent_median_time(),
+        expected_recipient,
+        buyer_inputs,
+        buyer_input_coins,
+        buyer_outputs,
+        expected_fee_base_units,
+    )
+}
+
 pub fn verify_signed_buyer_fulfillment(
     listing: &AuthenticatedFixedPriceListing,
     supplied_lock: &SuppliedShakedexLock,
@@ -244,6 +290,30 @@ impl PreparedSellerRecovery {
         self.fee_base_units
     }
 
+    /// Authorize the exact prepared recovery through the allocation-bound HNS
+    /// signer without exposing either the scalar or an arbitrary digest API.
+    fn authorize_with_hns_signer(
+        &self,
+        current_lock: &VerifiedCurrentShakedexLock,
+        signer: &HnsShakedexSigner,
+    ) -> Result<SellerAuthorizedRecovery, ShakedexError> {
+        let mut transaction = self.unsigned_transaction.clone();
+        signer
+            .sign_current_recovery_transaction(
+                current_lock,
+                &mut transaction,
+                &self.recovery_recipient,
+            )
+            .map_err(|_| ShakedexError::InvalidEvidence)?;
+        Ok(SellerAuthorizedRecovery {
+            supplied_lock: self.supplied_lock.clone(),
+            recovery_recipient: self.recovery_recipient.clone(),
+            funding_input_coins: self.funding_input_coins.clone(),
+            seller_authorized_transaction: canonical_transaction_bytes(&transaction)?,
+            fee_base_units: self.fee_base_units,
+        })
+    }
+
     pub fn install_seller_signature(
         &self,
         signature: &[u8; COMPACT_SIGNATURE_SIZE],
@@ -269,6 +339,43 @@ impl PreparedSellerRecovery {
             seller_authorized_transaction: canonical_transaction_bytes(&transaction)?,
             fee_base_units: self.fee_base_units,
         })
+    }
+}
+
+/// Recovery prepared from current-chain authority. Seller authorization
+/// requires the current authority for the same exact lock again, so a generic
+/// caller-supplied structural preparation cannot reach the protected HNS
+/// signer. The enclosing value runtime remains responsible for reacquisition
+/// before irreversible use.
+pub struct CurrentPreparedSellerRecovery {
+    inner: PreparedSellerRecovery,
+}
+
+impl CurrentPreparedSellerRecovery {
+    pub fn transaction_bytes(&self) -> Result<Vec<u8>, ShakedexError> {
+        self.inner.transaction_bytes()
+    }
+
+    pub const fn recovery_signature_hash(&self) -> &[u8; 32] {
+        self.inner.recovery_signature_hash()
+    }
+
+    pub const fn fee_base_units(&self) -> u64 {
+        self.inner.fee_base_units()
+    }
+
+    pub fn authorize_with_hns_signer(
+        &self,
+        current_lock: &VerifiedCurrentShakedexLock,
+        signer: &HnsShakedexSigner,
+    ) -> Result<SellerAuthorizedRecovery, ShakedexError> {
+        let current = supplied_lock_from_current(current_lock)?;
+        if current.descriptor() != self.inner.supplied_lock.descriptor()
+            || current.locking_coin() != self.inner.supplied_lock.locking_coin()
+        {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        self.inner.authorize_with_hns_signer(current_lock, signer)
     }
 }
 
@@ -413,6 +520,28 @@ pub fn prepare_seller_recovery(
         recovery_signature_hash,
         fee_base_units: expected_fee_base_units,
     })
+}
+
+/// Build seller recovery only from a freshly authenticated current lock. The
+/// returned digest still requires the allocation-bound HNS Shakedex signer.
+pub fn prepare_current_seller_recovery(
+    current_lock: &VerifiedCurrentShakedexLock,
+    recovery_recipient: Address,
+    funding_inputs: Vec<Input>,
+    funding_input_coins: Vec<Coin>,
+    funding_outputs: Vec<Output>,
+    expected_fee_base_units: u64,
+) -> Result<CurrentPreparedSellerRecovery, ShakedexError> {
+    let supplied_lock = supplied_lock_from_current(current_lock)?;
+    let inner = prepare_seller_recovery(
+        &supplied_lock,
+        recovery_recipient,
+        funding_inputs,
+        funding_input_coins,
+        funding_outputs,
+        expected_fee_base_units,
+    )?;
+    Ok(CurrentPreparedSellerRecovery { inner })
 }
 
 pub fn verify_signed_seller_recovery(
@@ -578,6 +707,40 @@ pub fn prepare_script_finalize(
         prepared_transaction: canonical_transaction_bytes(&transaction)?,
         fee_base_units: expected_fee_base_units,
     })
+}
+
+/// Build script-controlled FINALIZE from the HNS runtime's exact active-chain
+/// TRANSFER, maturity, renewal-block, and unspent authority. The verified
+/// parent must be byte-identical to that current owner transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_current_script_finalize(
+    supplied_lock: &SuppliedShakedexLock,
+    verified_parent: VerifiedShakedexTransfer<'_>,
+    current_transfer: &VerifiedCurrentShakedexTransfer,
+    expected_recipient: Address,
+    funding_inputs: Vec<Input>,
+    funding_input_coins: Vec<Coin>,
+    funding_outputs: Vec<Output>,
+    expected_fee_base_units: u64,
+) -> Result<PreparedScriptFinalize, ShakedexError> {
+    if supplied_lock.descriptor() != current_transfer.descriptor()
+        || verified_parent.transaction_bytes()
+            != canonical_transaction_bytes(current_transfer.transfer_transaction())?
+    {
+        return Err(ShakedexError::InvalidEvidence);
+    }
+    prepare_script_finalize(
+        supplied_lock,
+        verified_parent,
+        current_transfer.transfer_coin().clone(),
+        current_transfer.current_name_state().clone(),
+        BlockHash::new(current_transfer.renewal_block_hash()),
+        expected_recipient,
+        funding_inputs,
+        funding_input_coins,
+        funding_outputs,
+        expected_fee_base_units,
+    )
 }
 
 /// Reauthenticate a signed script-controlled FINALIZE from complete supplied

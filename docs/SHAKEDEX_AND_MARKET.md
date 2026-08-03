@@ -17,7 +17,10 @@ the selected network, current time, and exact supplied locking coin. This
 protocol authority has private fields and is neither cloneable nor
 serializable, but it does not prove that the supplied coin is currently
 unspent; the value runtime must obtain that evidence from the authenticated
-HNS adapter. A cancellation is accepted only through
+HNS adapter. That adapter now returns non-serializable current-lock authority
+only after binding canonical NameState and owner coin, no confirmed or mempool
+spender, the exact chain/mempool snapshot, network/genesis, and the tip's
+HSD-compatible median time past. A cancellation is accepted only through
 `ListingCancellation::verify_for_listing`. Its signed listing target can be
 re-authenticated from persisted canonical bytes after restart or a lock spend,
 without pretending those bytes prove current ownership. Denuo offer and
@@ -37,21 +40,48 @@ time lock against the separately supplied parent MTP. FINALIZE preparation
 requires a verified fulfillment or recovery parent and binds the supplied
 TRANSFER coin to that parent's exact transaction ID and output zero. These
 adapters accept explicit funding suffixes only as bounded transaction-building
-inputs; they do not select wallet funds, reserve inputs, or sign buyer or
-seller keys. Prepared results bind ordered input coins and outpoints, exact
+inputs; they do not select wallet funds, reserve inputs, or sign ordinary
+funding keys. The HNS runtime separately exposes only purpose-bound seller
+signing. Prepared results bind ordered input coins and outpoints, exact
 fees, expected recipients, and canonical bytes; signed-result verification
 requires exact `SIGHASH_ALL` P2PKH funding witnesses and rechecks bounded
 ordinary outputs, covenant links, and standard witness execution rather than
 trusting a caller success flag.
+
+The production-facing construction adapters no longer accept those chain facts
+independently. Buyer fulfillment consumes the current-lock authority and its
+snapshot-bound parent MTP; seller recovery consumes the same current lock;
+script FINALIZE consumes a current unspent TRANSFER authority that binds the
+exact parent bytes, active NameState, maturity, and selected renewal block.
+Protected seller recovery can be authorized only from the current-lock wrapper
+and requires that exact current-lock capability again at authorization. The
+value runtime must reacquire it before irreversible use.
+The explicit supplied-value functions remain a low-level structural boundary
+for deterministic verification and do not themselves confer chain authority.
+
+Seller keys use the independent `HnsShakedex` role and a protected encrypted
+allocation namespace. One atomic CAS batch commits a namespace anchor,
+account-global high-water, immutable workflow/name/canonical economic-terms
+binding, binding claim, and the WalletAccount derivation projection. A durable
+scan-required/scanning fence excludes allocation until the independent branch
+scan commits, including across processes. Exact retries return the same key;
+changed context is rejected; seed-only restoration scans the corresponding
+32-byte lock programs. Secret scalars
+are rederived only after the allocation topology and exact 64-byte recovery
+seed commitment authenticate. The opaque signer is non-cloneable,
+non-serializable, redacted, and exposes only canonical proof, listing,
+cancellation, and recovery operations. Proof/listing/cancellation signing
+recomputes payment, price, lock-time, and fee terms and rejects substitution;
+proof and listing signing also require the current-lock authority directly.
 
 Signed fulfillment and recovery results can be retained as encrypted buyer or
 seller workflow plan state under the compare-and-swap journal. A persisted plan
 binds its canonical terms and transaction bytes so a restart can reject a
 changed or stale plan instead of silently rebuilding different bytes.
 Script-controlled FINALIZE remains memory-only. Persisting or revalidating a
-plan is not chain authorization: the supplied Coin, parent MTP, NameState,
-renewal block, and funding suffix are caller inputs, not proof that they are
-fresh, current, unspent, or on the active chain.
+plan is not chain authorization: current lock/TRANSFER authority must be
+reacquired after restart and again before irreversible use, while the funding
+suffix remains caller input until the wallet selects and reserves it.
 
 The encrypted `DenuoBoardObject` namespace now has a versioned, bounded board
 reducer and CAS load/save boundary. It persists canonical listing and
@@ -81,16 +111,14 @@ not enable those runtime paths or advertise the feature. Typed transaction
 planning and encrypted plan CAS likewise do not enable a value workflow.
 
 The wallet now has coherent canonical V2 source plus exact NameState/resource/
-owner-output validation and ephemeral account ownership authority. Those are
-prerequisites, not Shakedex authorization. Wallet-owned P2PKH TRANSFER/direct
-FINALIZE is implemented behind HNS gates, but Shakedex cannot reuse that
-authority. Canonical fulfillment, recovery, and script-controlled FINALIZE
-planning is present, but authenticated current/unspent lock acquisition,
-wallet-owned key allocation and signing, ordinary-coin selection and
-reservation, exact fee approval, broadcast supervision, active-chain
-NameState/renewal evidence, parent-MTP authority, live Denuo transport, trusted
-browser approval, and restart/reorg/regtest qualification are still required
-before any gate can change. Reverse Dutch is deferred.
+owner-output validation. Wallet-owned P2PKH TRANSFER/direct FINALIZE remains a
+separate authority and is not reused by Shakedex. Canonical planning, protected
+seller-key allocation, purpose-bound signing, current/unspent lock acquisition,
+active-chain NameState/renewal evidence, and parent-MTP authority are present.
+Ordinary-coin selection and reservation, exact fee approval, irreversible
+persistence, broadcast/reorg supervision, live Denuo transport, trusted browser
+approval, and restart/reorg/regtest qualification are still required before
+any gate can change. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 
