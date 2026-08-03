@@ -102,9 +102,16 @@ activation/deletion paths reject
 both protected kinds. Runtime time limits a prepared aggregate and its rows to
 the wallet's existing five-minute prepared-artifact window. A prepared
 cancellation or explicit expiry deletes the complete set in the same CAS;
-product startup integration must invoke that expiry path. Every signed state
-retains the source and funding rows, including confirmation and conflict, until
-an evidence-backed terminal release policy is implemented.
+product startup integration must invoke that expiry path. Signed states retain
+the source and funding rows while their chain result remains reversible. A
+terminal release re-observes the expected transaction and every input spender
+under one runtime-owned snapshot. It deletes all protected rows atomically with
+the terminal workflow only when the expected transaction has the persisted
+minimum confirmations and every exact input position/inclusion matches, or an
+authenticated competing spender reaches the same persisted threshold under
+that snapshot. Subsequent reconciliation is audit-only: a deep reorg or changed
+terminal reason returns `RecoveryRequired` and never silently recreates rows or
+rolls the workflow back.
 
 The approval commitment contains the exact prepared aggregate and its current
 revision. Runtime-owned time governs preparation, approval expiry,
@@ -169,10 +176,11 @@ active-chain NameState/renewal evidence, parent-MTP authority, exact protected
 reservations, final-byte approval and fee evidence, persist-before-broadcast,
 and chain-state reconciliation are present in source for buyer fulfillment and
 seller recovery. The fixed release gates remain `false`. Product-owned coin
-selection, durable script-controlled FINALIZE, evidence-backed release of
-reservations from signed workflows, live Denuo/provider/trusted-UI integration,
-and complete regtest/restart/reorg/product qualification are still required
-before any gate can change. Reverse Dutch is deferred.
+selection, durable script-controlled FINALIZE, product/startup orchestration,
+live Denuo/provider/trusted-UI integration, and complete
+regtest/restart/reorg/product qualification are still required before any gate
+can change. The terminal-release source and focused tests have not been
+executed in this tranche. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 

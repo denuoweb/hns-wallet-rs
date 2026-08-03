@@ -3536,6 +3536,160 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_tranche_shakedex_terminal_workflow_and_reservation_delete_is_atomic() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const PASSPHRASE: &str = "production-tranche-terminal-release";
+        let directory = tempfile::tempdir().expect("private wallet directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private wallet directory permissions");
+        let database = directory.path().join("wallet.sqlite3");
+        let mut store =
+            WalletStore::create_with_kdf(&database, PASSPHRASE, KdfConfig::testing())
+                .expect("file-backed encrypted store");
+        let workflow_id = WorkflowId::new([0x41; 16]);
+        let source_id = vec![0x42; 36];
+        let funding_id = vec![0x43; 36];
+        store
+            .save_workflow(
+                workflow_id,
+                WorkflowKind::ShakedexValue,
+                0,
+                &json!({"stage": "confirmed"}),
+                true,
+                10,
+            )
+            .expect("active workflow");
+        store
+            .save_input_reservation(&source_id, 0, &json!({"kind": "source"}), 10)
+            .expect("source reservation");
+        store
+            .save_input_reservation(&funding_id, 0, &json!({"kind": "funding"}), 10)
+            .expect("funding reservation");
+
+        let stale_deletes = [
+            EntityBatchDelete {
+                id: source_id.clone(),
+                expected_revision: 2,
+            },
+            EntityBatchDelete {
+                id: funding_id.clone(),
+                expected_revision: 1,
+            },
+        ];
+        assert!(matches!(
+            store.save_workflow_with_entity_batch::<_, serde_json::Value>(
+                workflow_id,
+                WorkflowKind::ShakedexValue,
+                1,
+                &json!({"stage": "reservations_released"}),
+                true,
+                11,
+                EntityKind::InputReservation,
+                &[],
+                &stale_deletes,
+            ),
+            Err(StoreError::StaleRevision { .. })
+        ));
+        let unchanged: StoredWorkflow<serde_json::Value> = store
+            .load_workflow(workflow_id)
+            .expect("load workflow")
+            .expect("workflow present");
+        assert_eq!(unchanged.revision, 1);
+        assert_eq!(unchanged.state["stage"], "confirmed");
+        assert!(
+            store
+                .input_reservation::<serde_json::Value>(&source_id)
+                .expect("load source")
+                .is_some()
+        );
+        assert!(
+            store
+                .input_reservation::<serde_json::Value>(&funding_id)
+                .expect("load funding")
+                .is_some()
+        );
+
+        let deletes = [
+            EntityBatchDelete {
+                id: source_id.clone(),
+                expected_revision: 1,
+            },
+            EntityBatchDelete {
+                id: funding_id.clone(),
+                expected_revision: 1,
+            },
+        ];
+        assert_eq!(
+            store
+                .save_workflow_with_entity_batch::<_, serde_json::Value>(
+                    workflow_id,
+                    WorkflowKind::ShakedexValue,
+                    1,
+                    &json!({"stage": "reservations_released"}),
+                    true,
+                    12,
+                    EntityKind::InputReservation,
+                    &[],
+                    &deletes,
+                )
+                .expect("atomic terminal release"),
+            2
+        );
+        assert_eq!(
+            store
+                .load_workflow::<serde_json::Value>(workflow_id)
+                .expect("load released workflow")
+                .expect("released workflow present")
+                .state["stage"],
+            "reservations_released"
+        );
+        assert!(
+            store
+                .input_reservation::<serde_json::Value>(&source_id)
+                .expect("load released source")
+                .is_none()
+        );
+        assert!(
+            store
+                .input_reservation::<serde_json::Value>(&funding_id)
+                .expect("load released funding")
+                .is_none()
+        );
+
+        store.lock();
+        assert!(store.is_locked());
+        drop(store);
+
+        let mut reopened = WalletStore::open(&database).expect("open locked encrypted store");
+        assert!(reopened.is_locked());
+        assert!(matches!(
+            reopened.load_workflow::<serde_json::Value>(workflow_id),
+            Err(StoreError::Locked)
+        ));
+        reopened.unlock(PASSPHRASE).expect("unlock reopened store");
+        let persisted: StoredWorkflow<serde_json::Value> = reopened
+            .load_workflow(workflow_id)
+            .expect("load persisted terminal workflow")
+            .expect("terminal workflow present after reopen");
+        assert_eq!(persisted.revision, 2);
+        assert_eq!(persisted.state["stage"], "reservations_released");
+        assert!(
+            reopened
+                .input_reservation::<serde_json::Value>(&source_id)
+                .expect("load absent source after reopen")
+                .is_none()
+        );
+        assert!(
+            reopened
+                .input_reservation::<serde_json::Value>(&funding_id)
+                .expect("load absent funding after reopen")
+                .is_none()
+        );
+    }
+
     #[test]
     fn passphrases_are_bounded_at_the_store_boundary() {
         assert!(matches!(

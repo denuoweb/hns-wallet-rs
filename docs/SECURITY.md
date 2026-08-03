@@ -254,13 +254,16 @@ and chain observation. Its `ShakedexSource` reservation is keyed store-globally
 by the lock outpoint, so another wallet/account view in the same `WalletStore`
 cannot reserve the same script-controlled input; account funding rows bind the
 exact ordered ordinary coins. Generic cleanup cannot release either protected
-kind. Prepared expiry
-is capped by runtime time to the five-minute prepared-artifact window, and
-explicit expiry or cancellation releases the complete set atomically. Product
-startup expiry integration remains required. Every signed state—including
-confirmed and conflicted—retains the rows. Evidence-backed terminal release for
-signed workflows is deliberately pending, preventing a reversible confirmation
-from silently freeing inputs.
+kind. Prepared expiry is capped by runtime time to the five-minute prepared-
+artifact window, and explicit expiry or cancellation releases the complete set
+atomically. Product startup expiry integration remains required. Signed states
+retain the rows while their chain outcome remains reversible. Terminal release
+requires one runtime-owned snapshot containing the exact transaction and every
+input spender. It accepts only the expected transaction at the persisted
+confirmation threshold with every exact input position/inclusion, or an
+authenticated competing spender at that threshold under the same snapshot.
+The terminal evidence and deletion of the complete reservation set use one CAS
+transaction.
 
 The HNS runtime requires an exact current account/cache match and current lock
 with confirmed and mempool unspentness. Prepared funding witnesses must be
@@ -274,14 +277,17 @@ before the node call. Runtime-owned same-snapshot transaction and all-input
 spender evidence drives mempool/confirmation/conflict transitions; a reorg can
 move a formerly confirmed transaction back to same-byte rebroadcast. Caller-
 supplied clocks, status flags, and replacement bytes do not drive these
-transitions.
+transitions. Reconciliation of a released workflow is audit-only. If a deep
+reorg invalidates or changes its persisted terminal reason, the workflow stays
+terminal, reservations are not recreated, and the runtime returns
+`RecoveryRequired` for explicit operator handling.
 
 Script-controlled FINALIZE additionally binds its TRANSFER coin to output zero
 of a fully verified fulfillment or recovery parent that spends the exact lock,
 but its durable value child has not been implemented. Product coin selection,
-live Denuo/provider/trusted-UI integration, evidence-backed signed-workflow
-reservation release, and complete restart/reorg/regtest qualification remain
-pending. `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
+live Denuo/provider/trusted-UI integration, terminal-release test execution,
+and complete restart/reorg/regtest qualification remain pending.
+`SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`,
 `HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`,

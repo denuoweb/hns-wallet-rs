@@ -49,8 +49,16 @@ pub enum ShakedexValueStage {
     Confirming,
     Confirmed,
     Conflicted,
+    ReservationsReleased,
     Expired,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShakedexReservationReleaseReason {
+    ExactTransactionConfirmed,
+    ConfirmedCompetingSpend,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -80,6 +88,38 @@ pub struct ShakedexChainObservation {
     pub confirmation_count: u32,
     pub conflicted: bool,
     pub observed_at_unix: u64,
+}
+
+/// Immutable finality evidence that permitted the aggregate to release every
+/// protected source/funding reservation. A later observation that no longer
+/// proves the same terminal outcome is recovery-required; it never rolls the
+/// workflow back into an automatically spendable state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShakedexReservationReleaseEvidence {
+    reason: ShakedexReservationReleaseReason,
+    transaction_evidence: TransactionEvidence,
+    spend_evidence: OutpointSpendEvidence,
+    observed_at_unix: u64,
+    released_at_unix: u64,
+}
+
+impl ShakedexReservationReleaseEvidence {
+    pub const fn reason(&self) -> ShakedexReservationReleaseReason {
+        self.reason
+    }
+
+    pub const fn binding(&self) -> SnapshotBinding {
+        self.transaction_evidence.binding
+    }
+
+    pub const fn observed_at_unix(&self) -> u64 {
+        self.observed_at_unix
+    }
+
+    pub const fn released_at_unix(&self) -> u64 {
+        self.released_at_unix
+    }
 }
 
 /// One aggregate funds-safety record for a post-lock Shakedex value action.
@@ -113,6 +153,8 @@ pub struct ShakedexValueWorkflow {
     confirmed_once: bool,
     conflicted_once: bool,
     competing_spenders: Vec<TransactionHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reservation_release: Option<ShakedexReservationReleaseEvidence>,
 }
 
 impl ShakedexValueWorkflow {
@@ -247,6 +289,7 @@ impl ShakedexValueWorkflow {
             confirmed_once: false,
             conflicted_once: false,
             competing_spenders: Vec::new(),
+            reservation_release: None,
         };
         workflow.validate()?;
         Ok(workflow)
@@ -319,6 +362,10 @@ impl ShakedexValueWorkflow {
 
     pub fn competing_spenders(&self) -> &[TransactionHash] {
         &self.competing_spenders
+    }
+
+    pub const fn reservation_release(&self) -> Option<&ShakedexReservationReleaseEvidence> {
+        self.reservation_release.as_ref()
     }
 
     pub(crate) fn source_coin(&self) -> Result<Coin, ShakedexError> {
@@ -552,6 +599,86 @@ impl ShakedexValueWorkflow {
         Ok(next)
     }
 
+    fn release_reservations(
+        &self,
+        transaction_evidence: TransactionEvidence,
+        spend_evidence: OutpointSpendEvidence,
+        observed_at_unix: u64,
+        released_at_unix: u64,
+    ) -> Result<Self, ShakedexError> {
+        if !matches!(
+            self.stage,
+            ShakedexValueStage::Authorized
+                | ShakedexValueStage::RequiresRebroadcast
+                | ShakedexValueStage::Broadcast
+                | ShakedexValueStage::Mempool
+                | ShakedexValueStage::Confirming
+                | ShakedexValueStage::Confirmed
+                | ShakedexValueStage::Conflicted
+        ) || self.authorized.is_none()
+            || self.reservation_release.is_some()
+            || released_at_unix < observed_at_unix
+            || self
+                .last_chain_observation
+                .as_ref()
+                .is_some_and(|previous| {
+                    observed_at_unix < previous.observed_at_unix
+                        || !snapshot_binding_not_older(
+                            transaction_evidence.binding,
+                            previous.binding,
+                        )
+                        || !mempool_binding_not_older(
+                            transaction_evidence.mempool,
+                            previous.mempool,
+                        )
+                })
+        {
+            return Err(ShakedexError::InvalidTransition);
+        }
+        let transaction = self.transaction().ok_or(ShakedexError::InvalidTransition)?;
+        validate_transaction_evidence(self, &transaction_evidence)?;
+        let competing_spenders = validate_spend_evidence(
+            self,
+            &spend_evidence,
+            transaction,
+            &transaction_evidence,
+        )?;
+        let reason = terminal_release_reason(
+            transaction,
+            self.minimum_confirmations,
+            &transaction_evidence,
+            &spend_evidence,
+            &competing_spenders,
+        )?;
+        let mut next = self.reconcile(
+            &transaction_evidence,
+            &spend_evidence,
+            observed_at_unix,
+        )?;
+        if !matches!(
+            (reason, next.stage),
+            (
+                ShakedexReservationReleaseReason::ExactTransactionConfirmed,
+                ShakedexValueStage::Confirmed
+            ) | (
+                ShakedexReservationReleaseReason::ConfirmedCompetingSpend,
+                ShakedexValueStage::Conflicted
+            )
+        ) {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        next.stage = ShakedexValueStage::ReservationsReleased;
+        next.reservation_release = Some(ShakedexReservationReleaseEvidence {
+            reason,
+            transaction_evidence,
+            spend_evidence,
+            observed_at_unix,
+            released_at_unix,
+        });
+        next.validate()?;
+        Ok(next)
+    }
+
     pub fn validate_current_lock(
         &self,
         current_lock: &VerifiedCurrentShakedexLock,
@@ -655,7 +782,8 @@ impl ShakedexValueWorkflow {
                 | ShakedexValueStage::Mempool
                 | ShakedexValueStage::Confirming
                 | ShakedexValueStage::Confirmed
-                | ShakedexValueStage::Conflicted,
+                | ShakedexValueStage::Conflicted
+                | ShakedexValueStage::ReservationsReleased,
                 Some(authorized),
             ) => {
                 if self.verify_signed(&authorized.transaction_bytes)? != authorized.transaction
@@ -674,6 +802,11 @@ impl ShakedexValueWorkflow {
                 )?;
             }
             _ => return Err(ShakedexError::InvalidEvidence),
+        }
+        if (self.stage == ShakedexValueStage::ReservationsReleased)
+            != self.reservation_release.is_some()
+        {
+            return Err(ShakedexError::InvalidEvidence);
         }
         if self.stage == ShakedexValueStage::Authorized
             && (self.submission_attempts != 0
@@ -694,6 +827,7 @@ impl ShakedexValueWorkflow {
                 | ShakedexValueStage::Confirming
                 | ShakedexValueStage::Confirmed
                 | ShakedexValueStage::Conflicted
+                | ShakedexValueStage::ReservationsReleased
         );
         if post_authorization_stage
             && ((self.submission_attempts == 0) != self.submission_started_at_unix.is_none()
@@ -715,6 +849,7 @@ impl ShakedexValueWorkflow {
             return Err(ShakedexError::InvalidEvidence);
         }
         self.validate_chain_observation()?;
+        self.validate_reservation_release()?;
         Ok(())
     }
 
@@ -726,6 +861,7 @@ impl ShakedexValueWorkflow {
                     | ShakedexValueStage::Confirming
                     | ShakedexValueStage::Confirmed
                     | ShakedexValueStage::Conflicted
+                    | ShakedexValueStage::ReservationsReleased
             ) {
                 return Err(ShakedexError::InvalidEvidence);
             }
@@ -795,6 +931,22 @@ impl ShakedexValueWorkflow {
                 self.conflicted_once
                     && (observation.conflicted || !self.competing_spenders.is_empty())
             }
+            ShakedexValueStage::ReservationsReleased => self
+                .reservation_release
+                .as_ref()
+                .is_some_and(|release| match release.reason {
+                    ShakedexReservationReleaseReason::ExactTransactionConfirmed => {
+                        !observation.in_mempool
+                            && observation.confirmation_count >= self.minimum_confirmations
+                            && !observation.conflicted
+                            && self.competing_spenders.is_empty()
+                            && self.confirmed_once
+                    }
+                    ShakedexReservationReleaseReason::ConfirmedCompetingSpend => {
+                        self.conflicted_once
+                            && (observation.conflicted || !self.competing_spenders.is_empty())
+                    }
+                }),
             ShakedexValueStage::Prepared
             | ShakedexValueStage::Authorized
             | ShakedexValueStage::Broadcast
@@ -802,6 +954,53 @@ impl ShakedexValueWorkflow {
             | ShakedexValueStage::Cancelled => false,
         };
         if !valid_for_stage {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        Ok(())
+    }
+
+    fn validate_reservation_release(&self) -> Result<(), ShakedexError> {
+        let Some(release) = self.reservation_release.as_ref() else {
+            return if self.stage == ShakedexValueStage::ReservationsReleased {
+                Err(ShakedexError::InvalidEvidence)
+            } else {
+                Ok(())
+            };
+        };
+        if self.stage != ShakedexValueStage::ReservationsReleased
+            || release.observed_at_unix == 0
+            || release.released_at_unix < release.observed_at_unix
+        {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        let transaction = self.transaction().ok_or(ShakedexError::InvalidTransition)?;
+        validate_transaction_evidence(self, &release.transaction_evidence)?;
+        let competing_spenders = validate_spend_evidence(
+            self,
+            &release.spend_evidence,
+            transaction,
+            &release.transaction_evidence,
+        )?;
+        let reason = terminal_release_reason(
+            transaction,
+            self.minimum_confirmations,
+            &release.transaction_evidence,
+            &release.spend_evidence,
+            &competing_spenders,
+        )?;
+        let expected_observation = ShakedexChainObservation {
+            binding: release.transaction_evidence.binding,
+            mempool: release.transaction_evidence.mempool,
+            inclusion: release.transaction_evidence.inclusion,
+            in_mempool: release.transaction_evidence.status.in_mempool,
+            confirmation_count: release.transaction_evidence.status.confirmation_count,
+            conflicted: release.transaction_evidence.status.conflicted,
+            observed_at_unix: release.observed_at_unix,
+        };
+        if release.reason != reason
+            || self.competing_spenders != competing_spenders
+            || self.last_chain_observation.as_ref() != Some(&expected_observation)
+        {
             return Err(ShakedexError::InvalidEvidence);
         }
         Ok(())
@@ -1384,14 +1583,39 @@ fn require_value_runtime_release_qualified() -> Result<(), ShakedexError> {
     Ok(())
 }
 
-pub fn reconcile_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+/// Release every protected source/funding row only after one fresh runtime
+/// snapshot proves the signed transaction, or an authenticated competing
+/// spender, has reached the workflow's already-approved finality threshold.
+/// This recovery operation is intentionally available while value entrypoints
+/// remain gated: it cannot sign or broadcast new bytes.
+pub fn release_terminal_shakedex_value_workflow_reservations<
+    B: HnsBackend,
+    C: HnsClock,
+>(
     store: &mut WalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
 ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
     validate_runtime_scope(runtime, scope)?;
+    stored.workflow.validate()?;
     require_exact_stored_value_workflow(store, stored)?;
+    if stored.workflow.stage == ShakedexValueStage::ReservationsReleased {
+        validate_shakedex_value_workflow_reservations(store, scope, stored)?;
+        return Ok(stored.clone());
+    }
+    if !matches!(
+        stored.workflow.stage,
+        ShakedexValueStage::Authorized
+            | ShakedexValueStage::RequiresRebroadcast
+            | ShakedexValueStage::Broadcast
+            | ShakedexValueStage::Mempool
+            | ShakedexValueStage::Confirming
+            | ShakedexValueStage::Confirmed
+            | ShakedexValueStage::Conflicted
+    ) {
+        return Err(ShakedexError::InvalidTransition);
+    }
     validate_hns_shakedex_funding_reservations(
         store,
         scope,
@@ -1414,6 +1638,122 @@ pub fn reconcile_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     }
     let observed_at_unix = observation.observed_at_unix();
     let (transaction_evidence, spend_evidence) = observation.into_parts();
+    let released_at_unix = runtime.shakedex_now_unix()?;
+    let next = stored.workflow.release_reservations(
+        transaction_evidence,
+        spend_evidence,
+        observed_at_unix,
+        released_at_unix,
+    )?;
+    require_exact_stored_value_workflow(store, stored)?;
+    let batch = delete_hns_shakedex_funding_reservations(
+        store,
+        scope,
+        next.funding_reservation(),
+        HnsShakedexFundingReservationState::Active,
+    )?;
+    if !batch.saves().is_empty() || batch.deletes().is_empty() {
+        return Err(ShakedexError::Invariant);
+    }
+    let revision = store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+        next.workflow_id,
+        WorkflowKind::ShakedexValue,
+        stored.revision,
+        &next,
+        true,
+        released_at_unix,
+        EntityKind::InputReservation,
+        batch.saves(),
+        batch.deletes(),
+    )?;
+    let released = StoredShakedexValueWorkflow {
+        revision,
+        workflow: next,
+    };
+    validate_shakedex_value_workflow_reservations(store, scope, &released)?;
+    Ok(released)
+}
+
+/// Reconcile reversible signed states. For `ReservationsReleased`, this is a
+/// read-only finality audit: it performs no workflow/reservation mutation and
+/// returns `RecoveryRequired` rather than transitioning out of the terminal
+/// stage when the persisted outcome no longer holds.
+pub fn reconcile_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+    store: &mut WalletStore,
+    runtime: &HnsWalletRuntime<B, C>,
+    scope: &HnsShakedexFundingScope,
+    stored: &StoredShakedexValueWorkflow,
+) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+    validate_runtime_scope(runtime, scope)?;
+    require_exact_stored_value_workflow(store, stored)?;
+    let reservations_released =
+        stored.workflow.stage == ShakedexValueStage::ReservationsReleased;
+    validate_hns_shakedex_funding_reservations(
+        store,
+        scope,
+        stored.workflow.funding_reservation(),
+        if reservations_released {
+            HnsShakedexFundingReservationState::Released
+        } else {
+            HnsShakedexFundingReservationState::Active
+        },
+    )?;
+    let signed = stored
+        .workflow
+        .signed_transaction()
+        .ok_or(ShakedexError::InvalidTransition)?;
+    let observation =
+        runtime.observe_shakedex_transaction(stored.workflow.funding_reservation(), signed)?;
+    if observation.transaction()
+        != stored
+            .workflow
+            .transaction()
+            .ok_or(ShakedexError::InvalidTransition)?
+    {
+        return Err(ShakedexError::InvalidEvidence);
+    }
+    let observed_at_unix = observation.observed_at_unix();
+    let (transaction_evidence, spend_evidence) = observation.into_parts();
+    if reservations_released {
+        let previous = stored
+            .workflow
+            .last_chain_observation()
+            .ok_or(ShakedexError::InvalidEvidence)?;
+        if observed_at_unix < previous.observed_at_unix
+            || !snapshot_binding_not_older(transaction_evidence.binding, previous.binding)
+            || !mempool_binding_not_older(transaction_evidence.mempool, previous.mempool)
+        {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        validate_transaction_evidence(&stored.workflow, &transaction_evidence)?;
+        let competing_spenders = validate_spend_evidence(
+            &stored.workflow,
+            &spend_evidence,
+            stored
+                .workflow
+                .transaction()
+                .ok_or(ShakedexError::InvalidTransition)?,
+            &transaction_evidence,
+        )?;
+        let current_reason = audit_terminal_release_reason(
+            stored
+                .workflow
+                .transaction()
+                .ok_or(ShakedexError::InvalidTransition)?,
+            stored.workflow.minimum_confirmations,
+            &transaction_evidence,
+            &spend_evidence,
+            &competing_spenders,
+        )?;
+        if stored
+            .workflow
+            .reservation_release()
+            .is_none_or(|release| release.reason() != current_reason)
+        {
+            return Err(ShakedexError::RecoveryRequired);
+        }
+        return Ok(stored.clone());
+    }
     let next =
         stored
             .workflow
@@ -1464,8 +1804,8 @@ pub fn load_shakedex_value_workflow(
 }
 
 /// Reauthenticate the exact reservation rows required by a loaded aggregate.
-/// Terminal pre-authorization workflows must have released every row; signed
-/// workflows retain both source and funding reservations through reorgs.
+/// Prepared terminal and evidence-backed released workflows have no rows;
+/// nonterminal signed workflows retain both source and funding reservations.
 pub fn validate_shakedex_value_workflow_reservations(
     store: &WalletStore,
     scope: &HnsShakedexFundingScope,
@@ -1478,7 +1818,9 @@ pub fn validate_shakedex_value_workflow_reservations(
     }
     let expected_state = match stored.workflow.stage {
         ShakedexValueStage::Prepared => HnsShakedexFundingReservationState::Prepared,
-        ShakedexValueStage::Expired | ShakedexValueStage::Cancelled => {
+        ShakedexValueStage::Expired
+        | ShakedexValueStage::Cancelled
+        | ShakedexValueStage::ReservationsReleased => {
             HnsShakedexFundingReservationState::Released
         }
         ShakedexValueStage::Authorized
@@ -1604,6 +1946,8 @@ fn validate_save_transition(
     if next.submission_attempts < current.workflow.submission_attempts
         || current.workflow.confirmed_once && !next.confirmed_once
         || current.workflow.conflicted_once && !next.conflicted_once
+        || current.workflow.reservation_release.is_some()
+            && current.workflow.reservation_release != next.reservation_release
         || matches!(
             (
                 current.workflow.submission_started_at_unix,
@@ -1674,6 +2018,16 @@ fn valid_stage_transition(current: ShakedexValueStage, next: ShakedexValueStage)
             | (
                 ShakedexValueStage::Confirming | ShakedexValueStage::Confirmed,
                 ShakedexValueStage::RequiresRebroadcast
+            )
+            | (
+                ShakedexValueStage::Authorized
+                    | ShakedexValueStage::RequiresRebroadcast
+                    | ShakedexValueStage::Broadcast
+                    | ShakedexValueStage::Mempool
+                    | ShakedexValueStage::Confirming
+                    | ShakedexValueStage::Confirmed
+                    | ShakedexValueStage::Conflicted,
+                ShakedexValueStage::ReservationsReleased
             )
     )
 }
@@ -1860,10 +2214,98 @@ fn validate_spend_evidence(
     Ok(competing.into_keys().collect())
 }
 
+fn terminal_release_reason(
+    expected_transaction: TransactionHash,
+    minimum_confirmations: u32,
+    transaction_evidence: &TransactionEvidence,
+    spend_evidence: &OutpointSpendEvidence,
+    competing_spenders: &[TransactionHash],
+) -> Result<ShakedexReservationReleaseReason, ShakedexError> {
+    if minimum_confirmations == 0
+        || spend_evidence.binding != transaction_evidence.binding
+        || spend_evidence.entries.is_empty()
+    {
+        return Err(ShakedexError::InvalidEvidence);
+    }
+    if transaction_evidence.status.confirmation_count >= minimum_confirmations
+        && !transaction_evidence.status.in_mempool
+        && !transaction_evidence.status.conflicted
+        && competing_spenders.is_empty()
+    {
+        let inclusion = transaction_evidence
+            .inclusion
+            .ok_or(ShakedexError::InvalidEvidence)?;
+        let every_input_spent_by_exact_transaction = spend_evidence
+            .entries
+            .iter()
+            .enumerate()
+            .all(|(position, entry)| {
+                entry.spending.is_some_and(|spending| {
+                    spending.transaction == expected_transaction
+                        && usize::try_from(spending.input_position)
+                            .is_ok_and(|candidate| candidate == position)
+                        && spending.height == inclusion.height
+                        && spending.block_hash == inclusion.block_hash
+                })
+            });
+        if every_input_spent_by_exact_transaction {
+            return Ok(ShakedexReservationReleaseReason::ExactTransactionConfirmed);
+        }
+        return Err(ShakedexError::InvalidEvidence);
+    }
+    if transaction_evidence.status.confirmation_count != 0
+        || transaction_evidence.inclusion.is_some()
+        || transaction_evidence.status.in_mempool
+        || competing_spenders.is_empty()
+    {
+        return Err(ShakedexError::InvalidTransition);
+    }
+    let tip_height = transaction_evidence.binding.tip.height;
+    let final_competitor = spend_evidence.entries.iter().any(|entry| {
+        entry.spending.is_some_and(|spending| {
+            spending.transaction != expected_transaction
+                && competing_spenders.binary_search(&spending.transaction).is_ok()
+                && tip_height
+                    .checked_sub(spending.height)
+                    .and_then(|depth| depth.checked_add(1))
+                    .is_some_and(|depth| depth >= u64::from(minimum_confirmations))
+        })
+    });
+    if !final_competitor {
+        return Err(ShakedexError::InvalidTransition);
+    }
+    Ok(ShakedexReservationReleaseReason::ConfirmedCompetingSpend)
+}
+
+fn audit_terminal_release_reason(
+    expected_transaction: TransactionHash,
+    minimum_confirmations: u32,
+    transaction_evidence: &TransactionEvidence,
+    spend_evidence: &OutpointSpendEvidence,
+    competing_spenders: &[TransactionHash],
+) -> Result<ShakedexReservationReleaseReason, ShakedexError> {
+    terminal_release_reason(
+        expected_transaction,
+        minimum_confirmations,
+        transaction_evidence,
+        spend_evidence,
+        competing_spenders,
+    )
+    .map_err(|error| {
+        if matches!(error, ShakedexError::InvalidTransition) {
+            ShakedexError::RecoveryRequired
+        } else {
+            error
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_wallet_hns::ChainTip;
+    use hns_wallet_hns::{
+        ChainTip, HnsOutpoint, OutpointSpendEntry, SpendingTransactionEvidence, TransactionStatus,
+    };
 
     fn binding(epoch: u64, height: u64, hash: u8) -> SnapshotBinding {
         SnapshotBinding {
@@ -1975,5 +2417,232 @@ mod tests {
             observation.observed_at_unix,
             &observation,
         ));
+    }
+
+    #[test]
+    fn production_tranche_hns_shakedex_terminal_release_requires_exact_spenders() {
+        let expected = TransactionHash::new([0x71; 32]);
+        let chain = binding(9, 500, 0x72);
+        let mempool = MempoolSnapshotBinding {
+            instance_nonce: [0x73; 32],
+            generation: 4,
+        };
+        let inclusion = TransactionInclusion {
+            block_hash: [0x74; 32],
+            height: 498,
+            transaction_index: Some(2),
+        };
+        let transaction_evidence = TransactionEvidence {
+            binding: chain,
+            mempool,
+            raw: None,
+            status: TransactionStatus {
+                in_mempool: false,
+                confirmation_count: 3,
+                conflicted: false,
+            },
+            inclusion: Some(inclusion),
+        };
+        let mut spend_evidence = OutpointSpendEvidence {
+            binding: chain,
+            entries: (0_u8..2)
+                .map(|position| OutpointSpendEntry {
+                    outpoint: HnsOutpoint {
+                        transaction: TransactionHash::new([position.wrapping_add(1); 32]),
+                        output_index: u32::from(position),
+                    },
+                    spending: Some(SpendingTransactionEvidence {
+                        transaction: expected,
+                        input_position: u32::from(position),
+                        block_hash: inclusion.block_hash,
+                        height: inclusion.height,
+                    }),
+                })
+                .collect(),
+        };
+        assert!(matches!(
+            terminal_release_reason(
+                expected,
+                3,
+                &transaction_evidence,
+                &spend_evidence,
+                &[],
+            ),
+            Ok(ShakedexReservationReleaseReason::ExactTransactionConfirmed)
+        ));
+
+        spend_evidence.entries[1]
+            .spending
+            .as_mut()
+            .expect("spending evidence")
+            .input_position = 0;
+        assert!(matches!(
+            terminal_release_reason(
+                expected,
+                3,
+                &transaction_evidence,
+                &spend_evidence,
+                &[],
+            ),
+            Err(ShakedexError::InvalidEvidence)
+        ));
+    }
+
+    #[test]
+    fn production_tranche_hns_shakedex_terminal_audit_requires_recovery_after_finality_loss() {
+        let expected = TransactionHash::new([0x78; 32]);
+        let chain = binding(11, 900, 0x79);
+        let inclusion = TransactionInclusion {
+            block_hash: [0x7a; 32],
+            height: 899,
+            transaction_index: Some(1),
+        };
+        let transaction_evidence = TransactionEvidence {
+            binding: chain,
+            mempool: MempoolSnapshotBinding {
+                instance_nonce: [0x7b; 32],
+                generation: 6,
+            },
+            raw: None,
+            status: TransactionStatus {
+                in_mempool: false,
+                confirmation_count: 2,
+                conflicted: false,
+            },
+            inclusion: Some(inclusion),
+        };
+        let spend_evidence = OutpointSpendEvidence {
+            binding: chain,
+            entries: vec![OutpointSpendEntry {
+                outpoint: HnsOutpoint {
+                    transaction: TransactionHash::new([0x7c; 32]),
+                    output_index: 0,
+                },
+                spending: Some(SpendingTransactionEvidence {
+                    transaction: expected,
+                    input_position: 0,
+                    block_hash: inclusion.block_hash,
+                    height: inclusion.height,
+                }),
+            }],
+        };
+
+        assert!(matches!(
+            audit_terminal_release_reason(
+                expected,
+                3,
+                &transaction_evidence,
+                &spend_evidence,
+                &[],
+            ),
+            Err(ShakedexError::RecoveryRequired)
+        ));
+    }
+
+    #[test]
+    fn production_tranche_hns_shakedex_terminal_release_requires_final_competitor() {
+        let expected = TransactionHash::new([0x81; 32]);
+        let competitor = TransactionHash::new([0x82; 32]);
+        let chain = binding(10, 700, 0x83);
+        let transaction_evidence = TransactionEvidence {
+            binding: chain,
+            mempool: MempoolSnapshotBinding {
+                instance_nonce: [0x84; 32],
+                generation: 5,
+            },
+            raw: None,
+            status: TransactionStatus {
+                in_mempool: false,
+                confirmation_count: 0,
+                conflicted: true,
+            },
+            inclusion: None,
+        };
+        let mut spend_evidence = OutpointSpendEvidence {
+            binding: chain,
+            entries: vec![OutpointSpendEntry {
+                outpoint: HnsOutpoint {
+                    transaction: TransactionHash::new([0x85; 32]),
+                    output_index: 1,
+                },
+                spending: Some(SpendingTransactionEvidence {
+                    transaction: competitor,
+                    input_position: 0,
+                    block_hash: [0x86; 32],
+                    height: 699,
+                }),
+            }],
+        };
+        assert!(matches!(
+            terminal_release_reason(
+                expected,
+                3,
+                &transaction_evidence,
+                &spend_evidence,
+                &[competitor],
+            ),
+            Err(ShakedexError::InvalidTransition)
+        ));
+
+        spend_evidence.entries[0]
+            .spending
+            .as_mut()
+            .expect("competing spend")
+            .height = 698;
+        assert!(matches!(
+            terminal_release_reason(
+                expected,
+                3,
+                &transaction_evidence,
+                &spend_evidence,
+                &[competitor],
+            ),
+            Ok(ShakedexReservationReleaseReason::ConfirmedCompetingSpend)
+        ));
+
+        spend_evidence.binding = binding(10, 701, 0x87);
+        assert!(matches!(
+            terminal_release_reason(
+                expected,
+                3,
+                &transaction_evidence,
+                &spend_evidence,
+                &[competitor],
+            ),
+            Err(ShakedexError::InvalidEvidence)
+        ));
+    }
+
+    #[test]
+    fn production_tranche_hns_shakedex_terminal_release_stage_is_irreversible() {
+        for current in [
+            ShakedexValueStage::Authorized,
+            ShakedexValueStage::RequiresRebroadcast,
+            ShakedexValueStage::Broadcast,
+            ShakedexValueStage::Mempool,
+            ShakedexValueStage::Confirming,
+            ShakedexValueStage::Confirmed,
+            ShakedexValueStage::Conflicted,
+        ] {
+            assert!(valid_stage_transition(
+                current,
+                ShakedexValueStage::ReservationsReleased
+            ));
+        }
+        for next in [
+            ShakedexValueStage::Authorized,
+            ShakedexValueStage::RequiresRebroadcast,
+            ShakedexValueStage::Broadcast,
+            ShakedexValueStage::Mempool,
+            ShakedexValueStage::Confirming,
+            ShakedexValueStage::Confirmed,
+            ShakedexValueStage::Conflicted,
+            ShakedexValueStage::ReservationsReleased,
+        ] {
+            assert!(!valid_stage_transition(
+                ShakedexValueStage::ReservationsReleased,
+                next
+            ));
+        }
     }
 }

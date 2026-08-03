@@ -13,7 +13,7 @@ disabled independently.
 | Store | schema v3; Argon2id and XChaCha20-Poly1305; encrypted typed entities/workflows/provider records; metadata-bound AEAD; bounded heterogeneous CAS batches; complete bounded binary-prefix entity and opaque-workflow reads; non-consuming authenticated approval reads; atomic unchanged-approval consume plus workflow/reservation CAS; bounded passphrase input, approvals and replays; monotonic permission tombstones; migration checkpoint; Linux file-boundary enforcement; cloneable non-debuggable shared lock/key authority with poison-time key clearing | platform key wrapping, supported secure-open policy on non-Linux targets, migration/import tooling for populated schema-v1 entity tables, DB benchmarks and audit |
 | HNS | create/restore, separated keys, BLAKE2b-160 version-0 addresses, authenticated loopback `hns-node-rs` wallet RPC v1 adapter, separate bounded coin, `HnsName`, and 32-byte `HnsShakedex` queries under one exact chain/mempool snapshot, complete wallet/account-scoped persisted entity reads and fail-closed opaque-workflow recovery, encrypted monotonic name/Shakedex scan state with a cross-process durable allocation fence, protected workflow/economic-terms-bound Shakedex key allocation atomically coupled to WalletAccount and authenticated seed rederivation, restore/history/reorg reconciliation, ordered spender evidence, exact snapshot-bound HSD median time past and optional transaction positions, immutable canonical 0.2 NameState/resource source, exact raw/projected current/proof validation, owner txid/index/value/covenant/inclusion binding, `HnsName` ownership/incoming/outgoing classification, legacy-row revalidation, ephemeral exact-snapshot ownership authority, versioned chain/mempool/owner/lockup/renewal action-context validation, non-serializable current/unspent Shakedex lock and seller-script-bound TRANSFER authorities, canonical index-zero value-preserving TRANSFER and outgoing-owner direct FINALIZE construction, deterministic encrypted name workflows, typed name/funding and protected Shakedex source/funding reservations, runtime-bound Shakedex funding-coin recovery, single-use trusted approval, ordered `HnsName`/`HnsCoin` and funding-suffix signing, purpose-bound Shakedex proof/listing/cancellation/recovery signing, runtime-owned Shakedex time and same-snapshot transaction/all-input-spender observations, canonical policy-size/minimum-fee construction and independent node-quote comparison, exact signed-byte quote/requote, durable broadcast/mempool/lock/eligibility/finalization/cancellation/conflict/reapproval reconciliation, canonical HTLC construction/spends, settlement evidence and restart supervision | dedicated Shakedex-funding gate plus consolidated node/wallet action-context, MTP, key-allocation, Shakedex funding/reconciliation, and fee-policy CI; multi-process regtest, restart/reorg, mempool-conflict, adversarial, three-branch scan, and resource qualification; trusted provider/UI integration; protocol publication and independent review; published canonical settlement profile |
 | Provider | exact 43-name vocabulary, secure origin, opaque authority registry, authority-validated permission/tombstone snapshots, bounded persisted account bindings, generation-CAS-bound single-approval `hns_requestAccounts` join, runtime-downgrade-safe minimized `hns_accounts`, typed capability snapshot, ephemeral approvals/replay/rates, forbidden methods; checked-in existing-database control dispatcher exposes only capabilities/status/permission read-or-revoke/lock after unlock and cannot create dormant generic grants | concrete `HnsWalletRuntime` account selector/read dispatch, published engine authority adapter, browser-native transport, complete trusted approval UI, executed restart/product qualification |
-| Shakedex | encrypted/CAS seller, buyer, recovery, and typed transaction-plan schemas; opaque canonical fixed-price protocol authority bound to exact hash/network/time/locking coin; typed canonical cancellation; protected monotonic HNS seller-key allocation with purpose-bound signing; canonical fulfillment, explicit-recipient recovery, and script-witness FINALIZE planning; HNS-runtime adapters consume non-serializable current/unspent lock or TRANSFER, active NameState, parent-MTP, maturity, and renewal evidence; durable aggregate buyer-fulfillment/seller-recovery child with exact structural/coin/reservation/approval/final-byte-fee/signed-byte/pre-submit-fence evidence and runtime-owned restart/reorg/conflict/rebroadcast observations; all value authorization/submission entrypoints hard-disabled | product coin selection, durable script-FINALIZE child, evidence-backed signed-workflow reservation release, complete seller/buyer product orchestration, live node/Denuo/provider/trusted-UI integration, consolidated CI and restart/reorg/regtest qualification |
+| Shakedex | encrypted/CAS seller, buyer, recovery, and typed transaction-plan schemas; opaque canonical fixed-price protocol authority bound to exact hash/network/time/locking coin; typed canonical cancellation; protected monotonic HNS seller-key allocation with purpose-bound signing; canonical fulfillment, explicit-recipient recovery, and script-witness FINALIZE planning; HNS-runtime adapters consume non-serializable current/unspent lock or TRANSFER, active NameState, parent-MTP, maturity, and renewal evidence; durable aggregate buyer-fulfillment/seller-recovery child with exact structural/coin/reservation/approval/final-byte-fee/signed-byte/pre-submit-fence evidence and runtime-owned restart/reorg/conflict/rebroadcast observations; atomic evidence-backed signed-workflow terminal reservation release with audit-only recovery-required reorg handling; all value authorization/submission entrypoints hard-disabled | product coin selection, durable script-FINALIZE child, complete seller/buyer product and startup orchestration, live node/Denuo/provider/trusted-UI integration, consolidated CI and restart/reorg/regtest qualification |
 | Denuo market | pinned canonical name-market envelopes; bounded replay/tombstone-safe encrypted fixed-price board with sequence watermarks and CAS restart validation; chain-neutral reservations/sessions | live relay/outbox supervision, peer policy, reporter governance, product integration and qualification |
 | Bitcoin | BDK BIP84 create/load/receive/send primitives; context-bound atomic-swap allocation keys with crate-local regression vectors; encrypted CAS-backed monotonic session/role allocation and authenticated re-derivation; bounded Kyoto tip discovery and supervisor; encrypted birthday/phase/checkpoint journal; BDK-first restart reconciliation; bounded transaction/output mirrors; exact fee-bound pre-broadcast journal; HTLC funding/spend/evidence units | canonical complete-terms caller and settlement-supervisor integration, pinned Kyoto durable header/filter/peer API, record archival, signed-spend integration, consolidated CI, regtest/restart/reorg/adversarial qualification and benchmarks; value gate remains false |
 | Ethereum | separated offline accounts, typed dormant EIP-1559/HTLC and structural evidence primitives, deterministic contract, immutable false synchronization/value/settlement/mainnet gates, opaque runtime permits plus role/address/exact-fee-bound signing types, zeroizing preimages/intermediates, redacted controlled-broadcast artifact | embedded Helios proof source and privately minted evidence authority, persistence/balance/history/nonce/fee/broadcast runtime, redeem/refund verification, local-chain/restart/reorg qualification, approved address and audit |
@@ -94,9 +94,15 @@ prepared/signed bytes, exact approval and final-byte quote, bounded submission
 fence, and chain observations. Initial persistence atomically installs a
 globally keyed protected lock-source reservation plus exact account funding
 reservations. Runtime time caps prepared rows at five minutes. Prepared
-cancellation/expiry releases the whole set; signed
-states retain it through rebroadcast, mempool, confirmation, rollback, and
-conflict. Generic HNS cleanup cannot release these rows.
+cancellation/expiry releases the whole set; signed states retain it through
+reversible rebroadcast, mempool, confirmation, rollback, and conflict states.
+Generic HNS cleanup cannot release these rows. A dedicated terminal operation
+re-observes the exact transaction and all input spenders in one runtime-owned
+snapshot. It atomically persists release evidence and deletes every protected
+row only after the expected transaction or an authenticated competing spender
+reaches the persisted finality threshold. Released reconciliation is read-only;
+changed finality returns `RecoveryRequired` without row recreation or a stage
+rollback.
 
 The runtime owns time and chain evidence, recovers funding derivations only by
 exact current-cache matches, preserves the script-authorized first input,
@@ -109,9 +115,9 @@ confirmation to same-byte rebroadcast. Persisted fee evidence is revalidated
 after restart without treating its old snapshot as current authority.
 
 This source still does not select product funding coins, make script-controlled
-FINALIZE durable, release signed-workflow reservations from terminal evidence,
-contact live Denuo peers, dispatch through a provider/trusted approval UI, or
-constitute restart/reorg/regtest qualification. Purpose-bound seller proof/
+FINALIZE durable, contact live Denuo peers, dispatch through a provider/trusted
+approval UI, integrate product startup supervision, or constitute
+restart/reorg/regtest qualification. Purpose-bound seller proof/
 listing/cancellation/recovery signing remains separately constrained by
 canonical terms and current-lock authority. No Shakedex or dependent HNS
 Shakedex-funding/value/fee gate is enabled.
@@ -181,9 +187,11 @@ in [`QUALIFICATION.md`](QUALIFICATION.md). The new provider/ABI/service/host
 contract has focused source evidence only; installed-product and restart
 qualification remain unrun.
 
-The durable Shakedex value-aggregate source described above was added after
-the recorded `hns_shakedex` run. It has no recorded test result yet and does
-not inherit qualification from the earlier structural-plan compilation.
+The previously recorded focused `hns_shakedex` run covers the durable value
+aggregate described above. The terminal signed-reservation release source and
+its `production_tranche_` tests were added after that run. No build or test was
+invoked for this addition, so it has no execution evidence and does not inherit
+qualification from the prior aggregate result.
 
 ## Deferred by design
 

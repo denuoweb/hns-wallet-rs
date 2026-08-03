@@ -144,10 +144,18 @@ ordinary coins in transaction order. Runtime time caps prepared rows at the
 existing five-minute window. The aggregate and reservation inserts,
 prepared-to-active updates, prepared cancellation/expiry deletes, and
 pre-submit active-row retention each commit atomically. Generic HNS reservation
-cleanup cannot mutate these protected kinds. Signed states retain them across
-mempool, confirmation, confirmation rollback, conflict, and rebroadcast; an
-evidence-backed terminal release transition remains to be designed and
-qualified.
+cleanup cannot mutate these protected kinds. Signed states retain them while
+the chain result remains reversible. A dedicated terminal transition observes
+the exact transaction and every input spender under one runtime-owned snapshot
+and releases the rows only after either the expected transaction reaches the
+persisted confirmation threshold with every exact input position and inclusion,
+or an authenticated competing spender reaches that threshold under the same
+snapshot binding. The terminal workflow evidence and deletion of every
+protected row commit in one CAS transaction. Later reconciliation audits that
+terminal evidence without recreating reservations or rolling the workflow back;
+loss or change of terminal finality returns a recovery-required error. Durable
+script FINALIZE, product/startup integration, and executed qualification remain
+pending, and every release gate remains `false`.
 
 Approval bytes encode the exact prepared aggregate and CAS revision. The HNS
 runtime owns time, reacquires the current lock and cache snapshot, authenticates

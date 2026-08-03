@@ -108,8 +108,15 @@ runtime-owned time caps that prepared lifetime at five minutes, and product
 startup must invoke the explicit expiry path. Authorization atomically changes
 the complete set from expiring prepared rows to active rows.
 Active rows remain attached through rebroadcast, mempool, confirmation,
-confirmation rollback, and conflict. Durable evidence-backed release for a
-signed terminal workflow is not implemented yet.
+confirmation rollback, and conflict while the result remains reversible. A
+terminal release obtains the expected transaction and every input spender from
+one runtime-owned snapshot, proves either exact-transaction finality or the
+finality of an authenticated competitor at the workflow's persisted
+confirmation threshold, and
+atomically saves the terminal evidence while deleting the complete protected
+reservation set. Reconciliation never recreates those rows or reverses the
+terminal stage; if a later snapshot no longer supports the persisted terminal
+reason, it returns `RecoveryRequired` for explicit operator recovery.
 
 The approval request is a domain-separated encoding of the complete prepared
 aggregate and its exact workflow revision. Runtime-owned time determines its
@@ -261,7 +268,8 @@ The product runtime must:
 10. restore swap sessions and independently verify every recorded funding,
    redemption, refund, Shakedex structural plan, and Shakedex value child
    workflow against newly acquired chain authority and its exact protected
-   reservation set;
+   reservation set, requiring active rows for nonterminal signed workflows and
+   no rows plus revalidated release evidence for terminal workflows;
 11. extract an on-chain preimage only from the exact verified spend/event;
 12. determine refund eligibility from validated local chain time; and
 13. surface user actions without automatically moving value.
