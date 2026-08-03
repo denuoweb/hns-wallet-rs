@@ -38,6 +38,17 @@ authorized workflow/raw bytes/quote, and only then deletes the approval. Any
 stale revision, changed approval, signing error, or quote error leaves the
 approval and workflow state unconsumed.
 
+Wallet-owned name preparation uses the same atomic boundary. The canonical
+name source has a `Name` reservation carrying its exact name hash, while fee
+inputs have `Ordinary` reservations; both sets must exactly match the encrypted
+plan. Authorization activates the complete set before broadcast. Broadcast
+name workflows retain those reservations through `TransferLocked`,
+`FinalizeEligible`, `Finalized`, and confirmed transfer-cancellation tracking,
+because any of those confirmations can disappear on reorg. Expiry, explicit
+cancellation, or conflict releases them atomically. A formerly confirmed action
+that disappears becomes `ReapprovalRequired`; replacing an explicitly
+abandoned record requires a fresh request nonce and approval.
+
 ## HNS change derivations
 
 Send preparation and settlement-lock preparation commit account change-index
@@ -96,6 +107,19 @@ means submission may have started even if the caller sees an error or the
 process exits; recovery rebroadcasts the same persisted bytes, never caller
 replacement bytes. Stale snapshot or unavailable quote input triggers at most
 one complete reconciliation and one quote retry, with no polling loop.
+Snapshot-only advancement does not invalidate an otherwise unchanged name
+plan: the wallet revalidates the stable owner source and transaction-defining
+terms, then reacquires against the final quote's chain/mempool binding. A
+changed source or FINALIZE renewal commitment persists
+`ReapprovalRequired`; cancellation releases its reservations, and replacement
+uses a fresh nonce and approval.
+
+TRANSFER/FINALIZE reconciliation follows the same persist-before-broadcast
+rule and reconciles the exact persisted signed transaction by txid and
+available raw-byte equality, together with confirmation arithmetic, competing
+spenders, the transfer output's subsequent covenant, current candidate
+maturity, renewal evidence, and owner mempool spender. It never restores an
+ephemeral ownership or finalize authority from disk.
 
 ## Required startup sequence
 
@@ -132,10 +156,10 @@ generation pair remain exact across both scans, gap expansion, and all point
 reads in one reconciliation;
 they are intentionally reacquired after process restart rather than persisted
 as timeless authority. Exact final-signed fee quotes are wired and persisted;
-the immutable `hns-script` 0.2 source has canonical policy-size algebra, but its
-wallet integration and explicit qualification gate remain incomplete and false. The
-complete multi-chain product supervisor and current qualification evidence are
-not integrated, so HNS value operations remain release-gated.
+canonical fee-policy integration is implemented in source, but its explicit
+qualification gate remains false. The complete multi-chain product supervisor
+and current qualification evidence are not integrated, so HNS value operations
+remain release-gated.
 
 No Ethereum synchronization, history, or recovery checkpoint exists to resume
 in this revision. Ethereum account and receive-target derivation is offline;

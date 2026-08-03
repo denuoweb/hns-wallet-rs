@@ -28,7 +28,13 @@ node projection and exact owner output, and binds current control only to a
 persisted `HnsName` derivation. TRANSFER owners must also bind the canonical
 transfer height to the active-chain owner-transaction inclusion height.
 Persisted name status is never action authority: value workflows must reacquire
-an ephemeral exact-snapshot proof, and name transfer/finalize remain unavailable.
+an ephemeral exact-snapshot proof. The wallet source implements release-gated,
+wallet-owned P2PKH TRANSFER and old-owner direct FINALIZE workflows with
+canonical index-zero construction, typed name/fee reservations, single-use
+approval, ordered signing, exact final-byte fee quoting, durable rebroadcast,
+maturity tracking, and reorg recovery. They remain unavailable through the
+product while the HNS value/fee gates are false and provider integration and
+qualification are incomplete.
 
 ## Crates
 

@@ -33,10 +33,11 @@ runtime now persists split proof/current canonical summaries, exact current
 resource bytes, and account-bound ownership/transfer direction after fresh
 reconciliation; legacy rows stay explicitly watch-only. Provider dispatch for
 these methods is not yet product-integrated. `hns_transferName` and
-`hns_finalizeName` must remain unavailable until transaction workflows and
-trusted approvals consume a freshly reacquired exact-snapshot ownership
-authority. Persisted name status or node projections alone never authorize an
-action.
+`hns_finalizeName` remain unavailable even though typed wallet-owned P2PKH
+TRANSFER/direct-FINALIZE workflows now exist in the wallet source. Provider
+dispatch, trusted product approval UI, adapter qualification, and both HNS
+value gates are incomplete. Persisted status, incoming-recipient
+classification, or a node projection never authorize signing.
 
 External assets:
 

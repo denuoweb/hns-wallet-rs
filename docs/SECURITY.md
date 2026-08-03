@@ -1,9 +1,10 @@
 # Security model
 
 Status: production-hardening source implemented; executable value paths remain
-release-gated. HNS send/settlement and Ethereum synchronization/history/send/
-settlement are disabled on every network. Chain ID 1 and all other mainnet
-marketplace settlement are independently disabled.
+release-gated. HNS send, wallet-owned name TRANSFER/FINALIZE, HNS settlement,
+and Ethereum synchronization/history/send/settlement are disabled on every
+network. Chain ID 1 and all other mainnet marketplace settlement are
+independently disabled.
 
 ## Trust boundaries
 
@@ -99,10 +100,27 @@ without consumption before signing. Only after the exact final signed bytes
 receive a bound fee quote does one immediate transaction re-authenticate and
 consume the unchanged approval, persist those bytes and quote, and activate the
 matching reservations. Submission re-quotes the persisted bytes and records
-`RequiresRebroadcast` before the node call. The released canonical
-sigop-adjusted fee algebra is still unavailable, so its explicit false gate
-prevents this source wiring from authorizing value and the wallet does not copy
-the node's policy formula.
+`RequiresRebroadcast` before the node call. Canonical sigop-adjusted fee
+algebra and exact input evidence are integrated in source, but their explicit
+qualification gate remains false and prevents this wiring from authorizing
+value.
+
+Name actions bind the trusted approval to the exact encrypted prepared plan,
+including its recipient, fee maximum, canonical source, and unsigned
+transaction. The wallet deterministically signs and validates that unchanged
+plan, obtains the bound final-byte fee quote, and consumes the unchanged
+approval while persisting the signed bytes. It reacquires current name
+authority and the versioned node action context before authorization and
+initial broadcast, rejects any bound owner mempool spender, then reacquires
+against the final fee quote's exact snapshot before persistence or submission.
+An advanced snapshot is accepted only if the stable owner source and every
+transaction-defining term remain unchanged; otherwise the workflow durably
+requires fresh approval. The wallet persists rebroadcast state before the node
+call.
+TRANSFER preserves value and owner address while covenant-committing the
+recipient. Direct FINALIZE takes its destination only from that authenticated
+TRANSFER covenant and is signed by the outgoing owner's `HnsName` key;
+incoming-recipient classification never authorizes signing.
 
 ## Provider defenses
 
@@ -174,6 +192,10 @@ unevaluated rather than incorrectly asserting that a name is not wallet-owned.
 Persisted ownership is display/recovery cache state, never action authority. The
 non-serializable authority is freshly reacquired at one snapshot and is denied
 for expired, revoked, unregistered, or pending-transfer state.
+TRANSFER and FINALIZE additionally require the exact action/mempool snapshot,
+network and genesis identity, current owner inclusion, candidate height,
+ordered eligibility reasons, lockup, renewal window/hash, and absence of an
+owner spender. Persisted action context is audit/recovery evidence only.
 
 Ethereum has no embedded Helios proof producer in this revision. Its exact
 synchronization, value-runtime, settlement-runtime, and mainnet gates are
@@ -190,8 +212,9 @@ settlement.
 Current cross-chain code is not qualified for live value. The concrete HNS node
 adapter and canonical HNS name-state/resource ownership source are present, but
 their consolidated qualification, a published canonical HNS settlement
-profile, wallet-integrated and qualified HSD fee algebra, Bitcoin supervisor
-qualification, embedded Helios proof construction/persistence, name-role scan
+profile, consolidated qualification of the integrated HSD fee algebra and
+name-action context, Bitcoin supervisor qualification, embedded Helios proof
+construction/persistence, name-role scan
 qualification, restart/reorg
 demonstrations, real-chain tests, resource benchmarks, and independent review
 remain blockers.

@@ -28,13 +28,14 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     BlockHashEvidence, ChainTip, ConfirmedWalletPage, ConfirmedWalletPageRequest, HistoryEntry,
-    HnsBackend, HnsFeeRateSource, HnsOutpoint, HnsTransactionFeeQuote, HnsWalletError,
-    IndexedWalletCoin, MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest,
-    NameEvidence, NameProofResponse, OutpointSpendEntry, OutpointSpendEvidence, SnapshotBinding,
-    SpendingTransactionEvidence, TransactionEvidence, TransactionInclusion, TransactionStatus,
-    WalletAddressKey, WalletCoin, MAX_HISTORY_RESULTS, MAX_MEMPOOL_SCAN_RESULTS,
-    MAX_OUTPOINT_SPEND_BATCH, MAX_RESTORE_SCRIPTS_PER_QUERY, MAX_SCAN_CURSOR_BYTES,
-    MAX_SCAN_PAGE_RESULTS,
+    HnsBackend, HnsFeeRateSource, HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsOutpoint,
+    HnsTransactionFeeQuote, HnsWalletError, IndexedWalletCoin, MempoolSnapshotBinding,
+    MempoolWalletPage, MempoolWalletPageRequest, NameActionContextEvidence,
+    NameActionIneligibility, NameEvidence, NameProofResponse, OutpointSpendEntry,
+    OutpointSpendEvidence, SnapshotBinding, SpendingTransactionEvidence, TransactionEvidence,
+    TransactionInclusion, TransactionStatus, WalletAddressKey, WalletCoin, MAX_HISTORY_RESULTS,
+    MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH, MAX_RESTORE_SCRIPTS_PER_QUERY,
+    MAX_SCAN_CURSOR_BYTES, MAX_SCAN_PAGE_RESULTS,
 };
 
 const WALLET_RPC_API_VERSION: u16 = 1;
@@ -276,6 +277,12 @@ impl HnsNodeRpcBackend {
         validate_rpc_error(response.status, &error)?;
         if error.code == "stale_snapshot" {
             return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        if error.code == "chain_uninitialized" {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        if error.code == "name_state_missing" {
+            return Err(HnsWalletError::NameNotOwned);
         }
         if error.code == "invalid_cursor" {
             return Err(HnsWalletError::StaleNodeSnapshot);
@@ -658,7 +665,8 @@ fn error_code_message(code: &str) -> &'static str {
         "unknown_contract" | "invalid_contract" | "contract_registry_full" => {
             "node local tracked-contract profile is unavailable"
         }
-        "name_has_no_owner" => "node name evidence has no owner",
+        "name_has_no_owner" | "name_state_missing" => "node name evidence has no owner",
+        "chain_uninitialized" => "node active chain is not initialized",
         "transaction_orphan" => "node rejected an orphan transaction",
         "transaction_rejected" => "node rejected the transaction",
         "invalid_fee_quote_transaction" => "node rejected the fee quote transaction",
@@ -688,6 +696,8 @@ fn validate_rpc_error(status: u16, error: &RpcWireError) -> Result<(), HnsWallet
         "payload_pruned" => (410, false),
         "unknown_contract" => (404, false),
         "name_has_no_owner" => (404, false),
+        "name_state_missing" => (404, false),
+        "chain_uninitialized" => (409, true),
         "invalid_contract" => (409, false),
         "stale_snapshot" => (409, true),
         "transaction_orphan" => (409, true),
@@ -763,12 +773,18 @@ fn validate_rpc_error(status: u16, error: &RpcWireError) -> Result<(), HnsWallet
         "payload_pruned" => error.message == "the confirmed transaction payload has been pruned",
         "unknown_contract" => error.message == "the tracked-contract registration is unknown",
         "name_has_no_owner" => error.message == "the current name state has no owner",
+        "name_state_missing" => {
+            error.message == "the requested name has no current active-chain state"
+        }
+        "chain_uninitialized" => {
+            error.message == "name-action context requires an initialized active chain"
+        }
         "invalid_contract" => {
             error.message == "the tracked-contract registration is invalid or conflicts"
         }
         "stale_snapshot" => {
             error.message
-                == "the bound chain or mempool generation changed; restart this reconciliation"
+                == "the bound lifecycle, chain, or mempool generation changed; restart this reconciliation"
         }
         "transaction_orphan" => {
             error.message == "the transaction has unresolved inputs and was not relayed as accepted"
@@ -1039,6 +1055,13 @@ struct WireNameOwner {
     inclusion: WireInclusion,
 }
 
+struct ValidatedWireNameOwner {
+    outpoint: HnsOutpoint,
+    raw_transaction: Vec<u8>,
+    output: Output,
+    inclusion: TransactionInclusion,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireNameEvidence {
@@ -1052,6 +1075,69 @@ struct WireNameEvidence {
     current_owner: Option<WireNameOwner>,
     proof_owner: Option<WireNameOwner>,
     data_semantics: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNameActionChainIdentity {
+    network: HnsNetwork,
+    network_id: u8,
+    genesis_hash: String,
+    consensus_profile: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNameActionMempool {
+    instance_nonce: String,
+    generation: u64,
+    owner_spender_txid: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNameActionTransfer {
+    lockup_blocks: u32,
+    current_transfer_height: Option<u32>,
+    finalize_maturity_height: Option<u32>,
+    finalize_eligible_at_candidate: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNameActionRenewal {
+    maturity_blocks: u32,
+    period_blocks: u32,
+    hsd_selected_height: u32,
+    hsd_selected_hash: String,
+    valid_at_candidate: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNameActionEligibility {
+    eligible: bool,
+    reasons: Vec<NameActionIneligibility>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNameActionContext {
+    context_version: u8,
+    action: HnsNameAction,
+    chain_identity: WireNameActionChainIdentity,
+    chain_epoch: u64,
+    tip: WireTip,
+    candidate_inclusion_height: u32,
+    mempool: WireNameActionMempool,
+    name_hash: String,
+    current_state_hex: String,
+    current_state: WireNameState,
+    owner: WireNameOwner,
+    lifecycle: HnsNameLifecycle,
+    transfer: WireNameActionTransfer,
+    renewal: WireNameActionRenewal,
+    eligibility: WireNameActionEligibility,
 }
 
 struct ScriptQuery {
@@ -1836,6 +1922,218 @@ impl HnsBackend for HnsNodeRpcBackend {
         require_binding(response.chain_epoch, response.tip.clone(), binding)?;
         validated_name_response(self, response, name_hash, binding)
     }
+
+    fn get_name_action_context(
+        &self,
+        action: HnsNameAction,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+        expected_mempool: MempoolSnapshotBinding,
+    ) -> Result<NameActionContextEvidence, HnsWalletError> {
+        let response: WireNameActionContext = self.rpc(serde_json::json!({
+            "method": "name_action_context",
+            "params": {
+                "action": action,
+                "name_hash": hex::encode(name_hash),
+                "expected_chain_epoch": binding.chain_epoch,
+                "expected_mempool": expected_mempool_json(expected_mempool),
+            },
+        }))?;
+        validated_name_action_response(self, response, action, name_hash, binding, expected_mempool)
+    }
+}
+
+fn validated_name_action_response(
+    backend: &HnsNodeRpcBackend,
+    response: WireNameActionContext,
+    expected_action: HnsNameAction,
+    expected_name_hash: [u8; 32],
+    binding: SnapshotBinding,
+    expected_mempool: MempoolSnapshotBinding,
+) -> Result<NameActionContextEvidence, HnsWalletError> {
+    require_binding(response.chain_epoch, Some(response.tip.clone()), binding)?;
+    let candidate_height = binding
+        .tip
+        .height
+        .checked_add(1)
+        .ok_or_else(protocol_error)?;
+    if response.action != expected_action
+        || decode_hex_32(&response.name_hash)? != expected_name_hash
+        || u64::from(response.candidate_inclusion_height) != candidate_height
+    {
+        return Err(protocol_error());
+    }
+
+    let mempool = MempoolSnapshotBinding {
+        instance_nonce: decode_hex_32(&response.mempool.instance_nonce)?,
+        generation: response.mempool.generation,
+    };
+    if mempool != expected_mempool {
+        return Err(HnsWalletError::StaleNodeSnapshot);
+    }
+    let mempool_spender = response
+        .mempool
+        .owner_spender_txid
+        .as_deref()
+        .map(decode_hex_32)
+        .transpose()?
+        .map(TransactionHash::new);
+
+    let (current_state, canonical_state) = decode_projected_name_state(
+        &response.current_state_hex,
+        &response.current_state,
+        expected_name_hash,
+    )?;
+    let owner = validate_name_owner(
+        backend,
+        response.owner,
+        &response.current_state,
+        &canonical_state,
+        binding,
+    )?;
+
+    let transfer_height =
+        (canonical_state.transfer.get() != 0).then_some(canonical_state.transfer.get());
+    let expected_finalize_height = transfer_height
+        .map(|height| {
+            height
+                .checked_add(response.transfer.lockup_blocks)
+                .ok_or_else(protocol_error)
+        })
+        .transpose()?;
+    let expected_finalize_eligible = expected_finalize_height
+        .is_some_and(|height| response.candidate_inclusion_height >= height);
+    if response.transfer.lockup_blocks == 0
+        || response.transfer.current_transfer_height != transfer_height
+        || response.transfer.finalize_maturity_height != expected_finalize_height
+        || response.transfer.finalize_eligible_at_candidate != expected_finalize_eligible
+    {
+        return Err(protocol_error());
+    }
+
+    let renewal = &response.renewal;
+    if renewal.maturity_blocks == 0 || renewal.period_blocks < renewal.maturity_blocks {
+        return Err(protocol_error());
+    }
+    let selected_height = response
+        .tip
+        .height
+        .saturating_sub(renewal.maturity_blocks.saturating_mul(2));
+    let renewal_valid = response.candidate_inclusion_height < renewal.maturity_blocks
+        || (renewal.hsd_selected_height
+            <= response.candidate_inclusion_height - renewal.maturity_blocks
+            && renewal.hsd_selected_height
+                >= response
+                    .candidate_inclusion_height
+                    .saturating_sub(renewal.period_blocks));
+    let renewal_hash = decode_hex_32(&renewal.hsd_selected_hash)?;
+    if renewal.hsd_selected_height != selected_height || renewal.valid_at_candidate != renewal_valid
+    {
+        return Err(protocol_error());
+    }
+
+    let reasons = &response.eligibility.reasons;
+    if reasons.len() > 9
+        || !reasons
+            .windows(2)
+            .all(|pair| pair[0].rank() < pair[1].rank())
+        || response.eligibility.eligible != reasons.is_empty()
+    {
+        return Err(protocol_error());
+    }
+    let has = |reason| reasons.contains(&reason);
+    let expired_at_candidate = has(NameActionIneligibility::NameExpiredAtCandidate);
+    let mut expected_reasons = Vec::new();
+    if !canonical_state.registered {
+        expected_reasons.push(NameActionIneligibility::NameNotRegistered);
+    }
+    if expired_at_candidate {
+        expected_reasons.push(NameActionIneligibility::NameExpiredAtCandidate);
+    }
+    if response.lifecycle != HnsNameLifecycle::Closed {
+        expected_reasons.push(NameActionIneligibility::LifecycleNotClosed);
+    }
+    match expected_action {
+        HnsNameAction::Transfer => {
+            if transfer_height.is_some() {
+                expected_reasons.push(NameActionIneligibility::TransferAlreadyPending);
+            }
+            if !matches!(
+                owner.output.covenant.kind,
+                CovenantKind::Register
+                    | CovenantKind::Update
+                    | CovenantKind::Renew
+                    | CovenantKind::Finalize
+            ) {
+                expected_reasons.push(NameActionIneligibility::OwnerCovenantInvalidForAction);
+            }
+        }
+        HnsNameAction::Finalize => {
+            if transfer_height.is_none() {
+                expected_reasons.push(NameActionIneligibility::TransferNotPending);
+            } else if !expected_finalize_eligible {
+                expected_reasons.push(NameActionIneligibility::TransferNotMature);
+            }
+            if owner.output.covenant.kind != CovenantKind::Transfer {
+                expected_reasons.push(NameActionIneligibility::OwnerCovenantInvalidForAction);
+            }
+            if !renewal_valid {
+                expected_reasons.push(NameActionIneligibility::RenewalCommitmentInvalid);
+            }
+        }
+    }
+    if mempool_spender.is_some() {
+        expected_reasons.push(NameActionIneligibility::OwnerSpentInMempool);
+    }
+    if reasons != &expected_reasons {
+        return Err(protocol_error());
+    }
+
+    let genesis_hash = decode_hex_32(&response.chain_identity.genesis_hash)?;
+    let common = NameActionContextEvidence {
+        binding,
+        mempool,
+        network: response.chain_identity.network,
+        network_id: response.chain_identity.network_id,
+        genesis_hash,
+        context_version: u32::from(response.context_version),
+        consensus_profile: response.chain_identity.consensus_profile,
+        action: response.action,
+        name_hash: expected_name_hash,
+        current_state,
+        owner_outpoint: owner.outpoint,
+        owner_transaction: owner.raw_transaction,
+        owner_inclusion: owner.inclusion,
+        candidate_inclusion_height: candidate_height,
+        lifecycle: response.lifecycle,
+        action_eligible: response.eligibility.eligible,
+        ineligibility_reasons: response.eligibility.reasons,
+        transfer_height: None,
+        transfer_lockup: None,
+        finalize_eligible_height: None,
+        finalize_mature: None,
+        renewal_maturity: None,
+        renewal_period: None,
+        renewal_block_height: None,
+        renewal_block_hash: None,
+        renewal_valid_at_candidate: None,
+        mempool_spender,
+    };
+    Ok(match expected_action {
+        HnsNameAction::Transfer => common,
+        HnsNameAction::Finalize => NameActionContextEvidence {
+            transfer_height: response.transfer.current_transfer_height.map(u64::from),
+            transfer_lockup: Some(response.transfer.lockup_blocks),
+            finalize_eligible_height: response.transfer.finalize_maturity_height.map(u64::from),
+            finalize_mature: Some(response.transfer.finalize_eligible_at_candidate),
+            renewal_maturity: Some(renewal.maturity_blocks),
+            renewal_period: Some(renewal.period_blocks),
+            renewal_block_height: Some(u64::from(renewal.hsd_selected_height)),
+            renewal_block_hash: Some(renewal_hash),
+            renewal_valid_at_candidate: Some(renewal_valid),
+            ..common
+        },
+    })
 }
 
 fn validated_name_response(
@@ -1867,7 +2165,7 @@ fn validated_name_response(
     let current_resource = canonical_current
         .as_ref()
         .map(|(_, state)| state.resource_data.clone());
-    let (current_owner_outpoint, current_owner_transaction) = response
+    let (current_owner_outpoint, current_owner_transaction, current_owner_inclusion) = response
         .current_owner
         .map(|owner| {
             validate_name_owner(
@@ -1879,8 +2177,14 @@ fn validated_name_response(
             )
         })
         .transpose()?
-        .map_or((None, None), |(outpoint, raw)| (Some(outpoint), Some(raw)));
-    let (proof_owner_outpoint, proof_owner_transaction) = response
+        .map_or((None, None, None), |owner| {
+            (
+                Some(owner.outpoint),
+                Some(owner.raw_transaction),
+                Some(owner.inclusion),
+            )
+        });
+    let (proof_owner_outpoint, proof_owner_transaction, proof_owner_inclusion) = response
         .proof_owner
         .map(|owner| {
             validate_name_owner(
@@ -1892,7 +2196,13 @@ fn validated_name_response(
             )
         })
         .transpose()?
-        .map_or((None, None), |(outpoint, raw)| (Some(outpoint), Some(raw)));
+        .map_or((None, None, None), |owner| {
+            (
+                Some(owner.outpoint),
+                Some(owner.raw_transaction),
+                Some(owner.inclusion),
+            )
+        });
 
     let current_state = canonical_current.map(|(raw, _)| raw);
     let proof_state = canonical_proof.map(|(raw, _)| raw);
@@ -1922,9 +2232,11 @@ fn validated_name_response(
         proof_state,
         proof_owner_outpoint,
         proof_owner_transaction,
+        proof_owner_inclusion,
         current_state,
         current_owner_outpoint,
         current_owner_transaction,
+        current_owner_inclusion,
         untrusted_current_raw_resource: current_resource,
     })
 }
@@ -1969,7 +2281,7 @@ fn validate_name_owner(
     expected_state: &WireNameState,
     canonical_state: &NameState,
     binding: SnapshotBinding,
-) -> Result<(HnsOutpoint, Vec<u8>), HnsWalletError> {
+) -> Result<ValidatedWireNameOwner, HnsWalletError> {
     if &owner.name_state != expected_state || owner.owner != owner.name_state.owner {
         return Err(protocol_error());
     }
@@ -1996,7 +2308,12 @@ fn validate_name_owner(
     }
     validate_name_owner_inclusion(canonical_state, output.covenant.kind, inclusion.height)?;
     backend.require_active_block_hash(inclusion.height, inclusion.block_hash, binding)?;
-    Ok((outpoint, raw))
+    Ok(ValidatedWireNameOwner {
+        outpoint,
+        raw_transaction: raw,
+        output,
+        inclusion,
+    })
 }
 
 fn validate_name_owner_inclusion(
@@ -2101,5 +2418,100 @@ mod tests {
         state.transfer = Height::new(0);
         assert!(validate_name_owner_inclusion(&state, CovenantKind::Finalize, 42).is_ok());
         assert!(validate_name_owner_inclusion(&state, CovenantKind::Transfer, 0).is_err());
+    }
+
+    #[test]
+    fn canonical_hns_v3_name_action_wire_schema_is_closed() {
+        let projected_state = serde_json::json!({
+            "name_hash": hex::encode([1; 32]),
+            "name_hex": hex::encode(b"alpha"),
+            "height": 100,
+            "renewal": 120,
+            "owner": {"txid": hex::encode([2; 32]), "index": 0},
+            "value": 50_000,
+            "highest": 60_000,
+            "data_hex": "",
+            "transfer": 400,
+            "revoked": 0,
+            "claimed": 0,
+            "renewals": 1,
+            "registered": true,
+            "expired": false,
+            "weak": false
+        });
+        let response = serde_json::json!({
+            "context_version": 1,
+            "action": "finalize",
+            "chain_identity": {
+                "network": "regtest",
+                "network_id": 2,
+                "genesis_hash": hex::encode([3; 32]),
+                "consensus_profile": "hns-consensus/name-policy-v1"
+            },
+            "chain_epoch": 9,
+            "tip": {
+                "hash": hex::encode([4; 32]),
+                "height": 409,
+                "tree_root": hex::encode([5; 32])
+            },
+            "candidate_inclusion_height": 410,
+            "mempool": {
+                "instance_nonce": hex::encode([6; 32]),
+                "generation": 10,
+                "owner_spender_txid": null
+            },
+            "name_hash": hex::encode([1; 32]),
+            "current_state_hex": "00",
+            "current_state": projected_state.clone(),
+            "owner": {
+                "name_state": projected_state,
+                "owner": {"txid": hex::encode([2; 32]), "index": 0},
+                "transaction_hex": "00",
+                "owner_output": {
+                    "value": 50_000,
+                    "address": {"version": 0, "hash": hex::encode([7; 20])},
+                    "covenant": {"kind": 9, "items": []}
+                },
+                "inclusion": {
+                    "block_hash": hex::encode([8; 32]),
+                    "height": 400,
+                    "transaction_index": 1,
+                    "confirmations": 10
+                }
+            },
+            "lifecycle": "closed",
+            "transfer": {
+                "lockup_blocks": 11,
+                "current_transfer_height": 400,
+                "finalize_maturity_height": 411,
+                "finalize_eligible_at_candidate": false
+            },
+            "renewal": {
+                "maturity_blocks": 50,
+                "period_blocks": 2500,
+                "hsd_selected_height": 309,
+                "hsd_selected_hash": hex::encode([9; 32]),
+                "valid_at_candidate": true
+            },
+            "eligibility": {
+                "eligible": false,
+                "reasons": ["transfer_not_mature"]
+            }
+        });
+        let parsed: WireNameActionContext =
+            serde_json::from_value(response.clone()).expect("closed response schema");
+        assert_eq!(parsed.action, HnsNameAction::Finalize);
+        assert_eq!(parsed.lifecycle, HnsNameLifecycle::Closed);
+        assert_eq!(
+            parsed.eligibility.reasons,
+            vec![NameActionIneligibility::TransferNotMature]
+        );
+
+        let mut unknown_reason = response.clone();
+        unknown_reason["eligibility"]["reasons"][0] = serde_json::json!("unknown_reason");
+        assert!(serde_json::from_value::<WireNameActionContext>(unknown_reason).is_err());
+        let mut extra_field = response;
+        extra_field["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WireNameActionContext>(extra_field).is_err());
     }
 }

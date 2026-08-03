@@ -1,9 +1,17 @@
 #![doc = "Handshake wallet key roles, restoration, UTXO selection, and name workflows."]
 #![forbid(unsafe_code)]
 
+mod name_workflow;
 mod node_rpc;
 
+pub use name_workflow::{
+    AuthorizedNameOperation, HnsNameAction, HnsNameLifecycle, NameActionContextEvidence,
+    NameActionIneligibility, NameOperation, NameOperationState, PrepareNameFinalize,
+    PrepareNameTransfer, PreparedNameOperation, VerifiedOutgoingNameTransfer,
+};
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
+
+use name_workflow::{HnsInputReservationKind, HnsNameWorkflow};
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -391,6 +399,16 @@ pub trait HnsBackend {
         name_hash: [u8; 32],
         binding: SnapshotBinding,
     ) -> Result<NameEvidence, HnsWalletError>;
+    /// Returns candidate-height TRANSFER/FINALIZE policy, exact owner, active
+    /// chain, and owner-spender evidence from one authenticated chain/mempool
+    /// snapshot. The wallet independently validates every projection.
+    fn get_name_action_context(
+        &self,
+        action: HnsNameAction,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+        expected_mempool: MempoolSnapshotBinding,
+    ) -> Result<NameActionContextEvidence, HnsWalletError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -581,12 +599,16 @@ pub struct NameEvidence {
     /// Node projection that the wallet independently binds to `proof_state`.
     pub proof_owner_outpoint: Option<HnsOutpoint>,
     pub proof_owner_transaction: Option<Vec<u8>>,
+    #[serde(default)]
+    pub proof_owner_inclusion: Option<TransactionInclusion>,
     /// The node's current canonical view at `binding`. It may differ from the
     /// most recently committed name-tree proof view.
     pub current_state: Option<Vec<u8>>,
     /// Node projection that the wallet independently binds to `current_state`.
     pub current_owner_outpoint: Option<HnsOutpoint>,
     pub current_owner_transaction: Option<Vec<u8>>,
+    #[serde(default)]
+    pub current_owner_inclusion: Option<TransactionInclusion>,
     /// Legacy field name retained at the RPC/storage boundary. The wallet
     /// accepts these bytes only when they exactly equal canonical
     /// `NameState::resource_data` for `current_state`.
@@ -669,12 +691,14 @@ pub struct KnownName {
 /// that its exact snapshot is still current before preparing an action.
 pub struct VerifiedNameOwnership {
     binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
     name: Vec<u8>,
     name_hash: [u8; 32],
     current_state: Vec<u8>,
     owner_outpoint: HnsOutpoint,
     owner_transaction: Vec<u8>,
     owner_output: Output,
+    owner_inclusion: TransactionInclusion,
     derivation: DerivationReference,
 }
 
@@ -683,6 +707,7 @@ impl fmt::Debug for VerifiedNameOwnership {
         formatter
             .debug_struct("VerifiedNameOwnership")
             .field("binding", &self.binding)
+            .field("mempool", &self.mempool)
             .field("name", &String::from_utf8_lossy(&self.name))
             .field("name_hash", &hex::encode(self.name_hash))
             .field("owner_outpoint", &self.owner_outpoint)
@@ -694,6 +719,10 @@ impl fmt::Debug for VerifiedNameOwnership {
 impl VerifiedNameOwnership {
     pub const fn binding(&self) -> SnapshotBinding {
         self.binding
+    }
+
+    pub const fn mempool(&self) -> MempoolSnapshotBinding {
+        self.mempool
     }
 
     pub fn name(&self) -> &[u8] {
@@ -720,6 +749,10 @@ impl VerifiedNameOwnership {
         &self.owner_output
     }
 
+    pub const fn owner_inclusion(&self) -> TransactionInclusion {
+        self.owner_inclusion
+    }
+
     pub const fn derivation(&self) -> DerivationReference {
         self.derivation
     }
@@ -740,6 +773,7 @@ struct ValidatedNameOwner {
     outpoint: HnsOutpoint,
     raw_transaction: Vec<u8>,
     output: Output,
+    inclusion: TransactionInclusion,
 }
 
 pub fn import_known_name<B: HnsBackend>(
@@ -797,6 +831,7 @@ fn validated_name_evidence<B: HnsBackend>(
         evidence.proof_state.as_deref(),
         evidence.proof_owner_outpoint,
         evidence.proof_owner_transaction.as_deref(),
+        evidence.proof_owner_inclusion,
     )?;
     let canonical_current = validate_canonical_name_state(
         name,
@@ -804,6 +839,7 @@ fn validated_name_evidence<B: HnsBackend>(
         evidence.current_state.as_deref(),
         evidence.current_owner_outpoint,
         evidence.current_owner_transaction.as_deref(),
+        evidence.current_owner_inclusion,
     )?;
     let (current_raw_resource, resource_status) = bind_current_name_resource(
         canonical_current.as_ref(),
@@ -856,9 +892,10 @@ fn validate_canonical_name_state(
     raw_state: Option<&[u8]>,
     owner: Option<HnsOutpoint>,
     raw: Option<&[u8]>,
+    inclusion: Option<TransactionInclusion>,
 ) -> Result<Option<ValidatedCanonicalNameState>, HnsWalletError> {
     let Some(raw_state) = raw_state else {
-        if owner.is_some() || raw.is_some() {
+        if owner.is_some() || raw.is_some() || inclusion.is_some() {
             return Err(HnsWalletError::InvalidEvidence);
         }
         return Ok(None);
@@ -875,9 +912,11 @@ fn validate_canonical_name_state(
     if canonical_owner != owner {
         return Err(HnsWalletError::InvalidEvidence);
     }
-    let validated_owner = match (canonical_owner, raw) {
-        (None, None) => None,
-        (Some(owner), Some(raw)) => Some(validate_name_owner_transaction(&state, owner, raw)?),
+    let validated_owner = match (canonical_owner, raw, inclusion) {
+        (None, None, None) => None,
+        (Some(owner), Some(raw), Some(inclusion)) => Some(validate_name_owner_transaction(
+            &state, owner, raw, inclusion,
+        )?),
         _ => return Err(HnsWalletError::InvalidEvidence),
     };
     let summary = CanonicalNameStateSummary {
@@ -905,6 +944,7 @@ fn validate_name_owner_transaction(
     state: &NameState,
     owner: HnsOutpoint,
     raw: &[u8],
+    inclusion: TransactionInclusion,
 ) -> Result<ValidatedNameOwner, HnsWalletError> {
     let transaction = decode_transaction_for_id(raw, owner.transaction)?;
     let output = transaction
@@ -922,7 +962,10 @@ fn validate_name_owner_transaction(
         CovenantKind::Transfer => {
             let transfer = TransferCovenant::try_from(&output.covenant)
                 .map_err(|_| HnsWalletError::InvalidEvidence)?;
-            if state.transfer.get() == 0 || transfer.start_height != state.height {
+            if state.transfer.get() == 0
+                || u64::from(state.transfer.get()) != inclusion.height
+                || transfer.start_height != state.height
+            {
                 return Err(HnsWalletError::InvalidEvidence);
             }
         }
@@ -946,6 +989,7 @@ fn validate_name_owner_transaction(
         outpoint: owner,
         raw_transaction: raw.to_vec(),
         output,
+        inclusion,
     })
 }
 
@@ -1027,57 +1071,6 @@ fn classify_name_ownership(
             },
         }),
         (None, None) => Ok(NameOwnershipStatus::NotWalletOwned),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NameOperationState {
-    OwnershipVerified,
-    Prepared,
-    Broadcast,
-    TransferLocked,
-    FinalizeEligible,
-    Finalized,
-    Reorged,
-    Failed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NameOperation {
-    pub workflow_id: WorkflowId,
-    pub revision: u64,
-    pub name_hash: ObjectHash,
-    pub state: NameOperationState,
-    pub transaction: Option<TransactionHash>,
-    pub transfer_height: Option<u64>,
-    pub last_verified_height: u64,
-}
-
-impl NameOperation {
-    pub fn persist(
-        &mut self,
-        store: &mut WalletStore,
-        kind: WorkflowKind,
-        irreversible_broadcast_prepared: bool,
-        now_unix: u64,
-    ) -> Result<(), HnsWalletError> {
-        if !matches!(
-            kind,
-            WorkflowKind::NameTransfer | WorkflowKind::NameFinalize
-        ) {
-            return Err(HnsWalletError::InvalidWorkflow);
-        }
-        let next = store.save_workflow(
-            self.workflow_id,
-            kind,
-            self.revision,
-            self,
-            irreversible_broadcast_prepared,
-            now_unix,
-        )?;
-        self.revision = next;
-        Ok(())
     }
 }
 
@@ -1457,6 +1450,8 @@ struct HnsInputReservation {
     outpoint: HnsOutpoint,
     workflow_id: WorkflowId,
     expires_at_unix: Option<u64>,
+    #[serde(default)]
+    kind: HnsInputReservationKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1864,6 +1859,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     ) -> Result<VerifiedNameOwnership, HnsWalletError> {
         let cache = self.cache_read()?;
         let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let mempool = cache
+            .mempool_binding
+            .ok_or(HnsWalletError::StaleNodeSnapshot)?;
         let config = cache.account.config.clone();
         drop(cache);
         let wallet_name_addresses = {
@@ -1872,7 +1870,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         };
         let validated =
             validated_name_evidence(&self.backend, name, binding, Some(&wallet_name_addresses))?;
-        if self.cache_read()?.binding != Some(binding) {
+        let cache = self.cache_read()?;
+        if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
         let current = validated.current.ok_or(HnsWalletError::NameNotOwned)?;
@@ -1890,6 +1889,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let owner = current.owner.ok_or(HnsWalletError::NameNotOwned)?;
         Ok(VerifiedNameOwnership {
             binding,
+            mempool,
             name: validated.known_name.name,
             name_hash: validated.known_name.name_hash,
             current_state: validated
@@ -1899,6 +1899,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             owner_outpoint: owner.outpoint,
             owner_transaction: owner.raw_transaction,
             owner_output: owner.output,
+            owner_inclusion: owner.inclusion,
             derivation,
         })
     }
@@ -2484,7 +2485,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let revalidated_names = self.revalidate_names(&mut store, binding, now)?;
         persist_reconciled_entities(&mut store, &account.config, &coins, &transactions, now)?;
         let mut pending_user_actions =
-            self.reconcile_send_workflows(&mut store, binding, mempool_binding, now)?;
+            self.reconcile_name_workflows(&mut store, binding, mempool_binding, now)?;
+        pending_user_actions.extend(self.reconcile_send_workflows(
+            &mut store,
+            binding,
+            mempool_binding,
+            now,
+        )?);
         pending_user_actions.extend(self.reconcile_settlement_workflows(
             &mut store,
             binding,
@@ -3350,9 +3357,84 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .filter(|coin| is_ordinary_hns_derivation(coin.derivation))
             .map(|coin| coin.coin.outpoint)
             .collect();
+        let mut name_workflows = BTreeMap::new();
+        for kind in [WorkflowKind::NameTransfer, WorkflowKind::NameFinalize] {
+            for workflow in
+                store.list_workflows_complete::<HnsNameWorkflow>(kind, MAX_HISTORY_RESULTS)?
+            {
+                if workflow.state.plan.wallet_id != config.wallet_id
+                    || workflow.state.plan.account_id != config.account_id
+                {
+                    continue;
+                }
+                if workflow.state.plan.workflow_id != workflow.id
+                    || workflow.state.plan.action.workflow_kind() != kind
+                {
+                    return Err(HnsWalletError::InvalidWorkflow);
+                }
+                let mut expected_reservations = BTreeMap::new();
+                expected_reservations.insert(
+                    workflow.state.plan.source.owner_outpoint,
+                    HnsInputReservationKind::Name {
+                        name_hash: workflow.state.plan.name_hash,
+                    },
+                );
+                for input in &workflow.state.plan.funding_inputs {
+                    if !is_ordinary_hns_spend_candidate(input)
+                        || expected_reservations
+                            .insert(input.coin.outpoint, HnsInputReservationKind::Ordinary)
+                            .is_some()
+                    {
+                        return Err(HnsWalletError::InvalidWorkflow);
+                    }
+                }
+                let terminal = matches!(
+                    workflow.state.stage,
+                    NameOperationState::Conflicted
+                        | NameOperationState::Expired
+                        | NameOperationState::Cancelled
+                );
+                if name_workflows
+                    .insert(workflow.id, (expected_reservations, terminal))
+                    .is_some()
+                {
+                    return Err(HnsWalletError::InvalidWorkflow);
+                }
+            }
+        }
         let reservations = account_input_reservations(store, config)?;
+        let mut observed_name_reservations: BTreeMap<WorkflowId, BTreeSet<HnsOutpoint>> =
+            BTreeMap::new();
         let mut deletes = Vec::new();
         for stored in reservations {
+            if let Some((expected_reservations, terminal)) =
+                name_workflows.get(&stored.value.workflow_id)
+            {
+                if expected_reservations.get(&stored.value.outpoint) != Some(&stored.value.kind) {
+                    return Err(HnsWalletError::InvalidWorkflow);
+                }
+                if !observed_name_reservations
+                    .entry(stored.value.workflow_id)
+                    .or_default()
+                    .insert(stored.value.outpoint)
+                {
+                    return Err(HnsWalletError::InvalidWorkflow);
+                }
+                if *terminal {
+                    deletes.push(EntityBatchDelete {
+                        id: stored.id,
+                        expected_revision: stored.revision,
+                    });
+                }
+                continue;
+            }
+            if matches!(stored.value.kind, HnsInputReservationKind::Name { .. }) {
+                deletes.push(EntityBatchDelete {
+                    id: stored.id,
+                    expected_revision: stored.revision,
+                });
+                continue;
+            }
             let expired = stored
                 .value
                 .expires_at_unix
@@ -3382,6 +3464,17 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     id: stored.id,
                     expected_revision: stored.revision,
                 });
+            }
+        }
+        for (workflow_id, (expected, releases_reservations)) in &name_workflows {
+            if !*releases_reservations {
+                let observed = observed_name_reservations.get(workflow_id);
+                if observed.is_none_or(|observed| {
+                    observed.len() != expected.len()
+                        || expected.keys().any(|outpoint| !observed.contains(outpoint))
+                }) {
+                    return Err(HnsWalletError::InvalidWorkflow);
+                }
             }
         }
         if !deletes.is_empty() {
@@ -4543,6 +4636,7 @@ fn reservation_saves(
             outpoint: input.coin.outpoint,
             workflow_id,
             expires_at_unix: Some(expires_at_unix),
+            kind: HnsInputReservationKind::Ordinary,
         };
         saves.push(EntityBatchSave {
             id: namespaced_outpoint_id(config, input.coin.outpoint).to_vec(),
@@ -4581,6 +4675,7 @@ fn validate_prepared_reservations(
         if !expected.contains(&stored.value.outpoint)
             || stored.id.as_slice() != expected_id.as_slice()
             || stored.value.expires_at_unix != Some(expires_at_unix)
+            || stored.value.kind != HnsInputReservationKind::Ordinary
         {
             return Err(HnsWalletError::InvalidWorkflow);
         }
@@ -6469,12 +6564,16 @@ pub enum HnsWalletError {
     InvalidPreparedArtifact,
     #[error("prepared transaction artifact has expired")]
     PreparedArtifactExpired,
+    #[error("a fresh trusted approval is required")]
+    ApprovalRequired,
     #[error("transaction signing failed")]
     Signing,
     #[error("history result exceeds the configured bound")]
     HistoryLimit,
     #[error("current name owner output is not controlled by this account")]
     NameNotOwned,
+    #[error("name transfer is not finalizable before candidate height {eligible_height}")]
+    NameFinalizeNotMature { eligible_height: u64 },
     #[error("wallet state encoding failed")]
     Encoding,
     #[error("Handshake backend failed: {0}")]
@@ -6613,12 +6712,18 @@ mod tests {
     ) -> Result<ValidatedCanonicalNameState, HnsWalletError> {
         let raw_state = state.encode().expect("name state");
         let raw_transaction = transaction.encode().expect("owner transaction");
+        let inclusion_height = u64::from(state.transfer.get().max(1));
         validate_canonical_name_state(
             name,
             state.name_hash.into_bytes(),
             Some(&raw_state),
             Some(outpoint),
             Some(&raw_transaction),
+            Some(TransactionInclusion {
+                block_hash: [24; 32],
+                height: inclusion_height,
+                transaction_index: Some(0),
+            }),
         )?
         .ok_or(HnsWalletError::InvalidEvidence)
     }
@@ -6668,6 +6773,11 @@ mod tests {
             Some(&raw_state),
             Some(wrong_outpoint),
             Some(&raw_transaction),
+            Some(TransactionInclusion {
+                block_hash: [24; 32],
+                height: 1,
+                transaction_index: Some(0),
+            }),
         )
         .is_err());
 
@@ -6849,6 +6959,7 @@ mod tests {
             },
             workflow_id: WorkflowId::new([42; 16]),
             expires_at_unix: Some(10),
+            kind: HnsInputReservationKind::Ordinary,
         };
         let other_reservation = HnsInputReservation {
             wallet_id: other_config.wallet_id,
@@ -6859,6 +6970,7 @@ mod tests {
             },
             workflow_id: WorkflowId::new([44; 16]),
             expires_at_unix: Some(10),
+            kind: HnsInputReservationKind::Ordinary,
         };
         for (owner, reservation) in [
             (&config, current_reservation.clone()),

@@ -112,8 +112,33 @@ cache across restart/reorg, while legacy rows stay explicitly watch-only until
 fresh evidence succeeds. Cache state cannot authorize an action: the runtime
 must reacquire a non-serializable authority at the exact current snapshot.
 
+Wallet-owned name actions additionally consume the node's versioned
+`name_action_context` for the exact chain epoch, tip, mempool instance and
+generation. The wallet independently binds chain identity, candidate height,
+canonical state, owner transaction and active-chain inclusion, fixed ordered
+ineligibility reasons, owner mempool spender, transfer lockup, FINALIZE
+maturity, and the HSD-selected active-chain renewal block. TRANSFER preserves
+the name value at canonical input/output zero. Direct FINALIZE derives its
+destination from the authenticated TRANSFER covenant and is signed by the
+outgoing owner's `HnsName` key; incoming-recipient classification is not
+signing authority.
+
+Name workflow IDs deterministically bind account, action, and request nonce.
+Preparation atomically saves the encrypted workflow plus separately typed name
+source and ordinary fee-input reservations. Authorization consumes one exact
+approval, retains final signed bytes and fee evidence before broadcast, and
+reconciliation reports broadcast, mempool, transfer lock, finalize eligibility,
+finalization, transfer cancellation, conflict, rebroadcast, and reapproval
+states. Reservations for a broadcast name action remain attached across
+confirmed states so a later reorg cannot silently free returned inputs.
+Authority reacquisition permits a newer chain or mempool snapshot only when the
+owner source and every transaction-defining action term remain unchanged. The
+wallet reacquires again against the final fee quote's exact snapshot before it
+persists or submits signed bytes; changed source or FINALIZE renewal terms move
+the workflow to `ReapprovalRequired` for explicit cancellation and replacement.
+
 The concrete synchronous HNS adapter now speaks the authenticated loopback
-`hns-node-rs` wallet RPC v1 boundary, pinned to node commit `5ed38d15`. It
+`hns-node-rs` wallet RPC v1 boundary, pinned to node commit `e5f95c05`. It
 derives canonical ScriptIds, enforces full chain/mempool bindings, and validates
 HTTP, JSON, transaction, spender, and name evidence without giving the node
 signing authority. The complete enclosing product runtime and qualification

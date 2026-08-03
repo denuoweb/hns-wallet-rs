@@ -2,7 +2,7 @@
 
 `HnsNodeRpcBackend` is the concrete synchronous wallet-side adapter for the
 authenticated `hns-node-rs` wallet RPC v1 contract frozen at node commit
-`5ed38d15d50098191b4473d4dda66a93d4e3e6fc`. It implements `HnsBackend`; the
+`e5f95c05f72095484a2a33eb00aa7d1695eae4fb`. It implements `HnsBackend`; the
 node supplies canonical chain evidence and broadcast admission while the wallet
 alone derives keys, signs, approves, and persists workflows. The node never
 signs.
@@ -113,6 +113,28 @@ transaction's active-chain inclusion height. A non-TRANSFER owner is rejected
 while transfer height remains nonzero; FINALIZE is not incorrectly bound to its
 own inclusion height.
 
+## Name-action context
+
+`name_action_context` is a construction-evidence call, not a signing or
+broadcast call. Its request supplies exactly one `transfer` or `finalize`
+action, the name hash, the expected chain epoch, and the exact expected mempool
+instance nonce and generation. The versioned response binds stable network ID
+and genesis identity, consensus profile, tip, candidate inclusion height,
+canonical current state, exact owner transaction/output/inclusion, lifecycle,
+owner-spender txid, transfer lockup and maturity, HSD-selected renewal
+height/hash/window, and a maximum-nine fixed ordered reason vector.
+
+The adapter rejects unknown fields, lifecycle/reason vocabulary changes,
+duplicates or reordered reasons, binding changes, projection differences,
+incorrect owner/source covenant shape, transfer-height/inclusion mismatch,
+incorrect maturity or HSD-selection arithmetic, and noncanonical chain
+identity. For FINALIZE the wallet also reads the selected block hash through
+the same epoch-bound active-chain method at each authority reacquisition,
+including preparation, authorization, and broadcast or rebroadcast. A bound
+owner mempool spender denies fresh action authority. No consensus name-policy
+constant is copied into the wallet; contextual policy originates in the pinned
+node consensus profile and is independently checked from returned evidence.
+
 ## Release policy
 
 This adapter removes the missing source boundary; it does not by itself enable
@@ -126,10 +148,10 @@ reacquires a non-serializable authority from the exact live snapshot and only
 for a registered, unexpired, unrevoked, non-transferring owner output matching a
 persisted `HnsName` derivation. Shakedex/HTLC descriptor or preimage transport
 remains unavailable until protocol qualification, canonical fee-quote
-integration, product integration, and the recorded gates land. Ordinary HNS send
-and the exposed settlement lock, redeem, and refund paths are within this quote
-boundary. Name transfer and FINALIZE transaction construction are not exposed
-here and are not implied to be complete.
+qualification, product integration, and the recorded gates land. Ordinary HNS
+send, the exposed settlement lock/redeem/refund paths, and wallet-owned P2PKH
+TRANSFER/direct-FINALIZE source workflows are within the exact quote boundary.
+Provider dispatch and release qualification remain incomplete.
 
 Focused and consolidated evidence for this source is recorded only in
 [QUALIFICATION.md](QUALIFICATION.md); no test result changes a value gate.

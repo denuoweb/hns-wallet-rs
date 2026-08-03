@@ -22,9 +22,10 @@ from legacy persisted records therefore cannot bypass the boundary.
 
 The wallet now has coherent canonical V2 source plus exact NameState/resource/
 owner-output validation and ephemeral account ownership authority. Those are
-prerequisites, not Shakedex authorization. Signed name transfer/finalize and
-fulfillment/recovery construction, locked-name key handling, concrete node
-workflow evidence, live Denuo V2 publication/discovery, trusted browser
+prerequisites, not Shakedex authorization. Wallet-owned P2PKH TRANSFER/direct
+FINALIZE is implemented behind HNS gates, but Shakedex cannot reuse that
+authority. Locked-name/script-controlled transfer/finalize, fulfillment and
+recovery construction, live Denuo V2 publication/discovery, trusted browser
 approval, consolidated protocol qualification, and restart/reorg/regtest
 evidence are still required before any gate can change. Reverse Dutch is
 deferred.

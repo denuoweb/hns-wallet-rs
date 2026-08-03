@@ -11,7 +11,7 @@ disabled independently.
 | Standalone workspace | 13 crates, resolver 3, Rust 1.89, independent lockfile, no sibling paths | release CI and published artifacts |
 | Wallet types | persisted IDs unchanged; dedicated nonzero base64url service/session/handle/request/approval IDs with redacted diagnostics; decimal integer amounts, roles and capabilities | API stabilization review |
 | Store | schema v3; Argon2id and XChaCha20-Poly1305; encrypted typed entities/workflows/provider records; metadata-bound AEAD; bounded heterogeneous CAS batches; complete bounded binary-prefix entity and opaque-workflow reads; non-consuming authenticated approval reads; atomic unchanged-approval consume plus workflow/reservation CAS; bounded passphrase input, approvals and replays; monotonic permission tombstones; migration checkpoint; Linux file-boundary enforcement | platform key wrapping, supported secure-open policy on non-Linux targets, migration/import tooling for populated schema-v1 entity tables, DB benchmarks and audit |
-| HNS | create/restore, separated keys, BLAKE2b-160 version-0 addresses, authenticated loopback `hns-node-rs` wallet RPC v1 adapter, separate bounded coin and `HnsName` queries under one exact chain/mempool snapshot, complete wallet/account-scoped persisted entity reads and fail-closed opaque-workflow recovery, encrypted monotonic name scan state, restore/history/reorg reconciliation, ordered spender evidence, optional exact time/transaction positions, immutable canonical 0.2 NameState/resource source, exact raw/projected current/proof validation, owner txid/index/value/covenant binding, `HnsName` ownership/incoming/outgoing classification, legacy-row revalidation, ephemeral exact-snapshot ownership authority, exact persisted UTXO height/covenant evidence, ordered `HnsCoin`/`HnsName` P2PKH signing substrate, canonical policy-size/minimum-fee construction and independent node-quote comparison, exact final-signed fee-quote persistence, pre-submission re-quote with durable `RequiresRebroadcast`, atomic account/workflow/input reservation preparation, canonical HTLC construction/spends, settlement evidence and restart supervision | transfer/finalize workflows, consolidated adapter CI plus regtest/restart/reorg/adversarial/name-scan/fee-policy qualification, protocol publication/qualification, and published canonical settlement profile |
+| HNS | create/restore, separated keys, BLAKE2b-160 version-0 addresses, authenticated loopback `hns-node-rs` wallet RPC v1 adapter, separate bounded coin and `HnsName` queries under one exact chain/mempool snapshot, complete wallet/account-scoped persisted entity reads and fail-closed opaque-workflow recovery, encrypted monotonic name scan state, restore/history/reorg reconciliation, ordered spender evidence, optional exact time/transaction positions, immutable canonical 0.2 NameState/resource source, exact raw/projected current/proof validation, owner txid/index/value/covenant/inclusion binding, `HnsName` ownership/incoming/outgoing classification, legacy-row revalidation, ephemeral exact-snapshot ownership authority, versioned chain/mempool/owner/lockup/renewal action-context validation, canonical index-zero value-preserving TRANSFER and outgoing-owner direct FINALIZE construction, deterministic encrypted name workflows, typed name/funding reservations, single-use trusted approval, ordered `HnsName`/`HnsCoin` signing, canonical policy-size/minimum-fee construction and independent node-quote comparison, exact signed-byte quote/requote, durable broadcast/mempool/lock/eligibility/finalization/cancellation/conflict/reapproval reconciliation, canonical HTLC construction/spends, settlement evidence and restart supervision | consolidated node/wallet action-context and fee-policy CI; multi-process regtest, restart/reorg, mempool-conflict, adversarial, name-scan, and resource qualification; trusted provider/UI integration; protocol publication and independent review; published canonical settlement profile |
 | Provider | exact 43-name vocabulary, secure origin, opaque authority registry, authority-validated permission/tombstone snapshots, typed capability snapshot, ephemeral approvals/replay/rates, forbidden methods | published engine authority adapter, browser-native dispatch, atomic real `hns_requestAccounts` join, and complete trusted approval UI |
 | Shakedex | encrypted/CAS seller, buyer, and recovery schemas; immutable canonical V2 signed-listing decode with envelope signature and listing-identity binding for structural inspection; all creation, discovery, and transition entrypoints hard-disabled | canonical source qualification/publication, current network/time/locking-coin verification at action boundaries, signed transaction construction, live node/Denuo V2 integration, trusted approval UI, restart/reorg/regtest qualification |
 | Denuo market | chain-neutral reservations/sessions; canonical V2 protocol implemented in `hns-rs` | released protocol dependency, reporter governance, live relay/board integration |
@@ -41,8 +41,8 @@ consumes the unchanged approval, persists the authorized bytes and quote, and
 activates reservations. Submission re-quotes only those persisted bytes and
 durably records the refreshed quote plus `RequiresRebroadcast` first. A stale
 or unavailable quote input gets one full reconciliation and one retry, never a
-polling loop. Name transfer and FINALIZE transaction construction are not
-exposed by this wallet source and are not claimed complete.
+polling loop. Wallet-owned P2PKH TRANSFER and direct FINALIZE use the same
+boundary and remain unreachable while both HNS release gates are false.
 
 Other exact blockers are:
 
@@ -56,9 +56,9 @@ Other exact blockers are:
   bounds, and independent node-quote comparison, but consolidated fee-policy
   and adapter qualification is not recorded, so
   `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains false;
-- canonical name metadata and ownership cache are implemented, but name
-  transfer/FINALIZE workflows do not yet consume the new ephemeral authority,
-  and name-role restart/reorg/product qualification is not recorded;
+- name TRANSFER/FINALIZE source workflows consume fresh ephemeral authority and
+  exact node action context, but their node/wallet restart/reorg/mempool/product
+  qualification and provider/trusted-UI dispatch are not recorded;
 - canonical `hns-swap` 0.2 source is pinned to immutable revision `4b989aa`, but
   that protocol revision is unpublished and lacks consolidated qualification;
 - platform key wrapping, secure approval UI, browser/native-host integration,
@@ -128,13 +128,14 @@ Caller-provided verification booleans cannot become a verified settlement lock.
 The earlier 2026-08-02 baseline passed 34 Rust tests and its complete local
 gate. On 2026-08-03 the focused NVMe `canonical_hns_v2` invocation passed 6 HNS
 name/adapter tests and 3 Shakedex listing/gate tests; the subsequent exact
-account-scoped persistence regression passed 1 test. No standalone build,
-check, broad workspace test, RocksDB compilation, network run, or benchmark was
-performed. These focused results do not replace the consolidated gate and do
-not enable a value constant. Run `scripts/check.sh` once in CI and record the
-resulting commit ID and artifacts in [`QUALIFICATION.md`](QUALIFICATION.md).
-The new provider/ABI/service/host contract tests and machine-readable vectors
-are source-only and remain unrun.
+account-scoped persistence regression passed 1 test. The final focused
+`canonical_hns_v3_name_action` invocation passed 4 HNS tests with 0 failures
+and 19 filtered. No standalone build, check, broad workspace test, RocksDB
+compilation, network run, or benchmark was performed. These focused results do
+not replace the consolidated gate and do not enable a value constant. Run
+`scripts/check.sh` once in CI and record the resulting commit ID and artifacts
+in [`QUALIFICATION.md`](QUALIFICATION.md). The new provider/ABI/service/host
+contract tests and machine-readable vectors are source-only and remain unrun.
 
 ## Deferred by design
 
