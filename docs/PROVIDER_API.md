@@ -31,15 +31,18 @@ Handshake:
 The method vocabulary is stable even when a capability is unavailable. In the
 current release-gated runtime, imported names expose watch-only split proof/
 current status. `hns_transferName` and `hns_finalizeName` must return unavailable
-until canonical NameState parsing and the dedicated `HnsName` derivation scan
-independently prove current ownership; unbound raw resource bytes are not
-returned as proof-authenticated data.
+until released canonical NameState/resource parsing independently proves
+current ownership from committed bytes. The dedicated `HnsName` derivation scan
+is persisted but is key discovery only; unbound owner hints or raw resource
+bytes are not returned as proof-authenticated data.
 
 External assets:
 
 `asset_getAccount`, `asset_getBalance`, `asset_getTransactions`,
 `asset_getReceiveTarget`, `asset_send`. Every call includes exactly one enabled
 `bitcoin` or `ethereum` module. These methods never accept calldata or PSBTs.
+Ethereum currently exposes offline receive derivation only; provider dispatch,
+balance/history, send, signing, and settlement remain unavailable.
 
 Name market:
 

@@ -24,13 +24,26 @@ pub const NATIVE_TRANSFER_GAS: u64 = 21_000;
 pub const HTLC_LOCK_GAS_LIMIT: u64 = 180_000;
 pub const HTLC_REDEEM_GAS_LIMIT: u64 = 100_000;
 pub const HTLC_REFUND_GAS_LIMIT: u64 = 100_000;
+/// Helios-backed synchronization has no embedded, independently qualified
+/// runtime in this source revision.
+pub const ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED: bool = false;
+/// Native-ETH signing and broadcast have no qualified product runtime.
+pub const ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
+/// Cross-chain settlement remains sequenced after fixed-price Shakedex and its
+/// independent chain/runtime qualification.
+pub const ETHEREUM_SETTLEMENT_RUNTIME_RELEASE_QUALIFIED: bool = false;
+/// No Ethereum mainnet deployment or value path is approved by this source.
+pub const ETHEREUM_MAINNET_RUNTIME_RELEASE_QUALIFIED: bool = false;
 
 pub const fn capabilities() -> ChainCapabilities {
     ChainCapabilities {
         receive: true,
-        send: true,
-        history: true,
-        atomic_settlement: true,
+        send: ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED
+            && ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED,
+        history: ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED,
+        atomic_settlement: ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED
+            && ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED
+            && ETHEREUM_SETTLEMENT_RUNTIME_RELEASE_QUALIFIED,
         hash_algorithm: HashAlgorithm::Sha256,
         locktime_model: LocktimeModel::SmartContractTimestamp,
         finality_model: FinalityModel::EthereumFinalizedCheckpoint,
@@ -95,7 +108,13 @@ impl<'de> Deserialize<'de> for EthereumAddress {
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub struct EthereumSecretKey([u8; 32]);
+struct EthereumSecretMaterial([u8; 32]);
+
+pub struct EthereumSecretKey {
+    material: EthereumSecretMaterial,
+    address: EthereumAddress,
+    role: EthereumKeyRole,
+}
 
 impl fmt::Debug for EthereumSecretKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,6 +127,43 @@ impl fmt::Debug for EthereumSecretKey {
 pub enum EthereumKeyRole {
     Wallet,
     AtomicSwap,
+}
+
+/// Opaque authorization for the dormant ordinary native-ETH value runtime.
+/// The public acquisition function fails while the immutable release gate is
+/// false; the private field prevents callers from fabricating a permit.
+pub struct EthereumValueRuntimePermit(());
+
+/// Opaque authorization for the independently gated settlement runtime.
+pub struct EthereumSettlementRuntimePermit(());
+
+/// Opaque provenance token for evidence produced by an embedded, qualified
+/// Helios runtime. Caller-serialized verification booleans are not this token,
+/// and no public constructor or release-flag-based acquisition path exists.
+pub struct HeliosEvidenceRuntimePermit(());
+
+pub fn ethereum_value_runtime_permit() -> Result<EthereumValueRuntimePermit, EthereumError> {
+    if !ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED {
+        return Err(EthereumError::ValueOperationsDisabled);
+    }
+    if !ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED {
+        return Err(EthereumError::SynchronizationUnavailable);
+    }
+    Ok(EthereumValueRuntimePermit(()))
+}
+
+pub fn ethereum_settlement_runtime_permit(
+) -> Result<EthereumSettlementRuntimePermit, EthereumError> {
+    if !ETHEREUM_SETTLEMENT_RUNTIME_RELEASE_QUALIFIED {
+        return Err(EthereumError::SettlementOperationsDisabled);
+    }
+    if !ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED {
+        return Err(EthereumError::ValueOperationsDisabled);
+    }
+    if !ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED {
+        return Err(EthereumError::SynchronizationUnavailable);
+    }
+    Ok(EthereumSettlementRuntimePermit(()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -173,7 +229,11 @@ fn derive_account(
             account_index,
             address_index,
         },
-        EthereumSecretKey(secret_bytes),
+        EthereumSecretKey {
+            material: EthereumSecretMaterial(secret_bytes),
+            address,
+            role,
+        },
     ))
 }
 
@@ -210,10 +270,10 @@ impl HeliosPolicy {
     }
 }
 
-/// Proof-carrying execution observations accepted from the selected Helios
-/// adapter. The mainnet activation policy additionally requires an audited
-/// adapter at `HELIOS_UPSTREAM_REVISION`; this crate does not silently accept
-/// ordinary JSON-RPC responses as this type.
+/// Structural fields expected from the selected Helios adapter. Serialization
+/// does not confer provenance: authoritative verification additionally requires
+/// the opaque [`HeliosEvidenceRuntimePermit`], which has no public acquisition
+/// path and can only be minted inside a future embedded verifier.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HeliosExecutionEvidence {
     pub chain_id: u64,
@@ -270,7 +330,13 @@ impl EthereumHtlcDeploymentPolicy {
         {
             return Err(EthereumError::InvalidContractPolicy);
         }
-        if self.chain_id == 1 && self.mainnet_settlement_enabled {
+        // Qualification is source authority, never a caller-selected boolean.
+        // The legacy field is retained only so old policy records fail closed:
+        // setting it cannot enable any network, and chain ID 1 is unavailable
+        // regardless of its value in this source revision.
+        if self.mainnet_settlement_enabled
+            || (self.chain_id == 1 && !ETHEREUM_MAINNET_RUNTIME_RELEASE_QUALIFIED)
+        {
             return Err(EthereumError::MainnetQualificationRequired);
         }
         Ok(())
@@ -360,6 +426,8 @@ pub struct VerifiedEthereumLock {
 }
 
 pub fn verify_ethereum_lock(
+    _provenance: &HeliosEvidenceRuntimePermit,
+    _settlement_permit: &EthereumSettlementRuntimePermit,
     helios: &HeliosPolicy,
     deployment: &EthereumHtlcDeploymentPolicy,
     expected: &ExpectedEthereumLock,
@@ -420,35 +488,128 @@ fn verify_locked_log(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EthereumOperationClass {
+    NativeValue,
+    Settlement,
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct EthereumHtlcPreimage([u8; 32]);
+
+impl EthereumHtlcPreimage {
+    pub fn new(mut bytes: [u8; 32]) -> Self {
+        let preimage = Self(bytes);
+        bytes.zeroize();
+        preimage
+    }
+
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EthereumHtlcPreimage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EthereumHtlcPreimage([REDACTED])")
+    }
+}
+
 enum EthereumOperation {
-    NativeTransfer,
+    NativeTransfer {
+        signer: EthereumAddress,
+    },
     HtlcLock(ExpectedEthereumLock),
     HtlcRedeem {
         swap_id: [u8; 32],
-        preimage: [u8; 32],
+        preimage: EthereumHtlcPreimage,
+        receiver: EthereumAddress,
     },
     HtlcRefund {
         swap_id: [u8; 32],
+        refund_address: EthereumAddress,
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl fmt::Debug for EthereumOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NativeTransfer { .. } => formatter.write_str("NativeTransfer"),
+            Self::HtlcLock(_) => formatter.write_str("HtlcLock"),
+            Self::HtlcRedeem { .. } => formatter.write_str("HtlcRedeem([REDACTED])"),
+            Self::HtlcRefund { .. } => formatter.write_str("HtlcRefund"),
+        }
+    }
+}
+
+/// The permit kind is explicit at the final signing boundary. Both contained
+/// permit types are opaque and currently unobtainable through their public
+/// acquisition functions.
+pub enum EthereumSigningPermit<'a> {
+    Value(&'a EthereumValueRuntimePermit),
+    Settlement(&'a EthereumSettlementRuntimePermit),
+}
+
+#[derive(Debug)]
 pub struct PreparedEip1559Transaction {
-    pub chain_id: u64,
-    pub nonce: u64,
-    pub max_priority_fee_per_gas: u128,
-    pub max_fee_per_gas: u128,
-    pub gas_limit: u64,
-    pub to: EthereumAddress,
-    pub value_wei: u128,
+    chain_id: u64,
+    nonce: u64,
+    max_priority_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+    gas_limit: u64,
+    to: EthereumAddress,
+    value_wei: u128,
     operation: EthereumOperation,
+}
+
+/// Type-state proving that the exact immutable transaction was checked against
+/// an approval-supplied maximum fee before signing became reachable.
+#[derive(Debug)]
+pub struct FeeBoundEip1559Transaction {
+    transaction: PreparedEip1559Transaction,
+    approved_maximum_fee_wei: u128,
+}
+
+/// Opaque, single-owner signed payload for the controlled embedded-broadcast
+/// boundary. Encoded bytes are zeroized on drop and deliberately have no public
+/// accessor, serializer, cloning implementation, or byte-revealing `Debug`.
+pub struct SignedEip1559Transaction {
+    encoded: Zeroizing<Vec<u8>>,
+    transaction_hash: [u8; 32],
+}
+
+impl SignedEip1559Transaction {
+    pub const fn encoded_type(&self) -> u8 {
+        0x02
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        self.encoded.len()
+    }
+
+    pub const fn transaction_hash(&self) -> [u8; 32] {
+        self.transaction_hash
+    }
+}
+
+impl fmt::Debug for SignedEip1559Transaction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignedEip1559Transaction")
+            .field("encoded_type", &self.encoded_type())
+            .field("encoded_len", &self.encoded_len())
+            .field("transaction_hash", &self.transaction_hash)
+            .field("encoded", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl PreparedEip1559Transaction {
     pub fn native_transfer(
+        _permit: &EthereumValueRuntimePermit,
         chain_id: u64,
         nonce: u64,
+        signer: EthereumAddress,
         to: EthereumAddress,
         value_wei: u128,
         max_priority_fee_per_gas: u128,
@@ -462,13 +623,14 @@ impl PreparedEip1559Transaction {
             gas_limit: NATIVE_TRANSFER_GAS,
             to,
             value_wei,
-            operation: EthereumOperation::NativeTransfer,
+            operation: EthereumOperation::NativeTransfer { signer },
         };
         transaction.validate()?;
         Ok(transaction)
     }
 
     pub fn htlc_lock(
+        _permit: &EthereumSettlementRuntimePermit,
         deployment: &EthereumHtlcDeploymentPolicy,
         nonce: u64,
         terms: ExpectedEthereumLock,
@@ -492,16 +654,17 @@ impl PreparedEip1559Transaction {
     }
 
     pub fn htlc_redeem(
+        _permit: &EthereumSettlementRuntimePermit,
         deployment: &EthereumHtlcDeploymentPolicy,
         nonce: u64,
-        swap_id: [u8; 32],
-        preimage: [u8; 32],
-        expected_hashlock: [u8; 32],
+        terms: &ExpectedEthereumLock,
+        preimage: EthereumHtlcPreimage,
         max_priority_fee_per_gas: u128,
         max_fee_per_gas: u128,
     ) -> Result<Self, EthereumError> {
         deployment.validate()?;
-        if swap_id == [0; 32] || sha256(&preimage) != expected_hashlock {
+        terms.validate()?;
+        if sha256(preimage.as_bytes()) != terms.hashlock {
             return Err(EthereumError::InvalidPreimage);
         }
         let transaction = Self {
@@ -512,23 +675,26 @@ impl PreparedEip1559Transaction {
             gas_limit: HTLC_REDEEM_GAS_LIMIT,
             to: deployment.contract_address,
             value_wei: 0,
-            operation: EthereumOperation::HtlcRedeem { swap_id, preimage },
+            operation: EthereumOperation::HtlcRedeem {
+                swap_id: terms.swap_id,
+                preimage,
+                receiver: terms.receiver,
+            },
         };
         transaction.validate()?;
         Ok(transaction)
     }
 
     pub fn htlc_refund(
+        _permit: &EthereumSettlementRuntimePermit,
         deployment: &EthereumHtlcDeploymentPolicy,
         nonce: u64,
-        swap_id: [u8; 32],
+        terms: &ExpectedEthereumLock,
         max_priority_fee_per_gas: u128,
         max_fee_per_gas: u128,
     ) -> Result<Self, EthereumError> {
         deployment.validate()?;
-        if swap_id == [0; 32] {
-            return Err(EthereumError::InvalidHtlc);
-        }
+        terms.validate()?;
         let transaction = Self {
             chain_id: deployment.chain_id,
             nonce,
@@ -537,7 +703,10 @@ impl PreparedEip1559Transaction {
             gas_limit: HTLC_REFUND_GAS_LIMIT,
             to: deployment.contract_address,
             value_wei: 0,
-            operation: EthereumOperation::HtlcRefund { swap_id },
+            operation: EthereumOperation::HtlcRefund {
+                swap_id: terms.swap_id,
+                refund_address: terms.refund_address,
+            },
         };
         transaction.validate()?;
         Ok(transaction)
@@ -549,34 +718,101 @@ impl PreparedEip1559Transaction {
             .ok_or(EthereumError::Arithmetic)
     }
 
-    pub fn enforce_fee_limit(&self, maximum_fee_wei: u128) -> Result<(), EthereumError> {
+    pub fn bind_fee_limit(
+        self,
+        maximum_fee_wei: u128,
+    ) -> Result<FeeBoundEip1559Transaction, EthereumError> {
+        self.validate()?;
         if self.maximum_fee_wei()? > maximum_fee_wei {
             return Err(EthereumError::FeeLimit);
         }
-        Ok(())
+        Ok(FeeBoundEip1559Transaction {
+            transaction: self,
+            approved_maximum_fee_wei: maximum_fee_wei,
+        })
     }
 
-    pub fn sign(self, secret: &EthereumSecretKey) -> Result<Vec<u8>, EthereumError> {
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub const fn max_priority_fee_per_gas(&self) -> u128 {
+        self.max_priority_fee_per_gas
+    }
+
+    pub const fn max_fee_per_gas(&self) -> u128 {
+        self.max_fee_per_gas
+    }
+
+    pub const fn gas_limit(&self) -> u64 {
+        self.gas_limit
+    }
+
+    pub const fn to(&self) -> EthereumAddress {
+        self.to
+    }
+
+    pub const fn value_wei(&self) -> u128 {
+        self.value_wei
+    }
+
+    fn sign(
+        self,
+        secret: &EthereumSecretKey,
+        approved_maximum_fee_wei: u128,
+    ) -> Result<SignedEip1559Transaction, EthereumError> {
         self.validate()?;
+        if self.maximum_fee_wei()? > approved_maximum_fee_wei {
+            return Err(EthereumError::FeeLimit);
+        }
+        if secret.role != self.operation.required_role() {
+            return Err(EthereumError::SignerRoleMismatch);
+        }
+        if secret.address != self.operation.required_signer() {
+            return Err(EthereumError::SignerAddressMismatch);
+        }
+        let signing = SigningKey::from_slice(&secret.material.0)
+            .map_err(|_| EthereumError::Signing)?;
+        if address_from_verifying_key(&VerifyingKey::from(&signing)) != secret.address {
+            return Err(EthereumError::SignerAddressMismatch);
+        }
         let data = self.operation.calldata();
         let unsigned_fields = self.rlp_fields(&data, None);
-        let mut signing_payload = vec![0x02];
-        signing_payload.extend_from_slice(&rlp_list(&unsigned_fields));
-        let digest: [u8; 32] = Keccak256::digest(&signing_payload).into();
-        let signing = SigningKey::from_slice(&secret.0).map_err(|_| EthereumError::Signing)?;
+        let unsigned_rlp = Zeroizing::new(rlp_list(&unsigned_fields));
+        let mut signing_payload = Zeroizing::new(Vec::with_capacity(1 + unsigned_rlp.len()));
+        signing_payload.push(0x02);
+        signing_payload.extend_from_slice(unsigned_rlp.as_slice());
+        let digest: Zeroizing<[u8; 32]> =
+            Zeroizing::new(Keccak256::digest(signing_payload.as_slice()).into());
         let (signature, recovery) = signing
-            .sign_prehash_recoverable(&digest)
+            .sign_prehash_recoverable(&digest[..])
             .map_err(|_| EthereumError::Signing)?;
+        if recovery.is_x_reduced() {
+            return Err(EthereumError::Signing);
+        }
         let signed_fields = self.rlp_fields(&data, Some((signature, recovery.to_byte())));
-        let mut raw = vec![0x02];
-        raw.extend_from_slice(&rlp_list(&signed_fields));
-        if raw.len() > MAX_SIGNED_TRANSACTION_BYTES {
+        let signed_rlp = Zeroizing::new(rlp_list(&signed_fields));
+        let mut encoded = Zeroizing::new(Vec::with_capacity(1 + signed_rlp.len()));
+        encoded.push(0x02);
+        encoded.extend_from_slice(signed_rlp.as_slice());
+        if encoded.len() > MAX_SIGNED_TRANSACTION_BYTES {
             return Err(EthereumError::TransactionTooLarge);
         }
-        Ok(raw)
+        let transaction_hash = Keccak256::digest(encoded.as_slice()).into();
+        Ok(SignedEip1559Transaction {
+            encoded,
+            transaction_hash,
+        })
     }
 
     fn validate(&self) -> Result<(), EthereumError> {
+        if self.chain_id == 1 && !ETHEREUM_MAINNET_RUNTIME_RELEASE_QUALIFIED {
+            return Err(EthereumError::MainnetQualificationRequired);
+        }
         if self.chain_id == 0
             || self.to == EthereumAddress::ZERO
             || self.max_priority_fee_per_gas == 0
@@ -586,10 +822,13 @@ impl PreparedEip1559Transaction {
             return Err(EthereumError::InvalidTransaction);
         }
         match &self.operation {
-            EthereumOperation::NativeTransfer if self.value_wei == 0 => {
+            EthereumOperation::NativeTransfer { signer } if *signer == EthereumAddress::ZERO => {
+                Err(EthereumError::InvalidAddress)
+            }
+            EthereumOperation::NativeTransfer { .. } if self.value_wei == 0 => {
                 Err(EthereumError::InvalidAmount)
             }
-            EthereumOperation::NativeTransfer if self.gas_limit != NATIVE_TRANSFER_GAS => {
+            EthereumOperation::NativeTransfer { .. } if self.gas_limit != NATIVE_TRANSFER_GAS => {
                 Err(EthereumError::ArbitraryCalldataForbidden)
             }
             EthereumOperation::HtlcLock(terms)
@@ -611,8 +850,12 @@ impl PreparedEip1559Transaction {
         }
     }
 
-    fn rlp_fields(&self, data: &[u8], signature: Option<(Signature, u8)>) -> Vec<Vec<u8>> {
-        let mut fields = vec![
+    fn rlp_fields(
+        &self,
+        data: &[u8],
+        signature: Option<(Signature, u8)>,
+    ) -> Zeroizing<Vec<Vec<u8>>> {
+        let mut fields = Zeroizing::new(vec![
             rlp_u128(u128::from(self.chain_id)),
             rlp_u128(u128::from(self.nonce)),
             rlp_u128(self.max_priority_fee_per_gas),
@@ -622,7 +865,7 @@ impl PreparedEip1559Transaction {
             rlp_u128(self.value_wei),
             rlp_bytes(data),
             rlp_list(&[]),
-        ];
+        ]);
         if let Some((signature, recovery)) = signature {
             let bytes = signature.to_bytes();
             fields.push(rlp_u128(u128::from(recovery & 1)));
@@ -633,12 +876,64 @@ impl PreparedEip1559Transaction {
     }
 }
 
+impl FeeBoundEip1559Transaction {
+    pub const fn approved_maximum_fee_wei(&self) -> u128 {
+        self.approved_maximum_fee_wei
+    }
+
+    pub fn sign(
+        self,
+        permit: EthereumSigningPermit<'_>,
+        secret: &EthereumSecretKey,
+    ) -> Result<SignedEip1559Transaction, EthereumError> {
+        let permitted_class = match permit {
+            EthereumSigningPermit::Value(_) => EthereumOperationClass::NativeValue,
+            EthereumSigningPermit::Settlement(_) => EthereumOperationClass::Settlement,
+        };
+        if permitted_class != self.transaction.operation.class() {
+            return Err(EthereumError::RuntimePermitMismatch);
+        }
+        self.transaction
+            .sign(secret, self.approved_maximum_fee_wei)
+    }
+}
+
 impl EthereumOperation {
-    fn calldata(&self) -> Vec<u8> {
+    const fn class(&self) -> EthereumOperationClass {
         match self {
-            Self::NativeTransfer => Vec::new(),
+            Self::NativeTransfer { .. } => EthereumOperationClass::NativeValue,
+            Self::HtlcLock(_) | Self::HtlcRedeem { .. } | Self::HtlcRefund { .. } => {
+                EthereumOperationClass::Settlement
+            }
+        }
+    }
+
+    const fn required_role(&self) -> EthereumKeyRole {
+        match self {
+            Self::NativeTransfer { .. } => EthereumKeyRole::Wallet,
+            Self::HtlcLock(_) | Self::HtlcRedeem { .. } | Self::HtlcRefund { .. } => {
+                EthereumKeyRole::AtomicSwap
+            }
+        }
+    }
+
+    const fn required_signer(&self) -> EthereumAddress {
+        match self {
+            Self::NativeTransfer { signer } => *signer,
+            Self::HtlcLock(terms) => terms.refund_address,
+            Self::HtlcRedeem { receiver, .. } => *receiver,
+            Self::HtlcRefund { refund_address, .. } => *refund_address,
+        }
+    }
+
+    fn calldata(&self) -> Zeroizing<Vec<u8>> {
+        match self {
+            Self::NativeTransfer { .. } => Zeroizing::new(Vec::new()),
             Self::HtlcLock(terms) => {
-                let mut data = selector(b"lock(bytes32,bytes32,address,address,uint64)").to_vec();
+                let mut data = Zeroizing::new(Vec::with_capacity(4 + (5 * 32)));
+                data.extend_from_slice(&selector(
+                    b"lock(bytes32,bytes32,address,address,uint64)",
+                ));
                 data.extend_from_slice(&terms.swap_id);
                 data.extend_from_slice(&terms.hashlock);
                 data.extend_from_slice(&abi_address(terms.receiver));
@@ -646,14 +941,18 @@ impl EthereumOperation {
                 data.extend_from_slice(&abi_u64(terms.timelock_unix));
                 data
             }
-            Self::HtlcRedeem { swap_id, preimage } => {
-                let mut data = selector(b"redeem(bytes32,bytes32)").to_vec();
+            Self::HtlcRedeem {
+                swap_id, preimage, ..
+            } => {
+                let mut data = Zeroizing::new(Vec::with_capacity(4 + (2 * 32)));
+                data.extend_from_slice(&selector(b"redeem(bytes32,bytes32)"));
                 data.extend_from_slice(swap_id);
-                data.extend_from_slice(preimage);
+                data.extend_from_slice(preimage.as_bytes());
                 data
             }
-            Self::HtlcRefund { swap_id } => {
-                let mut data = selector(b"refund(bytes32)").to_vec();
+            Self::HtlcRefund { swap_id, .. } => {
+                let mut data = Zeroizing::new(Vec::with_capacity(4 + 32));
+                data.extend_from_slice(&selector(b"refund(bytes32)"));
                 data.extend_from_slice(swap_id);
                 data
             }
@@ -730,6 +1029,7 @@ fn rlp_bytes(bytes: &[u8]) -> Vec<u8> {
 fn rlp_list(fields: &[Vec<u8>]) -> Vec<u8> {
     let content_length: usize = fields.iter().map(Vec::len).sum();
     let mut encoded = rlp_length(content_length, 0xc0, 0xf7);
+    encoded.reserve(content_length);
     for field in fields {
         encoded.extend_from_slice(field);
     }
@@ -793,6 +1093,12 @@ pub enum EthereumError {
     InvalidAddress,
     #[error("invalid Helios synchronization policy")]
     InvalidHeliosPolicy,
+    #[error("Ethereum synchronization is unavailable until release qualification")]
+    SynchronizationUnavailable,
+    #[error("native ETH value operations are disabled until release qualification")]
+    ValueOperationsDisabled,
+    #[error("Ethereum settlement operations are disabled until release qualification")]
+    SettlementOperationsDisabled,
     #[error("Ethereum chain ID mismatch")]
     ChainIdMismatch,
     #[error("execution evidence is not fully proof-verified and finalized")]
@@ -821,6 +1127,12 @@ pub enum EthereumError {
     InvalidPreimage,
     #[error("fee exceeds approved maximum")]
     FeeLimit,
+    #[error("runtime permit does not authorize this Ethereum operation")]
+    RuntimePermitMismatch,
+    #[error("Ethereum signing key role does not authorize this operation")]
+    SignerRoleMismatch,
+    #[error("Ethereum signing key does not match the bound sender")]
+    SignerAddressMismatch,
     #[error("integer arithmetic overflow")]
     Arithmetic,
     #[error("transaction signing failed")]
@@ -843,6 +1155,18 @@ mod tests {
 
     fn phrase() -> &'static str {
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    }
+
+    fn value_permit() -> EthereumValueRuntimePermit {
+        EthereumValueRuntimePermit(())
+    }
+
+    fn settlement_permit() -> EthereumSettlementRuntimePermit {
+        EthereumSettlementRuntimePermit(())
+    }
+
+    fn embedded_helios_provenance_for_test() -> HeliosEvidenceRuntimePermit {
+        HeliosEvidenceRuntimePermit(())
     }
 
     fn deployment(code: &[u8]) -> EthereumHtlcDeploymentPolicy {
@@ -891,42 +1215,252 @@ mod tests {
     }
 
     #[test]
-    fn only_typed_native_and_htlc_transactions_can_be_signed() {
+    fn runtime_gates_and_public_permit_acquisition_fail_closed() {
+        assert!(!ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED);
+        assert!(!ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED);
+        assert!(!ETHEREUM_SETTLEMENT_RUNTIME_RELEASE_QUALIFIED);
+        assert!(!ETHEREUM_MAINNET_RUNTIME_RELEASE_QUALIFIED);
+        let capabilities = capabilities();
+        assert!(capabilities.receive);
+        assert!(!capabilities.send);
+        assert!(!capabilities.history);
+        assert!(!capabilities.atomic_settlement);
+        assert!(matches!(
+            ethereum_value_runtime_permit(),
+            Err(EthereumError::ValueOperationsDisabled)
+        ));
+        assert!(matches!(
+            ethereum_settlement_runtime_permit(),
+            Err(EthereumError::SettlementOperationsDisabled)
+        ));
+    }
+
+    #[test]
+    fn signing_requires_an_exact_fee_bound_transaction_and_matching_permit() {
+        let permit = value_permit();
+        let settlement_permit = settlement_permit();
         let (account, secret) =
             derive_account_from_phrase(phrase(), EthereumKeyRole::Wallet, 0, 0).expect("account");
-        let transaction = PreparedEip1559Transaction::native_transfer(
+        let transaction = || {
+            PreparedEip1559Transaction::native_transfer(
+                &permit,
+                31_337,
+                0,
+                account.address,
+                EthereumAddress::new([8; 20]),
+                1,
+                1_000_000_000,
+                2_000_000_000,
+            )
+            .expect("typed transfer")
+        };
+        let exact_maximum = transaction().maximum_fee_wei().expect("bounded fee");
+        assert!(matches!(
+            transaction().bind_fee_limit(exact_maximum - 1),
+            Err(EthereumError::FeeLimit)
+        ));
+        let mismatched_permit = transaction()
+            .bind_fee_limit(exact_maximum)
+            .expect("exact fee cap is bound");
+        assert_eq!(
+            mismatched_permit.approved_maximum_fee_wei(),
+            exact_maximum
+        );
+        assert!(matches!(
+            mismatched_permit.sign(
+                EthereumSigningPermit::Settlement(&settlement_permit),
+                &secret
+            ),
+            Err(EthereumError::RuntimePermitMismatch)
+        ));
+        let signed = transaction()
+            .bind_fee_limit(exact_maximum)
+            .expect("exact fee cap is bound")
+            .sign(EthereumSigningPermit::Value(&permit), &secret)
+            .expect("signed fee-bound transaction");
+        assert_eq!(signed.encoded_type(), 0x02);
+        assert!(signed.encoded_len() > 1);
+        assert_ne!(signed.transaction_hash(), [0; 32]);
+        assert!(format!("{signed:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn signing_enforces_key_role_and_bound_sender_address() {
+        let value_permit = value_permit();
+        let settlement_permit = settlement_permit();
+        let (wallet, wallet_secret) =
+            derive_account_from_phrase(phrase(), EthereumKeyRole::Wallet, 0, 0).expect("wallet");
+        let (other_wallet, other_wallet_secret) =
+            derive_account_from_phrase(phrase(), EthereumKeyRole::Wallet, 0, 1)
+                .expect("other wallet");
+        let (swap, swap_secret) =
+            derive_account_from_phrase(phrase(), EthereumKeyRole::AtomicSwap, 0, 0)
+                .expect("swap");
+
+        let native = PreparedEip1559Transaction::native_transfer(
+            &value_permit,
             31_337,
             0,
-            account.address,
+            swap.address,
+            EthereumAddress::new([8; 20]),
             1,
             1_000_000_000,
             2_000_000_000,
         )
-        .expect("typed transfer");
-        transaction
-            .enforce_fee_limit(42_000_000_000_000)
-            .expect("fee cap");
-        let raw = transaction.sign(&secret).expect("signed transaction");
-        assert_eq!(raw[0], 0x02);
+        .expect("native transfer")
+        .bind_fee_limit(42_000_000_000_000)
+        .expect("fee binding");
+        assert!(matches!(
+            native.sign(EthereumSigningPermit::Value(&value_permit), &swap_secret),
+            Err(EthereumError::SignerRoleMismatch)
+        ));
+
+        let address_mismatch = PreparedEip1559Transaction::native_transfer(
+            &value_permit,
+            31_337,
+            1,
+            wallet.address,
+            EthereumAddress::new([8; 20]),
+            1,
+            1_000_000_000,
+            2_000_000_000,
+        )
+        .expect("native transfer")
+        .bind_fee_limit(42_000_000_000_000)
+        .expect("fee binding");
+        assert_ne!(wallet.address, other_wallet.address);
+        assert!(matches!(
+            address_mismatch.sign(
+                EthereumSigningPermit::Value(&value_permit),
+                &other_wallet_secret
+            ),
+            Err(EthereumError::SignerAddressMismatch)
+        ));
+
+        let mut settlement_terms = terms();
+        settlement_terms.refund_address = wallet.address;
+        let settlement = PreparedEip1559Transaction::htlc_lock(
+            &settlement_permit,
+            &deployment(&[0x60, 0x00]),
+            0,
+            settlement_terms,
+            1_000_000_000,
+            2_000_000_000,
+        )
+        .expect("settlement lock")
+        .bind_fee_limit(360_000_000_000_000)
+        .expect("fee binding");
+        assert!(matches!(
+            settlement.sign(
+                EthereumSigningPermit::Settlement(&settlement_permit),
+                &wallet_secret
+            ),
+            Err(EthereumError::SignerRoleMismatch)
+        ));
     }
 
     #[test]
-    fn mainnet_activation_fails_closed() {
-        let policy = EthereumHtlcDeploymentPolicy {
+    fn private_settlement_permit_keeps_typed_primitives_testable() {
+        let permit = settlement_permit();
+        let (swap, secret) =
+            derive_account_from_phrase(phrase(), EthereumKeyRole::AtomicSwap, 0, 0)
+                .expect("swap");
+        let deployment = deployment(&[0x60, 0x00]);
+
+        let mut refund_terms = terms();
+        refund_terms.refund_address = swap.address;
+        let lock = PreparedEip1559Transaction::htlc_lock(
+            &permit,
+            &deployment,
+            0,
+            refund_terms.clone(),
+            1_000_000_000,
+            2_000_000_000,
+        )
+        .expect("lock")
+        .bind_fee_limit(360_000_000_000_000)
+        .expect("lock fee binding")
+        .sign(EthereumSigningPermit::Settlement(&permit), &secret)
+        .expect("lock signing");
+        assert_eq!(lock.encoded_type(), 0x02);
+
+        let mut redeem_terms = terms();
+        redeem_terms.receiver = swap.address;
+        let preimage = EthereumHtlcPreimage::new([9; 32]);
+        assert_eq!(
+            format!("{preimage:?}"),
+            "EthereumHtlcPreimage([REDACTED])"
+        );
+        let redeem = PreparedEip1559Transaction::htlc_redeem(
+            &permit,
+            &deployment,
+            1,
+            &redeem_terms,
+            preimage,
+            1_000_000_000,
+            2_000_000_000,
+        )
+        .expect("redeem")
+        .bind_fee_limit(200_000_000_000_000)
+        .expect("redeem fee binding")
+        .sign(EthereumSigningPermit::Settlement(&permit), &secret)
+        .expect("redeem signing");
+        assert_eq!(redeem.encoded_type(), 0x02);
+
+        let refund = PreparedEip1559Transaction::htlc_refund(
+            &permit,
+            &deployment,
+            2,
+            &refund_terms,
+            1_000_000_000,
+            2_000_000_000,
+        )
+        .expect("refund")
+        .bind_fee_limit(200_000_000_000_000)
+        .expect("refund fee binding")
+        .sign(EthereumSigningPermit::Settlement(&permit), &secret)
+        .expect("refund signing");
+        assert_eq!(refund.encoded_type(), 0x02);
+    }
+
+    #[test]
+    fn mainnet_activation_fails_closed_even_with_false_caller_flag() {
+        let value_permit = value_permit();
+        let mut policy = EthereumHtlcDeploymentPolicy {
             chain_id: 1,
             contract_address: EthereumAddress::new([1; 20]),
             runtime_code_hash: [2; 32],
             deployment_block: 1,
-            mainnet_settlement_enabled: true,
+            mainnet_settlement_enabled: false,
         };
         assert!(matches!(
             policy.validate(),
+            Err(EthereumError::MainnetQualificationRequired)
+        ));
+        policy.mainnet_settlement_enabled = true;
+        assert!(matches!(
+            policy.validate(),
+            Err(EthereumError::MainnetQualificationRequired)
+        ));
+        assert!(matches!(
+            PreparedEip1559Transaction::native_transfer(
+                &value_permit,
+                1,
+                0,
+                EthereumAddress::new([3; 20]),
+                EthereumAddress::new([4; 20]),
+                1,
+                1_000_000_000,
+                2_000_000_000,
+            ),
             Err(EthereumError::MainnetQualificationRequired)
         ));
     }
 
     #[test]
     fn lock_verification_binds_chain_code_state_receipt_and_event() {
+        let provenance = embedded_helios_provenance_for_test();
+        let settlement_permit = settlement_permit();
         let code = [0x60, 0x00];
         let deployment = deployment(&code);
         let terms = terms();
@@ -955,24 +1489,52 @@ mod tests {
             locked_log: locked_log(&terms, deployment.contract_address),
             deployed_runtime_code: code.to_vec(),
         };
-        verify_ethereum_lock(&helios(), &deployment, &terms, &evidence)
-            .expect("complete verified evidence");
+        verify_ethereum_lock(
+            &provenance,
+            &settlement_permit,
+            &helios(),
+            &deployment,
+            &terms,
+            &evidence,
+        )
+        .expect("complete verified evidence");
         let mut wrong_chain = evidence.clone();
         wrong_chain.execution.chain_id = 1;
         assert!(matches!(
-            verify_ethereum_lock(&helios(), &deployment, &terms, &wrong_chain),
+            verify_ethereum_lock(
+                &provenance,
+                &settlement_permit,
+                &helios(),
+                &deployment,
+                &terms,
+                &wrong_chain
+            ),
             Err(EthereumError::ChainIdMismatch)
         ));
         let mut wrong_code = evidence.clone();
         wrong_code.deployed_runtime_code.push(1);
         assert!(matches!(
-            verify_ethereum_lock(&helios(), &deployment, &terms, &wrong_code),
+            verify_ethereum_lock(
+                &provenance,
+                &settlement_permit,
+                &helios(),
+                &deployment,
+                &terms,
+                &wrong_code
+            ),
             Err(EthereumError::BytecodeHashMismatch)
         ));
         let mut unfinalized = evidence;
         unfinalized.execution.consensus_finality_verified = false;
         assert!(matches!(
-            verify_ethereum_lock(&helios(), &deployment, &terms, &unfinalized),
+            verify_ethereum_lock(
+                &provenance,
+                &settlement_permit,
+                &helios(),
+                &deployment,
+                &terms,
+                &unfinalized
+            ),
             Err(EthereumError::UnverifiedExecutionEvidence)
         ));
     }

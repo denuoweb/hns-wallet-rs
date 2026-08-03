@@ -58,6 +58,10 @@ pub const HNS_DERIVATION_DOMAIN: &[u8] = b"hns-wallet-rs/hns-role-key/v1";
 pub const HNS_SETTLEMENT_KEY_DOMAIN: &[u8] = b"hns-wallet-rs/hns-settlement-key/v1";
 pub const MAX_RESTORE_LOOKAHEAD: u32 = 10_000;
 pub const MAX_RESTORE_SCRIPTS_PER_QUERY: usize = 10_000;
+/// The coin and dedicated name branches are queried separately so neither
+/// branch reduces the other's bounded lookahead. Persisted address records
+/// are nevertheless bounded as one account-owned collection.
+pub const MAX_RESTORE_ADDRESS_RECORDS: usize = MAX_RESTORE_SCRIPTS_PER_QUERY * 2;
 pub const DEFAULT_RESTORE_LOOKAHEAD: u32 = 100;
 pub const MAX_WALLET_COINS: usize = 10_000;
 pub const MAX_HISTORY_RESULTS: usize = 10_000;
@@ -790,10 +794,19 @@ pub struct HnsAccountRecord {
     pub config: HnsRuntimeConfig,
     pub next_receive_index: u32,
     pub next_change_index: u32,
+    /// Next dedicated name-key derivation. This is restoration metadata only;
+    /// it does not establish ownership without canonical NameState evidence.
+    #[serde(default)]
+    pub next_name_index: u32,
     pub external_scan_end: u32,
     pub internal_scan_end: u32,
+    /// Inclusive end of the independent `HnsName`, change-zero scan branch.
+    #[serde(default)]
+    pub name_scan_end: u32,
     pub last_used_external: Option<u32>,
     pub last_used_internal: Option<u32>,
+    #[serde(default)]
+    pub last_used_name: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1080,10 +1093,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     config,
                     next_receive_index: 0,
                     next_change_index: 0,
+                    next_name_index: 0,
                     external_scan_end,
                     internal_scan_end: external_scan_end,
+                    name_scan_end: external_scan_end,
                     last_used_external: None,
                     last_used_internal: None,
+                    last_used_name: None,
                 };
                 let revision = store.save_wallet_account(
                     &account_entity_id(&account.config),
@@ -1802,8 +1818,22 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let now = self.clock.now_unix()?;
         self.set_sync_phase(SyncPhase::Headers, None)?;
         let tip = self.backend.get_chain_tip()?;
-        let account = self.cache_read()?.account.clone();
+        let (cached_account, cached_account_revision) = {
+            let cache = self.cache_read()?;
+            (cache.account.clone(), cache.account_revision)
+        };
         let mut store = self.store_lock()?;
+        let stored_account = store
+            .wallet_account::<HnsAccountRecord>(&account_entity_id(&cached_account.config))?
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        validate_authoritative_reconcile_account(
+            &cached_account,
+            cached_account_revision,
+            &stored_account.value,
+            stored_account.revision,
+        )?;
+        let stored_account_revision = stored_account.revision;
+        let account = stored_account.value;
         let stored_recovery: Option<StoredEntity<HnsRecoveryState>> =
             store.hns_recovery_state(&recovery_entity_id(&account.config))?;
         let (mut recovery, recovery_revision) = stored_recovery
@@ -1819,8 +1849,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             addresses,
             history,
             indexed_coins,
-        ) =
-            self.restore_scan(&mut store, account, tip, now)?;
+        ) = self.restore_scan(
+            &mut store,
+            account,
+            stored_account_revision,
+            tip,
+            now,
+        )?;
         let common_ancestor = self.find_common_ancestor(&recovery, binding)?;
         let reorg_detected = recovery.last_tip.is_some()
             && common_ancestor
@@ -1866,17 +1901,17 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             &recovery,
             now,
         )?;
-        drop(store);
 
         {
             let mut cache = self.cache_write()?;
-            // A prepared workflow may have atomically advanced the account
-            // after this scan released the store lock. Never overwrite that
-            // newer committed derivation with the scan's older snapshot.
-            if cache.account_revision <= account_revision {
-                cache.account = account;
-                cache.account_revision = account_revision;
-            }
+            validate_authoritative_reconcile_account(
+                &cache.account,
+                cache.account_revision,
+                &account,
+                account_revision,
+            )?;
+            cache.account = account;
+            cache.account_revision = account_revision;
             cache.sync = SyncStatus {
                 phase: SyncPhase::Ready,
                 validated_height: tip.height,
@@ -1889,6 +1924,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             cache.binding = Some(binding);
             cache.mempool_binding = Some(mempool_binding);
         }
+        drop(store);
         Ok(HnsReconciliationReport {
             tip,
             common_ancestor,
@@ -2067,6 +2103,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             || state.plan.fee > state.plan.maximum_fee
             || state.plan.destination != request.destination
             || state.plan.inputs.is_empty()
+            || state
+                .plan
+                .inputs
+                .iter()
+                .any(|input| !is_ordinary_hns_derivation(input.derivation))
             || state.plan.expires_at_unix <= now_unix
         {
             return Err(ChainError::InvalidRequest(
@@ -2111,6 +2152,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         &self,
         store: &mut WalletStore,
         mut account: HnsAccountRecord,
+        expected_account_revision: u64,
         expected_tip: ChainTip,
         now_unix: u64,
     ) -> Result<
@@ -2127,8 +2169,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     > {
         if account.external_scan_end >= MAX_RESTORE_LOOKAHEAD
             || account.internal_scan_end >= MAX_RESTORE_LOOKAHEAD
+            || account.name_scan_end >= MAX_RESTORE_LOOKAHEAD
             || account.next_receive_index >= MAX_RESTORE_LOOKAHEAD
             || account.next_change_index >= MAX_RESTORE_LOOKAHEAD
+            || account.next_name_index >= MAX_RESTORE_LOOKAHEAD
         {
             return Err(HnsWalletError::InvalidLookahead);
         }
@@ -2141,18 +2185,28 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .next_change_index
             .saturating_add(gap - 1)
             .min(MAX_RESTORE_LOOKAHEAD - 1);
+        let minimum_name_end = account
+            .next_name_index
+            .saturating_add(gap - 1)
+            .min(MAX_RESTORE_LOOKAHEAD - 1);
         account.external_scan_end = account.external_scan_end.max(minimum_external_end);
         account.internal_scan_end = account.internal_scan_end.max(minimum_internal_end);
+        account.name_scan_end = account.name_scan_end.max(minimum_name_end);
 
         let mut expected_binding = None;
         let mut expected_mempool = None;
         let (mut addresses, mut history, indexed_coins, binding, mempool_binding) = loop {
-            let addresses = derive_restore_addresses(store, &account)?;
-            let (scripts, index_remap) = sorted_restore_scripts(&addresses)?;
-            let (binding, mempool_binding, history, indexed_coins) = load_wallet_snapshot(
+            let coin_addresses =
+                derive_restore_addresses(store, &account, KeyRole::HnsCoin)?;
+            let name_addresses =
+                derive_restore_addresses(store, &account, KeyRole::HnsName)?;
+            validate_disjoint_restore_programs(&coin_addresses, &name_addresses)?;
+
+            let (coin_scripts, coin_index_remap) = sorted_restore_scripts(&coin_addresses)?;
+            let (binding, mempool_binding, coin_history, coin_coins) = load_wallet_snapshot(
                 &self.backend,
-                &scripts,
-                &index_remap,
+                &coin_scripts,
+                &coin_index_remap,
                 expected_tip,
                 expected_binding,
                 expected_mempool,
@@ -2163,43 +2217,90 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             if expected_mempool.is_some_and(|expected| expected != mempool_binding) {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
+
+            let (name_scripts, name_index_remap) = sorted_restore_scripts(&name_addresses)?;
+            let (
+                name_binding,
+                name_mempool_binding,
+                name_history,
+                name_coins,
+            ) = load_wallet_snapshot(
+                &self.backend,
+                &name_scripts,
+                &name_index_remap,
+                expected_tip,
+                Some(binding),
+                Some(mempool_binding),
+            )?;
+            validate_same_restore_snapshot(
+                binding,
+                mempool_binding,
+                name_binding,
+                name_mempool_binding,
+            )?;
             expected_binding = Some(binding);
             expected_mempool = Some(mempool_binding);
+
+            let mut addresses = Vec::new();
+            let mut history = Vec::new();
+            let mut indexed_coins = Vec::new();
+            append_restore_branch(
+                &mut addresses,
+                &mut history,
+                &mut indexed_coins,
+                coin_addresses,
+                coin_history,
+                coin_coins,
+            )?;
+            append_restore_branch(
+                &mut addresses,
+                &mut history,
+                &mut indexed_coins,
+                name_addresses,
+                name_history,
+                name_coins,
+            )?;
+
             let mut last_external = None;
             let mut last_internal = None;
+            let mut last_name = None;
             for entry in &history {
                 let derivation = addresses
                     .get(entry.script_index as usize)
                     .ok_or(HnsWalletError::InvalidEvidence)?
                     .derivation;
-                match derivation.change {
-                    0 => {
+                match restore_derivation_key(derivation)? {
+                    (HNS_COIN_DERIVATION_TAG, 0, index) => {
                         last_external = Some(
                             last_external
-                                .map_or(derivation.index, |last: u32| last.max(derivation.index)),
+                                .map_or(index, |last: u32| last.max(index)),
                         )
                     }
-                    1 => {
+                    (HNS_COIN_DERIVATION_TAG, 1, index) => {
                         last_internal = Some(
                             last_internal
-                                .map_or(derivation.index, |last: u32| last.max(derivation.index)),
+                                .map_or(index, |last: u32| last.max(index)),
                         )
+                    }
+                    (HNS_NAME_DERIVATION_TAG, 0, index) => {
+                        last_name = Some(last_name.map_or(index, |last: u32| last.max(index)))
                     }
                     _ => return Err(HnsWalletError::InvalidEvidence),
                 }
             }
             ensure_trailing_gap(last_external, gap)?;
             ensure_trailing_gap(last_internal, gap)?;
+            ensure_trailing_gap(last_name, gap)?;
             let required_external =
                 required_scan_end(last_external, account.external_scan_end, gap);
             let required_internal =
                 required_scan_end(last_internal, account.internal_scan_end, gap);
-            let required_count = required_external as usize + required_internal as usize + 2;
-            if required_count > MAX_RESTORE_SCRIPTS_PER_QUERY {
-                return Err(HnsWalletError::ScanCapacityExhausted);
-            }
+            let required_name = required_scan_end(last_name, account.name_scan_end, gap);
+            checked_scan_address_count(&[required_external, required_internal])?;
+            checked_scan_address_count(&[required_name])?;
             if required_external <= account.external_scan_end
                 && required_internal <= account.internal_scan_end
+                && required_name <= account.name_scan_end
             {
                 break (
                     addresses,
@@ -2211,48 +2312,48 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             }
             account.external_scan_end = required_external;
             account.internal_scan_end = required_internal;
+            account.name_scan_end = required_name;
         };
 
-        let used: BTreeSet<(u32, u32)> = history
+        let used: BTreeSet<(u8, u32, u32)> = history
             .iter()
-            .map(|entry| {
+            .map(|entry| -> Result<_, HnsWalletError> {
                 let derivation = addresses[entry.script_index as usize].derivation;
-                (derivation.change, derivation.index)
+                restore_derivation_key(derivation)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         for address in &mut addresses {
-            address.used = used.contains(&(address.derivation.change, address.derivation.index));
+            address.used = used.contains(&restore_derivation_key(address.derivation)?);
         }
         account.last_used_external = used
             .iter()
-            .filter(|(change, _)| *change == 0)
-            .map(|(_, index)| *index)
+            .filter(|(role, change, _)| *role == HNS_COIN_DERIVATION_TAG && *change == 0)
+            .map(|(_, _, index)| *index)
             .max();
         account.last_used_internal = used
             .iter()
-            .filter(|(change, _)| *change == 1)
-            .map(|(_, index)| *index)
+            .filter(|(role, change, _)| *role == HNS_COIN_DERIVATION_TAG && *change == 1)
+            .map(|(_, _, index)| *index)
             .max();
-        if let Some(last_used) = account.last_used_external {
-            account.next_receive_index = account
-                .next_receive_index
-                .max(last_used.saturating_add(1))
-                .min(MAX_RESTORE_LOOKAHEAD - 1);
-        }
-        if let Some(last_used) = account.last_used_internal {
-            account.next_change_index = account
-                .next_change_index
-                .max(last_used.saturating_add(1))
-                .min(MAX_RESTORE_LOOKAHEAD - 1);
-        }
+        account.last_used_name = used
+            .iter()
+            .filter(|(role, change, _)| *role == HNS_NAME_DERIVATION_TAG && *change == 0)
+            .map(|(_, _, index)| *index)
+            .max();
+        account.next_receive_index = advance_next_derivation_index(
+            account.next_receive_index,
+            account.last_used_external,
+        );
+        account.next_change_index = advance_next_derivation_index(
+            account.next_change_index,
+            account.last_used_internal,
+        );
+        account.next_name_index =
+            advance_next_derivation_index(account.next_name_index, account.last_used_name);
         persist_derived_addresses(store, &account.config, &addresses, now_unix)?;
-        let expected_revision = store
-            .wallet_account::<HnsAccountRecord>(&account_entity_id(&account.config))?
-            .ok_or(HnsWalletError::InvalidEvidence)?
-            .revision;
         let account_revision = store.save_wallet_account(
             &account_entity_id(&account.config),
-            expected_revision,
+            expected_account_revision,
             &account,
             now_unix,
         )?;
@@ -2343,9 +2444,16 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let mut history = coalesce_transaction_history(history)?;
         let observed_txids: BTreeSet<TransactionHash> =
             history.iter().map(|entry| entry.txid).collect();
+        if addresses.is_empty()
+            || addresses.len() > MAX_RESTORE_ADDRESS_RECORDS
+            || addresses
+                .iter()
+                .any(|address| restore_derivation_key(address.derivation).is_err())
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
         let programs: BTreeSet<Vec<u8>> = addresses
             .iter()
-            .filter(|address| address.derivation.role == KeyRole::HnsCoin)
             .map(|address| address.program.clone())
             .collect();
         if programs.len() != addresses.len() || programs.iter().any(|program| program.len() != 20) {
@@ -2629,7 +2737,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         mempool_binding: MempoolSnapshotBinding,
         now_unix: u64,
     ) -> Result<(), HnsWalletError> {
-        let unspent: BTreeSet<HnsOutpoint> = coins.iter().map(|coin| coin.coin.outpoint).collect();
+        let unspent: BTreeSet<HnsOutpoint> = coins
+            .iter()
+            .filter(|coin| is_ordinary_hns_derivation(coin.derivation))
+            .map(|coin| coin.coin.outpoint)
+            .collect();
         let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
         let mut deletes = Vec::new();
         for stored in reservations {
@@ -2814,6 +2926,31 @@ fn same_account_identity(left: &HnsRuntimeConfig, right: &HnsRuntimeConfig) -> b
         && left.birthday_height == right.birthday_height
 }
 
+fn validate_authoritative_reconcile_account(
+    cached: &HnsAccountRecord,
+    cached_revision: u64,
+    authoritative: &HnsAccountRecord,
+    authoritative_revision: u64,
+) -> Result<(), HnsWalletError> {
+    if !same_account_identity(&cached.config, &authoritative.config)
+        || cached.config != authoritative.config
+    {
+        return Err(HnsWalletError::AccountConfigurationMismatch);
+    }
+    if authoritative_revision < cached_revision
+        || (authoritative_revision == cached_revision && authoritative != cached)
+        || authoritative.next_receive_index < cached.next_receive_index
+        || authoritative.next_change_index < cached.next_change_index
+        || authoritative.next_name_index < cached.next_name_index
+        || authoritative.external_scan_end < cached.external_scan_end
+        || authoritative.internal_scan_end < cached.internal_scan_end
+        || authoritative.name_scan_end < cached.name_scan_end
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(())
+}
+
 fn account_birthday_ancestor(birthday_height: u64) -> Option<u64> {
     birthday_height.checked_sub(1)
 }
@@ -2827,47 +2964,83 @@ fn ensure_trailing_gap(last_used: Option<u32>, gap: u32) -> Result<(), HnsWallet
 }
 
 fn required_scan_end(last_used: Option<u32>, current: u32, gap: u32) -> u32 {
-    last_used.map_or(current, |index| index.saturating_add(gap))
+    last_used.map_or(current, |index| current.max(index.saturating_add(gap)))
+}
+
+fn advance_next_derivation_index(current: u32, last_used: Option<u32>) -> u32 {
+    last_used.map_or(current, |last_used| {
+        current
+            .max(last_used.saturating_add(1))
+            .min(MAX_RESTORE_LOOKAHEAD - 1)
+    })
+}
+
+const HNS_COIN_DERIVATION_TAG: u8 = 0;
+const HNS_NAME_DERIVATION_TAG: u8 = 1;
+
+fn restore_derivation_key(
+    derivation: DerivationReference,
+) -> Result<(u8, u32, u32), HnsWalletError> {
+    if derivation.index >= MAX_RESTORE_LOOKAHEAD {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    match (derivation.role, derivation.change) {
+        (KeyRole::HnsCoin, change) if change <= 1 => {
+            Ok((HNS_COIN_DERIVATION_TAG, change, derivation.index))
+        }
+        (KeyRole::HnsName, 0) => Ok((HNS_NAME_DERIVATION_TAG, 0, derivation.index)),
+        _ => Err(HnsWalletError::InvalidEvidence),
+    }
+}
+
+fn checked_scan_address_count(scan_ends: &[u32]) -> Result<usize, HnsWalletError> {
+    if scan_ends.is_empty() {
+        return Err(HnsWalletError::InvalidLookahead);
+    }
+    let count = scan_ends.iter().try_fold(0_usize, |count, scan_end| {
+        if *scan_end >= MAX_RESTORE_LOOKAHEAD {
+            return Err(HnsWalletError::ScanCapacityExhausted);
+        }
+        let branch = usize::try_from(*scan_end)
+            .map_err(|_| HnsWalletError::ScanCapacityExhausted)?
+            .checked_add(1)
+            .ok_or(HnsWalletError::ScanCapacityExhausted)?;
+        count
+            .checked_add(branch)
+            .ok_or(HnsWalletError::ScanCapacityExhausted)
+    })?;
+    if count == 0 || count > MAX_RESTORE_SCRIPTS_PER_QUERY {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
+    Ok(count)
 }
 
 fn derive_restore_addresses(
     store: &WalletStore,
     account: &HnsAccountRecord,
+    role: KeyRole,
 ) -> Result<Vec<DerivedHnsAddress>, HnsWalletError> {
-    let existing: BTreeMap<(u32, u32), DerivedHnsAddress> = store
-        .derived_addresses::<DerivedHnsAddress>(MAX_RESTORE_LOOKAHEAD as usize)?
-        .into_iter()
-        .filter(|entity| {
-            entity
-                .id
-                .starts_with(&account_entity_prefix(&account.config))
-        })
-        .map(|entity| {
-            (
-                (
-                    entity.value.derivation.change,
-                    entity.value.derivation.index,
-                ),
-                entity.value,
-            )
-        })
-        .collect();
-    let address_count = account.external_scan_end as usize + account.internal_scan_end as usize + 2;
-    if address_count > MAX_RESTORE_SCRIPTS_PER_QUERY {
-        return Err(HnsWalletError::ScanCapacityExhausted);
-    }
+    let branches = match role {
+        KeyRole::HnsCoin => vec![
+            (0, account.external_scan_end),
+            (1, account.internal_scan_end),
+        ],
+        KeyRole::HnsName => vec![(0, account.name_scan_end)],
+        _ => return Err(HnsWalletError::InvalidEvidence),
+    };
+    let scan_ends: Vec<u32> = branches.iter().map(|(_, scan_end)| *scan_end).collect();
+    let address_count = checked_scan_address_count(&scan_ends)?;
     let mut addresses = Vec::with_capacity(address_count);
-    for (change, scan_end) in [
-        (0, account.external_scan_end),
-        (1, account.internal_scan_end),
-    ] {
+    for (change, scan_end) in branches {
         for index in 0..=scan_end {
             let derivation = DerivationReference {
-                role: KeyRole::HnsCoin,
+                role,
                 account: account_number(account),
                 change,
                 index,
             };
+            let id = derived_address_record_id(&account.config, derivation)?;
+            let persisted = store.derived_address::<DerivedHnsAddress>(&id)?;
             let public_key = derive_hns_public_key(store, account.config.wallet_id, derivation)?;
             let program = public_key_hash(&public_key)?.to_vec();
             let derived = DerivedHnsAddress {
@@ -2875,15 +3048,16 @@ fn derive_restore_addresses(
                 derivation,
                 address: receive_address(account.config.network, &public_key)?,
                 program,
-                used: existing
-                    .get(&(change, index))
-                    .is_some_and(|address| address.used),
+                used: persisted
+                    .as_ref()
+                    .is_some_and(|address| address.value.used),
             };
-            if let Some(persisted) = existing.get(&(change, index))
-                && (persisted.account_id != derived.account_id
-                    || persisted.derivation != derived.derivation
-                    || persisted.address != derived.address
-                    || persisted.program != derived.program)
+            if let Some(persisted) = persisted
+                && (persisted.id != id
+                    || persisted.value.account_id != derived.account_id
+                    || persisted.value.derivation != derived.derivation
+                    || persisted.value.address != derived.address
+                    || persisted.value.program != derived.program)
             {
                 return Err(HnsWalletError::InvalidEvidence);
             }
@@ -2893,9 +3067,97 @@ fn derive_restore_addresses(
     Ok(addresses)
 }
 
+fn validate_disjoint_restore_programs(
+    coin_addresses: &[DerivedHnsAddress],
+    name_addresses: &[DerivedHnsAddress],
+) -> Result<(), HnsWalletError> {
+    let combined = coin_addresses
+        .len()
+        .checked_add(name_addresses.len())
+        .ok_or(HnsWalletError::ScanCapacityExhausted)?;
+    if combined == 0 || combined > MAX_RESTORE_ADDRESS_RECORDS {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
+    let mut programs = BTreeSet::new();
+    for address in coin_addresses.iter().chain(name_addresses) {
+        restore_derivation_key(address.derivation)?;
+        if address.program.len() != 20 || !programs.insert(address.program.clone()) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
+    Ok(())
+}
+
+fn validate_same_restore_snapshot(
+    expected_binding: SnapshotBinding,
+    expected_mempool: MempoolSnapshotBinding,
+    actual_binding: SnapshotBinding,
+    actual_mempool: MempoolSnapshotBinding,
+) -> Result<(), HnsWalletError> {
+    if actual_binding != expected_binding || actual_mempool != expected_mempool {
+        Err(HnsWalletError::StaleNodeSnapshot)
+    } else {
+        Ok(())
+    }
+}
+
+fn append_restore_branch(
+    addresses: &mut Vec<DerivedHnsAddress>,
+    history: &mut Vec<HistoryEntry>,
+    indexed_coins: &mut Vec<IndexedWalletCoin>,
+    branch_addresses: Vec<DerivedHnsAddress>,
+    mut branch_history: Vec<HistoryEntry>,
+    mut branch_coins: Vec<IndexedWalletCoin>,
+) -> Result<(), HnsWalletError> {
+    if branch_addresses.is_empty()
+        || branch_addresses.len() > MAX_RESTORE_SCRIPTS_PER_QUERY
+        || addresses
+            .len()
+            .checked_add(branch_addresses.len())
+            .is_none_or(|count| count > MAX_RESTORE_ADDRESS_RECORDS)
+        || history
+            .len()
+            .checked_add(branch_history.len())
+            .is_none_or(|count| count > MAX_HISTORY_RESULTS)
+        || indexed_coins
+            .len()
+            .checked_add(branch_coins.len())
+            .is_none_or(|count| count > MAX_WALLET_COINS)
+    {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
+    let offset = u32::try_from(addresses.len())
+        .map_err(|_| HnsWalletError::ScanCapacityExhausted)?;
+    for entry in &mut branch_history {
+        if entry.script_index as usize >= branch_addresses.len() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        entry.script_index = entry
+            .script_index
+            .checked_add(offset)
+            .ok_or(HnsWalletError::ScanCapacityExhausted)?;
+    }
+    for coin in &mut branch_coins {
+        if coin.script_index as usize >= branch_addresses.len() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        coin.script_index = coin
+            .script_index
+            .checked_add(offset)
+            .ok_or(HnsWalletError::ScanCapacityExhausted)?;
+    }
+    addresses.extend(branch_addresses);
+    history.extend(branch_history);
+    indexed_coins.extend(branch_coins);
+    Ok(())
+}
+
 fn sorted_restore_scripts(
     addresses: &[DerivedHnsAddress],
 ) -> Result<(Vec<WalletAddressKey>, Vec<u32>), HnsWalletError> {
+    if addresses.is_empty() || addresses.len() > MAX_RESTORE_SCRIPTS_PER_QUERY {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
     let mut indexed: Vec<(WalletAddressKey, u32)> = addresses
         .iter()
         .enumerate()
@@ -3243,7 +3505,7 @@ fn reconcile_coins(
         if indexed_coin.coin.value.is_zero()
             || indexed_coin.output_address.version != 0
             || indexed_coin.output_address.hash.as_slice() != address.program.as_slice()
-            || address.derivation.role != KeyRole::HnsCoin
+            || restore_derivation_key(address.derivation).is_err()
         {
             return Err(HnsWalletError::InvalidEvidence);
         }
@@ -3255,6 +3517,16 @@ fn reconcile_coins(
     }
     coins.sort_by_key(|coin| coin.coin.outpoint);
     Ok(coins)
+}
+
+const fn is_ordinary_hns_derivation(derivation: DerivationReference) -> bool {
+    matches!(derivation.role, KeyRole::HnsCoin)
+}
+
+fn is_ordinary_hns_spend_candidate(coin: &TrackedHnsCoin) -> bool {
+    is_ordinary_hns_derivation(coin.derivation)
+        && !coin.coin.name_locked
+        && !coin.coin.coinbase
 }
 
 fn decode_transaction_for_id(
@@ -3470,6 +3742,37 @@ fn derived_address_id(config: &HnsRuntimeConfig, change: u32, index: u32) -> [u8
     id
 }
 
+fn name_derived_address_id(
+    config: &HnsRuntimeConfig,
+    change: u32,
+    index: u32,
+) -> [u8; 41] {
+    let mut id = [0_u8; 41];
+    id[..32].copy_from_slice(&account_entity_prefix(config));
+    id[32] = HNS_NAME_DERIVATION_TAG;
+    id[33..37].copy_from_slice(&change.to_be_bytes());
+    id[37..].copy_from_slice(&index.to_be_bytes());
+    id
+}
+
+fn derived_address_record_id(
+    config: &HnsRuntimeConfig,
+    derivation: DerivationReference,
+) -> Result<Vec<u8>, HnsWalletError> {
+    if derivation.account != config.account_derivation_index {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    match restore_derivation_key(derivation)? {
+        (HNS_COIN_DERIVATION_TAG, change, index) => {
+            Ok(derived_address_id(config, change, index).to_vec())
+        }
+        (HNS_NAME_DERIVATION_TAG, change, index) => {
+            Ok(name_derived_address_id(config, change, index).to_vec())
+        }
+        _ => Err(HnsWalletError::InvalidEvidence),
+    }
+}
+
 fn namespaced_outpoint_id(config: &HnsRuntimeConfig, outpoint: HnsOutpoint) -> [u8; 68] {
     let mut id = [0_u8; 68];
     id[..32].copy_from_slice(&account_entity_prefix(config));
@@ -3498,15 +3801,33 @@ fn persist_derived_addresses(
     addresses: &[DerivedHnsAddress],
     now_unix: u64,
 ) -> Result<(), HnsWalletError> {
-    let existing: BTreeMap<Vec<u8>, u64> = store
-        .derived_addresses::<DerivedHnsAddress>(MAX_RESTORE_LOOKAHEAD as usize)?
-        .into_iter()
-        .filter(|entity| entity.id.starts_with(&account_entity_prefix(config)))
-        .map(|entity| (entity.id, entity.revision))
-        .collect();
+    if addresses.is_empty() || addresses.len() > MAX_RESTORE_ADDRESS_RECORDS {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
+    let mut ids = BTreeSet::new();
+    let mut programs = BTreeSet::new();
     for address in addresses {
-        let id = derived_address_id(config, address.derivation.change, address.derivation.index);
-        let revision = existing.get(id.as_slice()).copied().unwrap_or(0);
+        if address.account_id != config.account_id
+            || address.program.len() != 20
+            || !programs.insert(address.program.clone())
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let id = derived_address_record_id(config, address.derivation)?;
+        if !ids.insert(id.clone()) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let existing = store.derived_address::<DerivedHnsAddress>(&id)?;
+        if existing.as_ref().is_some_and(|stored| {
+            stored.id != id
+                || stored.value.account_id != address.account_id
+                || stored.value.derivation != address.derivation
+                || stored.value.address != address.address
+                || stored.value.program != address.program
+        }) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let revision = existing.map_or(0, |stored| stored.revision);
         store.save_derived_address(&id, revision, address, now_unix)?;
     }
     Ok(())
@@ -3549,7 +3870,10 @@ fn available_unreserved_coins(
     }
     Ok(coins
         .into_iter()
-        .filter(|coin| !reserved.contains(&coin.coin.outpoint))
+        .filter(|coin| {
+            is_ordinary_hns_derivation(coin.derivation)
+                && !reserved.contains(&coin.coin.outpoint)
+        })
         .collect())
 }
 
@@ -3562,6 +3886,9 @@ fn reservation_saves(
 ) -> Result<Vec<EntityBatchSave<HnsInputReservation>>, HnsWalletError> {
     let mut saves = Vec::with_capacity(inputs.len());
     for input in inputs {
+        if !is_ordinary_hns_derivation(input.derivation) {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
         let reservation = HnsInputReservation {
             wallet_id: config.wallet_id,
             account_id: config.account_id,
@@ -3731,7 +4058,7 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             .coins
             .iter()
             .try_fold(BaseUnits::ZERO, |total, coin| {
-                if coin.coin.name_locked || coin.coin.coinbase {
+                if !is_ordinary_hns_spend_candidate(coin) {
                     Ok(total)
                 } else {
                     total
@@ -4155,7 +4482,7 @@ impl<B: HnsBackend, C: HnsClock> UtxoChainModule for HnsWalletRuntime<B, C> {
                     base_units: coin.coin.value,
                 },
                 confirmation_count: coin.coin.confirmation_count,
-                spendable: !coin.coin.name_locked && !coin.coin.coinbase,
+                spendable: is_ordinary_hns_spend_candidate(coin),
             })
             .collect())
     }
@@ -4846,7 +5173,7 @@ fn build_unsigned_payment(
         return Err(HnsWalletError::InvalidAmount);
     }
     coins.retain(|coin| {
-        !coin.coin.name_locked && !coin.coin.coinbase && coin.coin.confirmation_count > 0
+        is_ordinary_hns_spend_candidate(coin) && coin.coin.confirmation_count > 0
     });
     coins.sort_by(|left, right| {
         left.coin
@@ -5373,6 +5700,246 @@ impl From<serde_json::Error> for HnsWalletError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime_config() -> HnsRuntimeConfig {
+        HnsRuntimeConfig {
+            wallet_id: WalletId::new([11; 16]),
+            account_id: AccountId::new([12; 16]),
+            account_derivation_index: 7,
+            network: HnsNetwork::Regtest,
+            birthday_height: 100,
+            restore_lookahead: DEFAULT_RESTORE_LOOKAHEAD,
+            minimum_confirmations: 2,
+            dust_threshold: BaseUnits::new(DEFAULT_DUST_THRESHOLD),
+            value_operations_enabled: false,
+            settlement_enabled: false,
+        }
+    }
+
+    fn test_derived_address(role: KeyRole, program: u8) -> DerivedHnsAddress {
+        let config = test_runtime_config();
+        DerivedHnsAddress {
+            account_id: config.account_id,
+            derivation: DerivationReference {
+                role,
+                account: config.account_derivation_index,
+                change: 0,
+                index: 0,
+            },
+            address: format!("test-address-{program}"),
+            program: vec![program; 20],
+            used: false,
+        }
+    }
+
+    fn test_snapshot(epoch: u64) -> SnapshotBinding {
+        SnapshotBinding {
+            tip: ChainTip {
+                height: 500,
+                block_hash: [21; 32],
+                tree_root: [22; 32],
+            },
+            chain_epoch: epoch,
+        }
+    }
+
+    fn test_mempool(generation: u64) -> MempoolSnapshotBinding {
+        MempoolSnapshotBinding {
+            instance_nonce: [23; 32],
+            generation,
+        }
+    }
+
+    #[test]
+    fn authoritative_reconcile_account_rejects_derivation_rollback() {
+        let cached = HnsAccountRecord {
+            config: test_runtime_config(),
+            next_receive_index: 3,
+            next_change_index: 4,
+            next_name_index: 5,
+            external_scan_end: 102,
+            internal_scan_end: 103,
+            name_scan_end: 104,
+            last_used_external: Some(2),
+            last_used_internal: Some(3),
+            last_used_name: Some(4),
+        };
+        assert!(validate_authoritative_reconcile_account(&cached, 7, &cached, 7).is_ok());
+
+        let mut advanced = cached.clone();
+        advanced.next_change_index = 5;
+        advanced.internal_scan_end = 104;
+        assert!(validate_authoritative_reconcile_account(&cached, 7, &advanced, 8).is_ok());
+
+        let mut rolled_back = advanced.clone();
+        rolled_back.next_receive_index = 2;
+        assert!(matches!(
+            validate_authoritative_reconcile_account(&cached, 7, &rolled_back, 8),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+        assert!(matches!(
+            validate_authoritative_reconcile_account(&cached, 7, &advanced, 6),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+        assert!(matches!(
+            validate_authoritative_reconcile_account(&cached, 7, &advanced, 7),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+
+        let mut mismatched = advanced;
+        mismatched.config.minimum_confirmations += 1;
+        assert!(matches!(
+            validate_authoritative_reconcile_account(&cached, 7, &mismatched, 8),
+            Err(HnsWalletError::AccountConfigurationMismatch)
+        ));
+    }
+
+    #[test]
+    fn legacy_account_state_defaults_the_independent_name_scan() {
+        let account = HnsAccountRecord {
+            config: test_runtime_config(),
+            next_receive_index: 3,
+            next_change_index: 4,
+            next_name_index: 8,
+            external_scan_end: 102,
+            internal_scan_end: 103,
+            name_scan_end: 107,
+            last_used_external: Some(2),
+            last_used_internal: Some(3),
+            last_used_name: Some(7),
+        };
+        let mut encoded = serde_json::to_value(account).expect("encode account");
+        let object = encoded.as_object_mut().expect("account object");
+        object.remove("next_name_index");
+        object.remove("name_scan_end");
+        object.remove("last_used_name");
+        let decoded: HnsAccountRecord =
+            serde_json::from_value(encoded).expect("decode legacy account");
+        assert_eq!(decoded.next_name_index, 0);
+        assert_eq!(decoded.name_scan_end, 0);
+        assert_eq!(decoded.last_used_name, None);
+        assert_eq!(decoded.next_receive_index, 3);
+        assert_eq!(decoded.external_scan_end, 102);
+    }
+
+    #[test]
+    fn name_address_ids_are_role_discriminated_without_changing_coin_ids() {
+        let config = test_runtime_config();
+        let coin = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: config.account_derivation_index,
+            change: 0,
+            index: 9,
+        };
+        let name = DerivationReference {
+            role: KeyRole::HnsName,
+            ..coin
+        };
+        let coin_id = derived_address_record_id(&config, coin).expect("coin id");
+        let name_id = derived_address_record_id(&config, name).expect("name id");
+        assert_eq!(coin_id, derived_address_id(&config, 0, 9).to_vec());
+        assert_eq!(coin_id.len(), 40);
+        assert_eq!(name_id.len(), 41);
+        assert_ne!(coin_id, name_id);
+        assert!(derived_address_record_id(
+            &config,
+            DerivationReference { change: 1, ..name }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn separate_restore_queries_share_one_exact_snapshot() {
+        let binding = test_snapshot(4);
+        let mempool = test_mempool(5);
+        assert!(validate_same_restore_snapshot(binding, mempool, binding, mempool).is_ok());
+        assert!(
+            validate_same_restore_snapshot(binding, mempool, test_snapshot(6), mempool).is_err()
+        );
+        assert!(
+            validate_same_restore_snapshot(binding, mempool, binding, test_mempool(6)).is_err()
+        );
+        let restarted = MempoolSnapshotBinding {
+            instance_nonce: [24; 32],
+            generation: mempool.generation,
+        };
+        assert!(
+            validate_same_restore_snapshot(binding, mempool, binding, restarted).is_err()
+        );
+    }
+
+    #[test]
+    fn name_gap_and_next_index_never_shrink_after_restart_or_reorg() {
+        assert_eq!(required_scan_end(None, 500, 100), 500);
+        assert_eq!(required_scan_end(Some(3), 500, 100), 500);
+        assert_eq!(required_scan_end(Some(550), 500, 100), 650);
+        assert_eq!(advance_next_derivation_index(50, None), 50);
+        assert_eq!(advance_next_derivation_index(50, Some(3)), 50);
+        assert_eq!(advance_next_derivation_index(50, Some(80)), 81);
+        assert_eq!(
+            checked_scan_address_count(&[4_999, 4_999]).expect("full coin query"),
+            MAX_RESTORE_SCRIPTS_PER_QUERY
+        );
+        assert_eq!(
+            checked_scan_address_count(&[9_999]).expect("full name query"),
+            MAX_RESTORE_SCRIPTS_PER_QUERY
+        );
+        assert!(checked_scan_address_count(&[5_000, 5_000]).is_err());
+        assert_eq!(
+            MAX_RESTORE_ADDRESS_RECORDS,
+            MAX_RESTORE_SCRIPTS_PER_QUERY * 2
+        );
+    }
+
+    #[test]
+    fn name_outputs_are_tracked_but_never_ordinary_spend_candidates() {
+        let address = test_derived_address(KeyRole::HnsName, 31);
+        let tracked = reconcile_coins(
+            vec![IndexedWalletCoin {
+                coin: WalletCoin {
+                    outpoint: HnsOutpoint {
+                        transaction: TransactionHash::new([32; 32]),
+                        output_index: 1,
+                    },
+                    value: BaseUnits::new(1_000),
+                    confirmation_count: 10,
+                    coinbase: false,
+                    name_locked: false,
+                },
+                script_index: 0,
+                output_address: WalletAddressKey {
+                    version: 0,
+                    hash: address.program.clone(),
+                },
+            }],
+            &[address],
+        )
+        .expect("track name output");
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].derivation.role, KeyRole::HnsName);
+        assert!(!is_ordinary_hns_spend_candidate(&tracked[0]));
+    }
+
+    #[test]
+    fn duplicate_programs_and_unsupported_name_branches_fail_closed() {
+        let coin = test_derived_address(KeyRole::HnsCoin, 41);
+        let name = test_derived_address(KeyRole::HnsName, 41);
+        assert!(validate_disjoint_restore_programs(&[coin], &[name]).is_err());
+        assert!(restore_derivation_key(DerivationReference {
+            role: KeyRole::HnsName,
+            account: 7,
+            change: 1,
+            index: 0,
+        })
+        .is_err());
+        assert!(restore_derivation_key(DerivationReference {
+            role: KeyRole::HnsShakedex,
+            account: 7,
+            change: 0,
+            index: 0,
+        })
+        .is_err());
+    }
 
     #[test]
     fn coin_selection_excludes_name_locked_outputs_and_is_deterministic() {

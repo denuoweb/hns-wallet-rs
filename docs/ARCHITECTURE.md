@@ -35,7 +35,7 @@ semantics, approvals, and recoverable application workflows.
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state | proof codecs |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
-| `hns-wallet-ethereum` | native ETH, selected Helios policy, approved HTLC | general Ethereum provider |
+| `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events | raw keys/native commands or engine authority objects |
 | `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition | browser engine policy or availability claims |
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
@@ -82,10 +82,14 @@ node formula is used.
 
 Name evidence deliberately preserves the interval-committed Urkel proof/state/
 owner view separately from the node's current state/owner view. The proof root
-and height must exactly equal the bound tip. A released canonical NameState
-decoder is still required to bind owner, transfer, renewal and resource fields
-to those bytes; until it and a dedicated bounded `HnsName` key-role scan exist,
-known names are watch-only and raw resource/ownership claims are unavailable.
+and height must exactly equal the bound tip. Ordinary HNS coin branches and the
+domain-separated `HnsName` branch are scanned in separate bounded queries that
+must share the exact chain epoch/tip and mempool instance/generation. Name-role
+outputs may enter history but are excluded from ordinary balance, selection,
+reservation, and spendability. A released canonical NameState decoder is still
+required to bind owner, transfer, renewal and resource fields to the committed
+bytes; until it is integrated and qualified, known names are watch-only and raw
+resource/ownership claims are unavailable.
 
 The concrete synchronous HNS adapter now speaks the authenticated loopback
 `hns-node-rs` wallet RPC v1 boundary, pinned to node commit `5ed38d15`. It
@@ -131,6 +135,28 @@ ready-last sequencing supplies logical recovery rather than pretending they are
 one SQLite transaction. Pinned Kyoto does not durably expose headers, filter
 headers/filters, or its address book; those missing objects prevent production
 qualification. `BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED` remains false.
+
+## Ethereum containment boundary
+
+Ethereum currently exposes only deterministic offline account/receive
+derivation. Its synchronization, value-runtime, settlement-runtime, and
+mainnet qualification constants are immutable and false; history shares the
+synchronization gate. Capability discovery therefore advertises no online or
+value path. Native-transfer and HTLC
+construction/signing require opaque permits that the current source cannot
+issue, and signing additionally binds the derived key role/address and an exact
+approved maximum fee. The resulting bytes remain in a non-cloneable,
+zeroizing, redacted controlled-broadcast artifact with no public raw accessor.
+Chain ID 1 is rejected regardless of caller policy.
+
+Serializable execution observations remain structural fixtures, not proof
+authority. No release-flag-based public Helios provenance issuer exists; only a
+future embedded verifier may construct the opaque evidence permit needed to
+return an authoritative verified lock, and settlement permission is also
+required. This prevents
+ordinary JSON-RPC fields or caller-set booleans from advancing settlement while
+Helios proof production, persistence, rollback recovery, deployment approval,
+and qualification are absent.
 
 ## Future chains
 

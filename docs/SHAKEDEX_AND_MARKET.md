@@ -18,12 +18,13 @@ check these gates before validation or mutation. Existing sessions restored
 from legacy persisted records therefore cannot bypass the boundary.
 
 A published coherent canonical V2 protocol dependency, canonical NameState and
-resource decoding, a separately persisted bounded `HnsName` key-role scan,
-signed name transfer/finalize and fulfillment/recovery construction, concrete
-node evidence, live Denuo V2 publication and discovery, trusted browser
-approval, and restart/reorg/regtest qualification are required before any gate
-can change. Imported names remain watch-only, and node-supplied owner/resource
-hints cannot authorize seller actions. Reverse Dutch is deferred.
+resource decoding, qualification of the separately persisted bounded `HnsName`
+key-role scan, signed name transfer/finalize and fulfillment/recovery
+construction, concrete node evidence, live Denuo V2 publication and discovery,
+trusted browser approval, and restart/reorg/regtest qualification are required
+before any gate can change. The scan establishes key discovery, not ownership;
+imported names remain watch-only, and node-supplied owner/resource hints cannot
+authorize seller actions. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 
@@ -44,6 +45,8 @@ HNS/BTC uses SHA-256 native HTLCs on both chains. HNS/ETH uses the HNS script
 and the approved native-ETH contract. Neither pair is advertised because full
 HNS adapters, Bitcoin signed settlement, Helios runtime evidence, integrated
 success/refund/restart/reorg tests, and real-network qualification are absent.
+Ethereum synchronization, history, send, authoritative evidence, and settlement
+permits are unavailable, and chain ID 1 is rejected unconditionally.
 
 ## Price rounds and Denuo
 

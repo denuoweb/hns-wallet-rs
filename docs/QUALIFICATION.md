@@ -8,12 +8,12 @@ current commit has no recorded result for that gate.
 | --- | --- | --- | --- | --- | --- | --- |
 | Types/chain traits | pending consolidated gate | n/a | n/a | n/a | no external audit | qualification pending |
 | Encrypted store/schema v3 | pending consolidated gate | source includes migration checkpoint, encrypted typed CRUD/CAS/batches and restart-safe workflow rows | n/a | no device secure-store test | no DB benchmark/audit | qualification pending |
-| HNS wallet/names | adapter tranche pending consolidated gate | source includes authenticated loopback RPC configuration, strict HTTP/JSON parsing, atomic snapshot restoration, mempool-bound point reads, non-consuming approval authentication, atomic approval/workflow/reservation commit, exact signed-byte fee-quote persistence, and durable pre-submission `RequiresRebroadcast` recovery | source includes epoch-bound checkpoint rewind, ordered spender evidence, split current/proof evidence revalidation, and one-reconciliation fee-quote recovery | concrete adapter source pinned to node RPC v1 commit `5ed38d15`; no multi-process regtest run, released canonical fee algebra, canonical NameState decoder, or dedicated name-role scan | no resource measurement/audit | value runtime and fee-algebra gates unavailable; names watch-only |
+| HNS wallet/names | name-role/adapter tranche pending consolidated gate | source includes authenticated loopback RPC configuration, strict HTTP/JSON parsing, atomic coin/name-role snapshot restoration, encrypted monotonic scan state, mempool-bound point reads, non-consuming approval authentication, atomic approval/workflow/reservation commit, exact signed-byte fee-quote persistence, and durable pre-submission `RequiresRebroadcast` recovery | source includes epoch-bound checkpoint rewind, ordered spender evidence, split current/proof evidence revalidation, exact cross-scan binding rejection, and one-reconciliation fee-quote recovery | concrete adapter source pinned to node RPC v1 commit `5ed38d15`; no multi-process regtest run, released canonical fee algebra, canonical NameState decoder, or executed name-role qualification | no resource measurement/audit | value runtime and fee-algebra gates unavailable; names watch-only |
 | Provider core | pending consolidated gate | encrypted grants/tombstones/approvals/replays implemented | n/a | no installed-browser E2E | no audit | product integration pending |
 | Fixed-price Shakedex | prior unit baseline only | CAS journal source | evidence incomplete | no regtest/Denuo E2E | no audit | unavailable |
 | Market sessions | prior unit baseline only | CAS journal source | evidence incomplete | no pair E2E | no audit | unavailable |
 | Bitcoin Kyoto | current supervisor tranche pending consolidated gate | source includes BDK-first sync journal, bounded reconciliation chunks, restart resume, and pre-broadcast intent; pinned Kyoto header/filter/peer persistence unavailable | source queries exact canonical hash membership within a bounded retained window; no current execution evidence | no regtest/P2P/broadcast run | not measured/no audit | send and settlement hard-disabled |
-| Ethereum | prior unit baseline only | schema only | rollback negative baseline only | contract compiles in baseline; no local-chain/Helios run | no contract audit | unavailable |
+| Ethereum | containment tranche pending consolidated gate | offline derivation and dormant typed primitives only; no synchronization/history persistence | no restart/reorg evidence | deterministic contract compiled only in prior baseline; no embedded Helios/local-chain run; permits unavailable; mainnet denied | no contract audit | synchronization/history/send/signing/settlement unavailable |
 | ABI | prior unit baseline only | session field only | n/a | no platform ABI E2E | no audit | product integration pending |
 | Browser products | separate repositories | platform integration pending | n/a | no installed/signed E2E | no review | unavailable |
 
@@ -52,7 +52,7 @@ Baseline contract evidence SHA-256:
 - Kyoto invalid-PoW/filter/peer-consistency fixtures and birthday scans;
 - Ethereum local-chain lock/redeem/refund/replay/receiver/refund-address,
   reentrancy/event/rollback tests;
-- embedded Helios proof and persistence tests;
+- embedded proof-producing Helios runtime plus persistence/restart/reorg tests;
 - Chromium installed-extension/native-host and signed Android/iOS tests;
 - Kyoto disk/bandwidth/startup/mobile-memory benchmarks; and
 - independent review of key management, provider authority, HTLC scripts,

@@ -1,9 +1,11 @@
 # Ethereum narrow settlement module
 
-This is not a MetaMask-compatible provider. It supports deterministic account
-restoration with separate ordinary/swap derivation branches, native ETH
-receive/send, integer balance/history models, and internal calls to one approved
-native-ETH HTLC. There are no tokens, NFTs, arbitrary calldata/calls,
+This is not a MetaMask-compatible provider. The current source supports
+deterministic offline account derivation with separate ordinary/swap
+derivation branches plus dormant typed native-ETH/HTLC primitives. It does not
+currently expose synchronization, balance/history, send, signing, or settlement:
+their immutable release-qualification gates are false. There are no tokens,
+NFTs, arbitrary calldata/calls,
 deployment through websites, chain switching, custom RPCs, WalletConnect,
 staking, DeFi, or `window.ethereum`.
 
@@ -20,11 +22,26 @@ They may censor, omit, delay, correlate, equivocate below accepted proof/finalit
 thresholds, or make startup unavailable. Wrong-chain, stale, unfinalized,
 proof-incomplete, unexpected-code, and reorged evidence fails closed.
 
-The Rust crate currently defines and tests the complete chain/code/state/
-receipt/event binding policy, but does not embed a Helios runtime that produces
-cryptographically unforgeable evidence tokens. Ordinary JSON-RPC booleans are
-not production evidence. Therefore Ethereum synchronization and marketplace
-settlement are not complete.
+The Rust crate currently defines structural chain/code/state/receipt/event
+binding inputs, but does not embed a Helios runtime that produces
+cryptographically unforgeable evidence tokens. Public serializable observations
+and their verification booleans are not proof authority. An opaque Helios
+evidence permit that current source cannot issue is required before structural
+evidence can become a verified lock. Therefore Ethereum synchronization,
+history, sending, and marketplace settlement are unavailable.
+
+## Capability and permit boundary
+
+Capability discovery exposes deterministic offline receive derivation only.
+The exact synchronization, value-runtime, settlement-runtime, and mainnet
+qualification constants are independently `false`; history shares the false
+synchronization gate. Transaction constructors,
+fee-bound role/address signing, and authoritative lock verification require
+opaque permits with no available issuer. Typed builders, validators, and the
+contract are dormant source boundaries, not an executable runtime. Redeem
+preimages and signing intermediates are zeroized; the final signed bytes are a
+non-cloneable redacted controlled-broadcast artifact with no public raw-byte
+accessor.
 
 ## Contract
 
@@ -57,7 +74,13 @@ chain ID, address, runtime code hash, transaction value/inclusion, finalized
 block, current storage state, receipt status, and exact event before accepting
 a lock.
 
-The code hard-rejects a policy that attempts to enable chain ID 1. Mainnet can
-only be enabled by a reviewed source change after deterministic bytecode,
-Helios proof coverage/persistence, local-chain execution tests, rollback tests,
-and independent contract review are complete.
+Chain ID 1 is rejected unconditionally in this source; a caller-controlled
+serialized policy flag is never release authority. Native-transfer and HTLC
+construction require opaque value/settlement permits, and signing binds the
+derived account role/address plus a previously enforced exact maximum fee. None
+of those permits can currently be issued. Helios provenance has no public
+release-flag acquisition path, and verified settlement also requires the
+unavailable settlement permit. Mainnet can only be enabled by a
+reviewed source change after deterministic bytecode, Helios proof coverage and
+persistence, local-chain execution tests, rollback tests, and independent
+contract review are complete.

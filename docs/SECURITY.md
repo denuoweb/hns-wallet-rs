@@ -1,8 +1,9 @@
 # Security model
 
 Status: production-hardening source implemented; executable value paths remain
-release-gated. HNS send/settlement are disabled on every network and mainnet
-marketplace settlement is independently disabled.
+release-gated. HNS send/settlement and Ethereum synchronization/history/send/
+settlement are disabled on every network. Chain ID 1 and all other mainnet
+marketplace settlement are independently disabled.
 
 ## Trust boundaries
 
@@ -26,10 +27,11 @@ marketplace settlement is independently disabled.
   Loopback is not authorization: the wallet requires an exact, bounded,
   visible-ASCII Authorization value and rejects redirects, remote endpoints,
   ambiguous HTTP framing, and noncanonical RPC envelopes.
-- Ethereum availability still depends on configured consensus and execution
-  data providers. The selected Helios model is intended to verify consensus
-  and execution evidence, but providers may censor, omit, delay, correlate, or
-  make the wallet unavailable.
+- The source models Helios-shaped evidence but has no embedded verifier that can
+  produce its opaque authorization permit. Caller-serializable verification
+  booleans are structural consistency inputs only. A future selected Helios
+  runtime and its consensus/execution providers may still censor, omit, delay,
+  correlate, or make the wallet unavailable.
 
 ## Secrets
 
@@ -122,6 +124,12 @@ HNS evidence requests bind a chain epoch, tip and mempool generation across
 bounded sorted exact version-0 address pages. A nonzero node-instance nonce
 prevents a generation reset after restart from reusing an old cursor. Transaction,
 parent-output and outpoint-spend evidence must match that same snapshot.
+The separate ordinary-coin and `HnsName` scans must share that exact chain and
+mempool binding. Name-role outputs are tracked for history but excluded from
+ordinary balance, selection, reservation, and spendability.
+The scan reloads the authoritative encrypted account revision while holding the
+store mutex and rejects derivation high-water rollback before replacing cache
+state, so concurrent workflow preparation cannot be lost to stale reconciliation.
 Settlement lock verification binds the exact funding outpoint, output index,
 script, terms and confirmation policy, and preimage observation accepts only the
 exact verified redeem witness.
@@ -133,11 +141,24 @@ view. Because released protocol crates do not yet decode canonical NameState
 owner/resource/transfer/renewal fields, imported names remain watch-only;
 current/proof owner hints and raw resource bytes are not authorization evidence.
 
+Ethereum has no embedded Helios proof producer in this revision. Its exact
+synchronization, value-runtime, settlement-runtime, and mainnet gates are
+immutable and false; history shares the synchronization gate. Opaque permits
+for transaction construction and verified locks cannot be issued. Helios
+provenance has no public release-flag issuer and verified locks
+also require settlement permission. Redeem preimages, signing intermediates,
+and final signed bytes remain contained: preimages are non-Clone and zeroize on
+drop, transient signing buffers use zeroizing owners, and the final signed
+artifact is non-Clone, zeroizing, and redacted with no public raw-byte accessor.
+Serializable observation fields are structural data only and cannot authorize
+settlement.
+
 Current cross-chain code is not qualified for live value. The concrete HNS node
 adapter source is present, but its consolidated qualification, released
 canonical HNS name-state/resource decoding, a published canonical HNS
 settlement profile, released canonical HSD sigop-adjusted fee algebra, Bitcoin
-supervisor qualification, Helios proof construction, restart/reorg
+supervisor qualification, embedded Helios proof construction/persistence,
+name-role scan qualification, restart/reorg
 demonstrations, real-chain tests, resource benchmarks, and independent review
 remain blockers.
 

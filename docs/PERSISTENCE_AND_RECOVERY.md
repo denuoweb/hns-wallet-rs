@@ -53,6 +53,27 @@ and complete reservation set, refreshes the committed account cache, and returns
 the persisted artifact without deriving or reserving another change address.
 Mismatched, expired, or advanced-stage retries fail closed.
 
+## HNS name-role derivations
+
+The `HnsName` branch has independent encrypted next-index, scan-end, and
+last-used state. Legacy account records deserialize with deterministic defaults,
+while legacy HNS coin address identifiers remain unchanged. Name-role address
+identifiers include the role so the same branch/index cannot collide with an
+ordinary receive address. A complete reconciliation persists the combined
+account/address state only after the separate coin and name queries prove the
+same chain epoch/tip and mempool instance/generation.
+Reconciliation reloads the full authoritative account and its CAS revision
+after taking the store mutex, rejects any derivation high-water rollback, and
+holds that ordering through cache installation; a concurrently prepared send or
+settlement cannot be overwritten by a stale scan clone.
+
+Name-role scan advancement is monotonic and bounded across restart and reorg.
+Outputs to discovered name keys remain visible to history/reconciliation but
+are excluded from ordinary balance, input selection, reservations, and
+spendable UTXOs. This persistence establishes key discovery only: it neither
+populates authoritative name-owner outpoints nor converts current/proof owner
+hints into ownership before canonical NameState decoding is integrated.
+
 Before HNS submission, the runtime loads the exact persisted signed bytes and
 prior quote, re-quotes only those bytes, and atomically saves the refreshed
 quote with `RequiresRebroadcast` before invoking the node. That durable state
@@ -74,11 +95,13 @@ The product runtime must:
 4. finish any plaintext-migration checkpoint before exposing wallet state;
 5. load persisted workflows, permission generations/tombstones, and the last
    consistent chain checkpoints;
-6. resume HNS, Kyoto, and the selected Ethereum synchronization adapter;
+6. resume HNS and Kyoto; keep Ethereum synchronization unavailable until its
+   selected embedded adapter is implemented and qualified;
 7. reconcile mempools, confirmations, replacements, and reorgs from atomic,
    validated evidence;
-8. revalidate split committed-proof/current name views and Shakedex listings,
-   while leaving name ownership watch-only until canonical state decoding;
+8. restore the bounded name-role scan, revalidate split committed-proof/current
+   name views and Shakedex listings, and leave ownership watch-only until
+   canonical state decoding;
 9. expire price rounds, intents, fill grants, persisted workflow approvals, and replay rows only
    after their authenticated metadata verifies;
 10. restore swap sessions and independently verify every recorded funding,
@@ -88,15 +111,20 @@ The product runtime must:
 13. surface user actions without automatically moving value.
 
 The HNS source implements the concrete synchronous authenticated node adapter,
-bounded chain/mempool snapshot reconciliation, and prepared-transaction
-recovery. The learned durable chain epoch and process-instance/generation pair
-remain exact across gap expansion and all point reads in one reconciliation;
+bounded coin/name-role chain/mempool snapshot reconciliation, and prepared-
+transaction recovery. The learned durable chain epoch and process-instance/
+generation pair remain exact across both scans, gap expansion, and all point
+reads in one reconciliation;
 they are intentionally reacquired after process restart rather than persisted
 as timeless authority. Exact final-signed fee quotes are wired and persisted,
 but released `hns-script` 0.1 lacks the canonical policy-size fee algebra needed
 for independent validation; its explicit qualification gate remains false. The
 complete multi-chain product supervisor and current qualification evidence are
 not integrated, so HNS value operations remain release-gated.
+
+No Ethereum synchronization, history, or recovery checkpoint exists to resume
+in this revision. Ethereum account and receive-target derivation is offline;
+online evidence and value paths remain behind unavailable opaque permits.
 
 ## Bitcoin Kyoto recovery journal
 

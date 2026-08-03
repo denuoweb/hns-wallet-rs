@@ -46,6 +46,12 @@ add a nonzero process-instance nonce and generation; both remain exact across
 all continuations, gap-limit expansion, transaction/parent reads, and workflow
 reconciliation. Any difference discards the partial snapshot.
 
+The ordinary receive/change branches and the domain-separated `HnsName` branch
+use separate bounded script queries. The name query is accepted only under the
+exact chain binding and mempool binding learned by the coin query, so neither
+query can reduce the other's lookahead or combine observations from different
+node views.
+
 ScriptId derivation hashes the canonical address bytes
 `[version, hash_length_u8, hash...]` with BLAKE2b-256, sorts the resulting IDs,
 and retains a checked reverse map to wallet derivations. Response hex is
@@ -99,12 +105,13 @@ This adapter removes the missing source boundary; it does not by itself enable
 value movement. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` remains `false`, runtime
 configuration rejects HNS send and settlement on every network, imported names
 remain watch-only, and Shakedex/HTLC descriptor or preimage transport remains
-unavailable until published canonical `hns-rs` 0.2 types, dedicated name-role
-scanning, canonical fee-quote algebra, product integration, and the recorded
-qualification gates land. Ordinary HNS send and the exposed settlement lock,
-redeem, and refund paths are within this quote boundary. Name transfer and
-FINALIZE transaction construction are not exposed here and are not implied to
-be complete.
+unavailable until published canonical `hns-rs` 0.2 types, canonical NameState/
+resource decoding, canonical fee-quote algebra, product integration, and the
+recorded qualification gates land. The separately persisted name-role scan is
+source-only key discovery and does not authorize ownership. Ordinary HNS send
+and the exposed settlement lock, redeem, and refund paths are within this quote
+boundary. Name transfer and FINALIZE transaction construction are not exposed
+here and are not implied to be complete.
 
 No local build or test result was produced for this tranche. The next evidence
 event is the single consolidated CI gate described in
