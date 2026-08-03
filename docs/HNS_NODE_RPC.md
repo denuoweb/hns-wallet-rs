@@ -2,7 +2,7 @@
 
 `HnsNodeRpcBackend` is the concrete synchronous wallet-side adapter for the
 authenticated `hns-node-rs` wallet RPC v1 contract frozen at node commit
-`74f7ae36ddfd4a396451d33a2bca1c71a04f8a75`. It implements `HnsBackend`; the
+`5ed38d15d50098191b4473d4dda66a93d4e3e6fc`. It implements `HnsBackend`; the
 node supplies canonical chain evidence and broadcast admission while the wallet
 alone derives keys, signs, approves, and persists workflows. The node never
 signs.
@@ -54,12 +54,29 @@ outpoint echoes, cursor lengths, collection bounds, fee evidence, inclusion
 counts, optional transaction positions, and optional exact block/admission
 times are validated before projection into wallet types.
 
-Fee-response target, source, sample count, and rate bounds are validated, but
-the returned unit is atomic units per 1,000 HSD sigop-adjusted policy virtual
-bytes. The dormant wallet transaction builder still sizes fees by transaction
-weight and therefore must not use that value as release authority. Canonical
-policy-size integration is an explicit HNS value-release blocker; the global
-value gate prevents the mismatched calculation from becoming executable.
+`quote_transaction_fee` binds the exact final signed transaction bytes to the
+current chain epoch/tip, mempool instance/generation, and requested confirmation
+target. The adapter verifies canonical raw bytes, txid, transaction weight,
+policy virtual bytes, sigop cost, rate source/sample bounds, actual fee,
+minimum fee, shortfall, and the node's `meets_minimum` relationship before
+projecting the quote into wallet state.
+
+The send and exposed settlement signing paths are wired to sign first and quote
+those exact bytes. Authorization peeks at the authenticated approval without
+consuming it; after signing and quote validation, one SQLite transaction
+consumes the unchanged approval, persists the authorized workflow with exact
+raw bytes and quote, and activates the matching input reservations. Immediately
+before submission the wallet re-quotes only the persisted bytes, commits the
+refreshed quote and `RequiresRebroadcast` state, and then submits those same
+bytes. A stale snapshot or temporarily unavailable quote input permits exactly
+one complete reconciliation and one quote retry; there is no polling loop.
+
+The released `hns-script` 0.1 API does not expose the canonical HSD
+sigop-adjusted policy-size/fee algebra needed for an independent wallet check
+of the node's minimum. The wallet must not copy that consensus/policy formula.
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` therefore remains `false`, so the
+wired quote path cannot authorize value until a released canonical helper is
+integrated and qualified.
 
 Confirmed coinbase identity is preserved exactly, but coinbase outputs are
 conservatively excluded from selection. No local maturity constant is invented;
@@ -83,7 +100,11 @@ value movement. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` remains `false`, runtime
 configuration rejects HNS send and settlement on every network, imported names
 remain watch-only, and Shakedex/HTLC descriptor or preimage transport remains
 unavailable until published canonical `hns-rs` 0.2 types, dedicated name-role
-scanning, product integration, and the recorded qualification gates land.
+scanning, canonical fee-quote algebra, product integration, and the recorded
+qualification gates land. Ordinary HNS send and the exposed settlement lock,
+redeem, and refund paths are within this quote boundary. Name transfer and
+FINALIZE transaction construction are not exposed here and are not implied to
+be complete.
 
 No local build or test result was produced for this tranche. The next evidence
 event is the single consolidated CI gate described in

@@ -82,6 +82,16 @@ The library supplies the policy and state boundary; the current browser UI does
 not yet provide every approval screen. No mainnet enablement may infer approval
 from a unit test.
 
+For ordinary HNS sends, the persisted workflow approval is authenticated
+without consumption before signing. Only after the exact final signed bytes
+receive a bound fee quote does one immediate transaction re-authenticate and
+consume the unchanged approval, persist those bytes and quote, and activate the
+matching reservations. Submission re-quotes the persisted bytes and records
+`RequiresRebroadcast` before the node call. The released canonical
+sigop-adjusted fee algebra is still unavailable, so its explicit false gate
+prevents this source wiring from authorizing value and the wallet does not copy
+the node's policy formula.
+
 ## Provider defenses
 
 The provider core enforces secure exact origins (with loopback HTTP allowed for
@@ -126,9 +136,10 @@ current/proof owner hints and raw resource bytes are not authorization evidence.
 Current cross-chain code is not qualified for live value. The concrete HNS node
 adapter source is present, but its consolidated qualification, released
 canonical HNS name-state/resource decoding, a published canonical HNS
-settlement profile, canonical HSD sigop-adjusted fee sizing, Bitcoin supervisor
-qualification, Helios proof construction, restart/reorg demonstrations,
-real-chain tests, resource benchmarks, and independent review remain blockers.
+settlement profile, released canonical HSD sigop-adjusted fee algebra, Bitcoin
+supervisor qualification, Helios proof construction, restart/reorg
+demonstrations, real-chain tests, resource benchmarks, and independent review
+remain blockers.
 
 Bitcoin swap keys now have a deterministic application-private HKDF domain
 which is disjoint from ordinary BIP84 receive/change derivation and binds the

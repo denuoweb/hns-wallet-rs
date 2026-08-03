@@ -29,6 +29,14 @@ the wallet account, workflow, and all input-reservation saves/deletes together.
 Duplicate `(entity kind, record ID)` operations and stale writers fail before a
 partial batch becomes visible. Secret record kinds are immutable.
 
+HNS authorization can authenticate and return a pending approval without
+consuming it. After exact signed-byte fee quoting succeeds, a bounded immediate
+transaction re-authenticates that unchanged approval together with the current
+workflow and reservation revisions, activates the reservations, saves the
+authorized workflow/raw bytes/quote, and only then deletes the approval. Any
+stale revision, changed approval, signing error, or quote error leaves the
+approval and workflow state unconsumed.
+
 ## HNS change derivations
 
 Send preparation and settlement-lock preparation commit account change-index
@@ -44,6 +52,14 @@ workflow first, verifies the exact account/request/fee terms, signed artifact,
 and complete reservation set, refreshes the committed account cache, and returns
 the persisted artifact without deriving or reserving another change address.
 Mismatched, expired, or advanced-stage retries fail closed.
+
+Before HNS submission, the runtime loads the exact persisted signed bytes and
+prior quote, re-quotes only those bytes, and atomically saves the refreshed
+quote with `RequiresRebroadcast` before invoking the node. That durable state
+means submission may have started even if the caller sees an error or the
+process exits; recovery rebroadcasts the same persisted bytes, never caller
+replacement bytes. Stale snapshot or unavailable quote input triggers at most
+one complete reconciliation and one quote retry, with no polling loop.
 
 ## Required startup sequence
 
@@ -76,9 +92,11 @@ bounded chain/mempool snapshot reconciliation, and prepared-transaction
 recovery. The learned durable chain epoch and process-instance/generation pair
 remain exact across gap expansion and all point reads in one reconciliation;
 they are intentionally reacquired after process restart rather than persisted
-as timeless authority. The complete multi-chain product supervisor and current
-qualification evidence are not integrated, so HNS value operations remain
-release-gated.
+as timeless authority. Exact final-signed fee quotes are wired and persisted,
+but released `hns-script` 0.1 lacks the canonical policy-size fee algebra needed
+for independent validation; its explicit qualification gate remains false. The
+complete multi-chain product supervisor and current qualification evidence are
+not integrated, so HNS value operations remain release-gated.
 
 ## Bitcoin Kyoto recovery journal
 

@@ -974,6 +974,121 @@ impl WalletStore {
         Ok(next)
     }
 
+    /// Atomically consumes an already-authenticated approval, advances one
+    /// workflow revision, and applies its reservation/entity changes. A
+    /// missing, expired, or changed approval returns None without advancing
+    /// the workflow. No validation failure consumes the approval.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_approval_and_save_workflow_with_entity_batch<
+        W: Serialize,
+        E: Serialize,
+    >(
+        &mut self,
+        expected_approval: &PendingApproval,
+        now_unix: u64,
+        id: WorkflowId,
+        kind: WorkflowKind,
+        expected_revision: u64,
+        state: &W,
+        irreversible_broadcast_prepared: bool,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+    ) -> Result<Option<u64>, StoreError> {
+        let encoded_workflow = Zeroizing::new(serde_json::to_vec(state)?);
+        if encoded_workflow.is_empty() || encoded_workflow.len() > MAX_STATE_BYTES {
+            return Err(StoreError::RecordTooLarge);
+        }
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(current_approval) = authenticated_pending_approval(
+            &transaction,
+            key,
+            &self.database_id,
+            expected_approval.id,
+        )?
+        else {
+            return Ok(None);
+        };
+        if current_approval.expires_at_unix <= now_unix {
+            transaction.execute(
+                "DELETE FROM private_pending_approvals WHERE id=?1",
+                params![expected_approval.id.as_bytes().as_slice()],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        }
+        if current_approval.origin.as_str() != expected_approval.origin.as_str()
+            || current_approval.expires_at_unix != expected_approval.expires_at_unix
+            || current_approval.request_json.as_slice()
+                != expected_approval.request_json.as_slice()
+        {
+            return Ok(None);
+        }
+        let actual =
+            authenticated_workflow_revision(&transaction, key, &self.database_id, id, kind)?;
+        if actual != expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let encrypted_entities = authenticate_entity_batch(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+        let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        let encrypted_workflow = encrypt_record(
+            key,
+            &self.database_id,
+            &workflow_label(kind),
+            &revisioned_aad_id(
+                id.as_bytes(),
+                next,
+                now_unix,
+                Some(irreversible_broadcast_prepared),
+            )?,
+            &encoded_workflow,
+        )?;
+        write_entity_batch_in_transaction(
+            &transaction,
+            entity_kind,
+            &encrypted_entities,
+            deletes,
+        )?;
+        transaction.execute(
+            "DELETE FROM private_pending_approvals WHERE id=?1",
+            params![expected_approval.id.as_bytes().as_slice()],
+        )?;
+        transaction.execute(
+            "INSERT INTO workflows(
+                 id, kind, revision, state_json, broadcast_prepared, updated_at_unix,
+                 encryption_version
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)
+             ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,
+             state_json=excluded.state_json, broadcast_prepared=excluded.broadcast_prepared,
+             updated_at_unix=excluded.updated_at_unix,
+             encryption_version=excluded.encryption_version",
+            params![
+                id.as_bytes().as_slice(),
+                workflow_kind(kind),
+                next,
+                encrypted_workflow,
+                irreversible_broadcast_prepared,
+                now_unix,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(Some(next))
+    }
+
     /// Atomically advances a workflow, its wallet-account record, and a
     /// bounded second entity set. Every existing revision and ciphertext is
     /// authenticated before the first write. Duplicate `(kind, id)` operations
@@ -1519,6 +1634,24 @@ impl WalletStore {
         Ok(())
     }
 
+    /// Authenticates and decrypts one live approval without consuming it.
+    /// This permits signing and external evidence checks to complete before
+    /// the approval participates in the final workflow CAS.
+    pub fn get_pending_approval(
+        &self,
+        id: ApprovalId,
+        now_unix: u64,
+    ) -> Result<Option<PendingApproval>, StoreError> {
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        Ok(authenticated_pending_approval(
+            &self.connection,
+            key,
+            &self.database_id,
+            id,
+        )?
+        .filter(|approval| approval.expires_at_unix > now_unix))
+    }
+
     /// Atomically removes and decrypts a pending approval. Expired approvals
     /// are deleted but never returned to the caller.
     pub fn take_pending_approval(
@@ -1530,33 +1663,12 @@ impl WalletStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(Vec<u8>, Vec<u8>, u64)> = transaction
-            .query_row(
-                "SELECT origin_token, encrypted_record, expires_at_unix
-                 FROM private_pending_approvals WHERE id=?1",
-                params![id.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((origin_token, encrypted, expires_at_unix)) = row else {
+        let Some(approval) =
+            authenticated_pending_approval(&transaction, key, &self.database_id, id)?
+        else {
             return Ok(None);
         };
-        let origin_token: [u8; 32] = origin_token
-            .try_into()
-            .map_err(|_| StoreError::CorruptMetadata)?;
-        let clear = decrypt_record(
-            key,
-            &self.database_id,
-            "pending_approval",
-            &approval_record_id(&id, &origin_token, expires_at_unix),
-            &encrypted,
-        )?;
-        let (origin, request_json) = decode_origin_payload(&clear)?;
-        let expected_token = origin_lookup_token(key, &self.database_id, &origin)?;
-        if origin_token != expected_token {
-            return Err(StoreError::Encryption);
-        }
-        if expires_at_unix <= now_unix {
+        if approval.expires_at_unix <= now_unix {
             transaction.execute(
                 "DELETE FROM private_pending_approvals WHERE id=?1",
                 params![id.as_bytes().as_slice()],
@@ -1569,12 +1681,7 @@ impl WalletStore {
             params![id.as_bytes().as_slice()],
         )?;
         transaction.commit()?;
-        Ok(Some(PendingApproval {
-            id,
-            origin,
-            request_json,
-            expires_at_unix,
-        }))
+        Ok(Some(approval))
     }
 
     /// Atomically consumes a request nonce. Duplicate live nonces fail.
@@ -1892,6 +1999,46 @@ fn prepare_entity_batch<E: Serialize>(
         }
     }
     Ok(prepared)
+}
+
+fn authenticated_pending_approval(
+    connection: &Connection,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    id: ApprovalId,
+) -> Result<Option<PendingApproval>, StoreError> {
+    let row: Option<(Vec<u8>, Vec<u8>, u64)> = connection
+        .query_row(
+            "SELECT origin_token, encrypted_record, expires_at_unix
+             FROM private_pending_approvals WHERE id=?1",
+            params![id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((origin_token, encrypted, expires_at_unix)) = row else {
+        return Ok(None);
+    };
+    let origin_token: [u8; 32] = origin_token
+        .try_into()
+        .map_err(|_| StoreError::CorruptMetadata)?;
+    let clear = decrypt_record(
+        key,
+        database_id,
+        "pending_approval",
+        &approval_record_id(&id, &origin_token, expires_at_unix),
+        &encrypted,
+    )?;
+    let (origin, request_json) = decode_origin_payload(&clear)?;
+    let expected_token = origin_lookup_token(key, database_id, &origin)?;
+    if origin_token != expected_token {
+        return Err(StoreError::Encryption);
+    }
+    Ok(Some(PendingApproval {
+        id,
+        origin,
+        request_json,
+        expires_at_unix,
+    }))
 }
 
 fn authenticated_workflow_revision(

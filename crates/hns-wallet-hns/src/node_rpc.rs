@@ -28,12 +28,13 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     BlockHashEvidence, ChainTip, ConfirmedWalletPage, ConfirmedWalletPageRequest, HistoryEntry,
-    HnsBackend, HnsOutpoint, HnsWalletError, IndexedWalletCoin, MempoolSnapshotBinding,
-    MempoolWalletPage, MempoolWalletPageRequest, NameEvidence, NameProofResponse,
-    OutpointSpendEntry, OutpointSpendEvidence, SnapshotBinding, SpendingTransactionEvidence,
-    TransactionEvidence, TransactionInclusion, TransactionStatus, WalletAddressKey, WalletCoin,
-    MAX_HISTORY_RESULTS, MAX_MEMPOOL_SCAN_RESULTS, MAX_RESTORE_SCRIPTS_PER_QUERY,
-    MAX_OUTPOINT_SPEND_BATCH, MAX_SCAN_CURSOR_BYTES, MAX_SCAN_PAGE_RESULTS,
+    HnsBackend, HnsFeeRateSource, HnsOutpoint, HnsTransactionFeeQuote, HnsWalletError,
+    IndexedWalletCoin, MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest,
+    NameEvidence, NameProofResponse, OutpointSpendEntry, OutpointSpendEvidence, SnapshotBinding,
+    SpendingTransactionEvidence, TransactionEvidence, TransactionInclusion, TransactionStatus,
+    WalletAddressKey, WalletCoin, MAX_HISTORY_RESULTS, MAX_MEMPOOL_SCAN_RESULTS,
+    MAX_OUTPOINT_SPEND_BATCH, MAX_RESTORE_SCRIPTS_PER_QUERY, MAX_SCAN_CURSOR_BYTES,
+    MAX_SCAN_PAGE_RESULTS,
 };
 
 const WALLET_RPC_API_VERSION: u16 = 1;
@@ -279,6 +280,12 @@ impl HnsNodeRpcBackend {
         }
         if error.code == "invalid_cursor" {
             return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        if error.code == "fee_quote_input_unavailable" {
+            return Err(HnsWalletError::FeeQuoteInputUnavailable);
+        }
+        if error.code == "invalid_fee_quote_transaction" {
+            return Err(HnsWalletError::InvalidFeeQuoteTransaction);
         }
         Err(backend_error(error_code_message(&error.code)))
     }
@@ -659,6 +666,8 @@ fn error_code_message(code: &str) -> &'static str {
         "name_has_no_owner" => "node name evidence has no owner",
         "transaction_orphan" => "node rejected an orphan transaction",
         "transaction_rejected" => "node rejected the transaction",
+        "invalid_fee_quote_transaction" => "node rejected the fee quote transaction",
+        "fee_quote_input_unavailable" => "node could not resolve a fee quote input",
         _ => "node wallet RPC returned an unknown error",
     }
 }
@@ -687,8 +696,10 @@ fn validate_rpc_error(status: u16, error: &RpcWireError) -> Result<(), HnsWallet
         "invalid_contract" => (409, false),
         "stale_snapshot" => (409, true),
         "transaction_orphan" => (409, true),
+        "fee_quote_input_unavailable" => (409, true),
         "contract_registry_full" => (507, false),
         "transaction_rejected" => (422, false),
+        "invalid_fee_quote_transaction" => (422, false),
         _ => return Err(protocol_error()),
     };
     if status != expected.0 || error.retryable != expected.1 {
@@ -767,9 +778,13 @@ fn validate_rpc_error(status: u16, error: &RpcWireError) -> Result<(), HnsWallet
             == "the bound chain or mempool generation changed; restart this reconciliation",
         "transaction_orphan" => error.message
             == "the transaction has unresolved inputs and was not relayed as accepted",
+        "fee_quote_input_unavailable" => error.message
+            == "an input coin is unavailable in the bound active chain and mempool snapshot",
         "contract_registry_full" => {
             error.message == "the append-only tracked-contract registry is full"
         }
+        "invalid_fee_quote_transaction" => error.message
+            == "the raw transaction is not eligible for a Handshake fee quote",
         _ => false,
     };
     if !message_is_valid {
@@ -964,6 +979,27 @@ struct WireFeeEstimate {
     atomic_units_per_kvb: u64,
     sampled_transactions: usize,
     source: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireTransactionFeeQuote {
+    txid: String,
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    mempool_instance_nonce: String,
+    mempool_generation: u64,
+    target_blocks: u32,
+    rate_atomic_units_per_1000_policy_vbytes: u64,
+    rate_sample_count: usize,
+    rate_source: String,
+    transaction_weight: usize,
+    transaction_sigops: u32,
+    sigop_adjusted_policy_vbytes: usize,
+    minimum_policy_fee_atomic_units: u64,
+    actual_fee_atomic_units: u64,
+    meets_minimum_policy_fee: bool,
+    minimum_policy_fee_shortfall_atomic_units: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1688,6 +1724,94 @@ impl HnsBackend for HnsNodeRpcBackend {
         }
         let _ = response.newly_admitted;
         Ok(returned)
+    }
+
+    fn quote_transaction_fee(
+        &self,
+        raw: &[u8],
+        target_blocks: u16,
+        binding: SnapshotBinding,
+        expected_mempool: MempoolSnapshotBinding,
+    ) -> Result<HnsTransactionFeeQuote, HnsWalletError> {
+        if raw.is_empty()
+            || raw.len() > MAX_TRANSACTION_RAW_SIZE.min(1_000_000)
+            || target_blocks == 0
+            || target_blocks > MAX_FEE_TARGET_BLOCKS
+            || expected_mempool.instance_nonce == [0; 32]
+        {
+            return Err(protocol_error());
+        }
+        let transaction = Transaction::decode(raw).map_err(|_| protocol_error())?;
+        if transaction.encode().map_err(|_| protocol_error())? != raw {
+            return Err(protocol_error());
+        }
+        let transaction_weight = transaction.weight().map_err(|_| protocol_error())?;
+        let expected_txid = transaction
+            .transaction_hash()
+            .map_err(|_| protocol_error())?;
+        let expected_txid = TransactionHash::new(expected_txid.into_bytes());
+        let response: WireTransactionFeeQuote = self.rpc(serde_json::json!({
+            "method": "quote_transaction_fee",
+            "params": {
+                "transaction_hex": hex::encode(raw),
+                "target_blocks": target_blocks,
+                "expected_chain_epoch": binding.chain_epoch,
+                "expected_mempool": expected_mempool_json(expected_mempool),
+            },
+        }))?;
+        require_binding(response.chain_epoch, response.tip, binding)?;
+        let mempool = MempoolSnapshotBinding {
+            instance_nonce: decode_hex_32(&response.mempool_instance_nonce)?,
+            generation: response.mempool_generation,
+        };
+        if mempool != expected_mempool {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        let rate_source = match response.rate_source.as_str() {
+            "minimum_relay" if response.rate_sample_count == 0 => {
+                HnsFeeRateSource::MinimumRelay
+            }
+            "mempool" if response.rate_sample_count > 0 => HnsFeeRateSource::Mempool,
+            _ => return Err(protocol_error()),
+        };
+        let minimum_policy_fee =
+            BaseUnits::new(u128::from(response.minimum_policy_fee_atomic_units));
+        let actual_fee = BaseUnits::new(u128::from(response.actual_fee_atomic_units));
+        let minimum_policy_fee_shortfall =
+            BaseUnits::new(u128::from(response.minimum_policy_fee_shortfall_atomic_units));
+        let expected_shortfall = minimum_policy_fee
+            .get()
+            .saturating_sub(actual_fee.get());
+        if TransactionHash::new(decode_hex_32(&response.txid)?) != expected_txid
+            || response.target_blocks != u32::from(target_blocks)
+            || response.rate_atomic_units_per_1000_policy_vbytes < 1_000
+            || response.rate_sample_count > MAX_FEE_SAMPLES
+            || response.transaction_weight != transaction_weight
+            || response.transaction_weight == 0
+            || response.sigop_adjusted_policy_vbytes == 0
+            || response.meets_minimum_policy_fee
+                != (actual_fee >= minimum_policy_fee)
+            || minimum_policy_fee_shortfall.get() != expected_shortfall
+        {
+            return Err(protocol_error());
+        }
+        Ok(HnsTransactionFeeQuote {
+            txid: expected_txid,
+            binding,
+            mempool,
+            target_blocks,
+            rate_atomic_units_per_1000_policy_vbytes: response
+                .rate_atomic_units_per_1000_policy_vbytes,
+            rate_sample_count: response.rate_sample_count,
+            rate_source,
+            transaction_weight: response.transaction_weight,
+            transaction_sigops: response.transaction_sigops,
+            sigop_adjusted_policy_vbytes: response.sigop_adjusted_policy_vbytes,
+            minimum_policy_fee,
+            actual_fee,
+            meets_minimum_policy_fee: response.meets_minimum_policy_fee,
+            minimum_policy_fee_shortfall,
+        })
     }
 
     fn estimate_fee_rate(&self, target_blocks: u16) -> Result<BaseUnits, HnsWalletError> {

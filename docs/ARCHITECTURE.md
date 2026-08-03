@@ -28,7 +28,7 @@ semantics, approvals, and recoverable application workflows.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `hns-wallet-types` | IDs, integer amounts, capabilities, UI-safe summaries | consensus/wire types |
-| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, provider permission tombstones, persisted workflow approvals/replays | browser storage, ABI v2 authority handles, or remote truth |
+| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, atomic approval-consume/workflow/reservation commits, provider permission tombstones, persisted workflow approvals/replays | browser storage, ABI v2 authority handles, or remote truth |
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | HNS key roles, address/coin/name evidence and workflows | canonical encodings |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
@@ -68,6 +68,18 @@ workflow, and every input reservation. The cache changes only after commit.
 Failures therefore cannot burn or reuse a change derivation and cannot leave a
 partial losing workflow.
 
+HNS value authorization is additionally bound to an exact final-signed
+transaction fee quote. The approval is first read without mutation; signing and
+quote validation complete before one store transaction consumes the unchanged
+approval, saves the authorized exact bytes and quote, and activates the input
+reservations. Broadcast re-quotes only those persisted bytes, saves the
+refreshed quote with `RequiresRebroadcast` before submission, and allows at most
+one full reconciliation and one retry for stale or unavailable quote evidence.
+The released `hns-script` 0.1 API lacks the canonical sigop-adjusted fee algebra
+needed to independently verify the quoted minimum, so
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains false and no local copy of the
+node formula is used.
+
 Name evidence deliberately preserves the interval-committed Urkel proof/state/
 owner view separately from the node's current state/owner view. The proof root
 and height must exactly equal the bound tip. A released canonical NameState
@@ -76,7 +88,7 @@ to those bytes; until it and a dedicated bounded `HnsName` key-role scan exist,
 known names are watch-only and raw resource/ownership claims are unavailable.
 
 The concrete synchronous HNS adapter now speaks the authenticated loopback
-`hns-node-rs` wallet RPC v1 boundary, pinned to node commit `74f7ae36`. It
+`hns-node-rs` wallet RPC v1 boundary, pinned to node commit `5ed38d15`. It
 derives canonical ScriptIds, enforces full chain/mempool bindings, and validates
 HTTP, JSON, transaction, spender, and name evidence without giving the node
 signing authority. The complete enclosing product runtime and qualification
