@@ -1645,11 +1645,16 @@ mod tests {
         assert!(second.seen_request_ids.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn production_tranche_persistent_control_reopens_locked_and_preserves_only_permission_authority()
     {
+        use std::os::unix::fs::PermissionsExt as _;
+
         const PASSPHRASE: &str = "correct horse battery staple";
         let directory = tempfile::tempdir().expect("temporary wallet directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private wallet directory permissions");
         let database_path = directory.path().join("wallet.sqlite3");
         let first_store = SharedWalletStore::new(
             WalletStore::create(&database_path, PASSPHRASE).expect("create store"),
@@ -1676,7 +1681,7 @@ mod tests {
         assert!(matches!(
             first.provider_capabilities(handle(), 1, NOW_MS),
             Err(ServiceFailure {
-                code: ServiceErrorCode::PersistenceFailure,
+                code: ServiceErrorCode::WalletLocked,
                 ..
             })
         ));

@@ -9,12 +9,12 @@ current commit has no recorded result for that gate.
 | Types/chain traits | pending consolidated gate | n/a | n/a | n/a | no external audit | qualification pending |
 | Encrypted store/schema v3 | pending consolidated gate | source includes migration checkpoint, encrypted typed CRUD/CAS/batches and restart-safe workflow rows | n/a | no device secure-store test | no DB benchmark/audit | qualification pending |
 | HNS wallet/names | current focused `hns_shakedex` PASS on NVMe: 4 passed, 0 failed, 22 filtered; focused `canonical_hns_v3_name_action` PASS: 4 passed, 0 failed, 19 filtered; prior `canonical_hns_v2`: 6 passed, 0 failed, 9 filtered; prior account-scoped persistence regression: 1 passed, 0 failed, 15 filtered; consolidated evidence pending | source includes authenticated loopback RPC configuration, strict HTTP/JSON parsing, atomic coin/name/Shakedex-role snapshot restoration, complete bounded account-prefix entity reloads, encrypted monotonic scan state and durable cross-writer scan fence, WalletAccount-coupled protected Shakedex key allocation/rederivation, canonical current/proof summaries and exact owner inclusion, legacy-row revalidation, ephemeral ownership/finalize/Shakedex lock authorities, snapshot-bound HSD median time past, versioned action context, exact persisted input evidence, canonical TRANSFER/FINALIZE construction, typed reservations, store-globally keyed protected Shakedex source and exact account-funding reservations, runtime-bound funding derivations, single-use approval, ordered coin/name and purpose-bound Shakedex suffix signing, runtime-owned same-snapshot Shakedex transaction/spender observations, canonical local policy/minimum-fee checks, exact signed-byte fee-quote persistence/revalidation, and durable rebroadcast/name-action state | source includes epoch-bound checkpoint rewind, ordered spender evidence, split current/proof revalidation, exact cross-scan binding rejection, authority reacquisition, persistent protected reservations across reversible Shakedex confirmations/conflicts, reapproval state, and one-reconciliation fee-quote recovery; no multi-process restart/reorg execution | concrete adapter source pinned to node RPC v1 commit `c1b633d1`; canonical protocol crates pinned coherently to immutable `hns-rs` `4b989aa`; no multi-process regtest or product Shakedex/name-action run | no resource measurement/audit | wallet-owned P2PKH TRANSFER/direct-FINALIZE and current Shakedex funding/evidence source implemented; HNS Shakedex-funding, value-runtime, and fee-policy qualification gates remain false; provider/product and real-network qualification pending |
-| Provider core | focused `canonical_provider_account_join` PASS on NVMe: 5 passed, 0 failed, 31 filtered across FFI, host, provider, and service; new `production_tranche_` persistent-control regression added but not executed; consolidated gate pending | source now gives provider state and runtime control one locked store/key authority, rejects unlocked construction, retains encrypted grants/tombstones across reopen, and drops process-local authorities/approvals/replays; execution evidence pending | n/a | only narrow existing-database control dispatch; no concrete HNS account/chain runtime or installed-browser E2E | no audit | product integration pending; value/browser unavailable |
-| Fixed-price Shakedex | current focused `hns_shakedex` PASS on NVMe: 1 aggregate unit passed, 0 failed, 4 filtered; 1 restart integration passed, 0 failed, 0 filtered; exact-lock/Denuo/board filter PASS on NVMe: 1 passed, 0 failed, 3 filtered; prior immutable-V2 listing/gate filter: 3 passed, 0 failed; new `production_tranche_` terminal-release tests unrun; consolidated evidence pending | encrypted parent-plan/board CAS plus protected monotonic seller-key allocation; buyer-fulfillment/seller-recovery child binds exact structural plan, source/funding evidence and reservations, approval/revision, final signed bytes/fee quote, and pre-submit fence; persisted quote evidence is revalidated without restoring snapshot authority; terminal workflow evidence and complete reservation deletion use one CAS | source state machine retains protected reservations through reversible states and uses runtime-owned transaction/all-input-spender evidence for recovery, mempool, confirmation, conflict, rollback, same-byte rebroadcast, and exact terminal release; released reconciliation is read-only and reports `RecoveryRequired` if finality changes; no executed multi-process restart/reorg evidence or durable script-FINALIZE child | no regtest/live-Denuo/provider/UI E2E | no audit | all Shakedex and dependent HNS Shakedex-funding/value/fee gates remain false |
+| Provider core | focused `canonical_provider_account_join` PASS on NVMe: 5 passed, 0 failed, 31 filtered across FFI, host, provider, and service; focused `production_tranche_` persistent-control PASS: 1 passed, 0 failed, 7 filtered; consolidated gate pending | source gives provider state and runtime control one locked store/key authority, rejects unlocked construction, retains encrypted grants/tombstones across reopen, and drops process-local authorities/approvals/replays; focused file-backed reopen evidence passed | n/a | only narrow existing-database control dispatch; no concrete HNS account/chain runtime or installed-browser E2E | no audit | product integration pending; value/browser unavailable |
+| Fixed-price Shakedex | current focused `hns_shakedex` PASS on NVMe: 1 aggregate unit passed, 0 failed, 4 filtered; 1 restart integration passed, 0 failed, 0 filtered; exact-lock/Denuo/board filter PASS on NVMe: 1 passed, 0 failed, 3 filtered; prior immutable-V2 listing/gate filter: 3 passed, 0 failed; focused terminal-release `production_tranche_` PASS: 5 passed, 0 failed (4 workflow plus 1 encrypted store reopen); consolidated evidence pending | encrypted parent-plan/board CAS plus protected monotonic seller-key allocation; buyer-fulfillment/seller-recovery child binds exact structural plan, source/funding evidence and reservations, approval/revision, final signed bytes/fee quote, and pre-submit fence; persisted quote evidence is revalidated without restoring snapshot authority; terminal workflow evidence and complete reservation deletion use one CAS | source state machine retains protected reservations through reversible states and uses runtime-owned transaction/all-input-spender evidence for recovery, mempool, confirmation, conflict, rollback, same-byte rebroadcast, and exact terminal release; released reconciliation is read-only and reports `RecoveryRequired` if finality changes; no executed multi-process restart/reorg evidence or durable script-FINALIZE child | no regtest/live-Denuo/provider/UI E2E | no audit | all Shakedex and dependent HNS Shakedex-funding/value/fee gates remain false |
 | Market sessions | prior unit baseline only | CAS journal source | evidence incomplete | no pair E2E | no audit | unavailable |
 | Bitcoin Kyoto | targeted allocation filter PASS on NVMe: 10 passed, 0 failed, 8 filtered; consolidated gate pending | source includes encrypted CAS-backed monotonic session/role swap-key allocation, protected seed/allocation records, authenticated re-derivation, BDK-first sync journal, bounded reconciliation chunks, restart resume, and pre-broadcast intent; allocation database reopen covered by the targeted filter; pinned Kyoto header/filter/peer persistence unavailable | source queries exact canonical hash membership within a bounded retained window; no allocation reorg or snapshot-rollback evidence | no regtest/P2P/broadcast run | not measured/no audit | send and settlement hard-disabled |
 | Ethereum | containment tranche pending consolidated gate | offline derivation and dormant typed primitives only; no synchronization/history persistence | no restart/reorg evidence | deterministic contract compiled only in prior baseline; no embedded Helios/local-chain run; permits unavailable; mainnet denied | no contract audit | synchronization/history/send/signing/settlement unavailable |
-| ABI/host | account-join FFI/host subset included in the 5-test focused PASS; persistent-control source regression not executed; host/contract consolidated gate pending | source includes exact hello/restart and directional sequencing, bounded response correlation, authority/approval/private-binding/event replay state, post-unlock rotation-failure relock, and machine-readable private/public/manifest contracts plus bounded vectors | restart reset and a database reopen regression are implemented in source; new regression has no execution evidence | no platform ABI E2E, signed artifact verifier, launcher, or generated mobile binding | no resource measurement/audit | product integration pending; private control dispatch only; browser/value unavailable |
+| ABI/host | account-join FFI/host subset included in the 5-test focused PASS; persistent-control regression PASS: 1 passed, 0 failed, 7 filtered; host/contract consolidated gate pending | source includes exact hello/restart and directional sequencing, bounded response correlation, authority/approval/private-binding/event replay state, post-unlock rotation-failure relock, and machine-readable private/public/manifest contracts plus bounded vectors | focused restart reset and encrypted database reopen regression passed | no platform ABI E2E, signed artifact verifier, launcher, or generated mobile binding | no resource measurement/audit | product integration pending; private control dispatch only; browser/value unavailable |
 | Browser products | separate repositories | platform integration pending | n/a | no installed/signed E2E | no review | unavailable |
 
 ## Single qualification command
@@ -71,12 +71,13 @@ browser, and product qualification remain pending.
 
 The persistent control-plane tranche adds
 `production_tranche_persistent_control_reopens_locked_and_preserves_only_permission_authority`.
-It is intended to cover rejection of an already-unlocked composition, ABI
-unlock/lock, the exact five-method control subset, generic-permission gating,
-encrypted tombstone survival across database reopen, fresh service/wallet
-sessions, and loss of process-local authority/request state. By instruction,
-no build or test was run while authoring this source; the focused regression and
-all broader qualification remain pending evidence.
+The combined focused command below passed that one service regression with 0
+failures and 7 filtered service-library tests. It covers rejection of an
+already-unlocked composition, ABI unlock/lock, the exact five-method control
+subset, generic-permission gating, encrypted tombstone survival across database
+reopen, fresh service/wallet sessions, and loss of process-local
+authority/request state. Installed-product and broader qualification remain
+pending.
 
 The fixed-price protocol/board tranche ran one narrowly filtered NVMe command:
 `cargo test --locked --offline -p hns-wallet-shakedex
@@ -117,12 +118,26 @@ provider/UI integration, multi-process regtest restart/reorg/conflict execution,
 and durable script-controlled FINALIZE remain pending; every related release
 gate stays `false`.
 
-The evidence-backed terminal release source and its focused
-`production_tranche_` tests were added after that recorded run. This tranche
-deliberately invoked no build or test, so no pass is claimed for exact-spender
-finality, final competing spends, deep-reorg recovery-required audit,
-irreversible terminal state, or atomic encrypted workflow-plus-reservation
-deletion across reopen.
+The persistent-control and evidence-backed terminal-release source used one
+combined, narrowly filtered command with the existing NVMe target:
+
+```text
+CARGO_TARGET_DIR=/home/den/.codex/targets/hns-wallet-shakedex-aug3 \
+TMPDIR=/home/den/.codex/tmp/hns-wallet-shakedex-aug3 \
+cargo test --locked --offline \
+  -p hns-wallet-store -p hns-wallet-service -p hns-wallet-shakedex \
+  production_tranche -- --test-threads=1
+```
+
+The initial invocation compiled the three targets and exposed a Linux
+temporary-directory mode error in the new service fixture; the next run
+reached a stale expected error code after locked-store failures were made
+explicitly `WalletLocked`. After those fixture corrections, the same command
+passed 6 tests with 0 failures: 1 service encrypted-reopen regression, 4
+Shakedex exact-spender/final-competitor/reorg/terminal-state regressions, and 1
+encrypted store atomic-delete/reopen regression. Twenty unrelated tests were
+filtered across the selected targets. No standalone build/check, broad
+workspace test, RocksDB compilation, network run, or benchmark was performed.
 
 ## Prior baseline evidence
 

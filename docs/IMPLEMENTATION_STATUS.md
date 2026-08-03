@@ -184,14 +184,15 @@ run, or benchmark was performed. These focused results do not replace the
 consolidated gate and do not enable a value constant. Run
 `scripts/check.sh` once in CI and record the resulting commit ID and artifacts
 in [`QUALIFICATION.md`](QUALIFICATION.md). The new provider/ABI/service/host
-contract has focused source evidence only; installed-product and restart
-qualification remain unrun.
+contract has a passing focused encrypted restart regression; installed-product
+and full restart qualification remain unrun.
 
 The previously recorded focused `hns_shakedex` run covers the durable value
-aggregate described above. The terminal signed-reservation release source and
-its `production_tranche_` tests were added after that run. No build or test was
-invoked for this addition, so it has no execution evidence and does not inherit
-qualification from the prior aggregate result.
+aggregate described above. A later combined NVMe-only `production_tranche`
+filter passed 6 tests with 0 failures: the persistent-control restart case,
+four terminal signed-reservation finality/reorg cases, and the encrypted atomic
+workflow-plus-reservation delete/reopen case. That narrow evidence does not
+replace consolidated or installed-product qualification.
 
 ## Deferred by design
 
