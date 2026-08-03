@@ -96,9 +96,28 @@ only when the method, requested module, displayed chain, amount asset, and fee
 asset agree exactly.
 
 The 43 method names remain the closed vocabulary, but presence in that
-vocabulary is not availability. Capability negotiation is a closed enum and an
-unimplemented method returns `unsupportedCapability`. The checked-in subprocess
-does not advertise provider dispatch, value movement, or browser integration.
+vocabulary is not availability. Wallet types own the single canonical wire-name
+list used by both provider parsing and private ABI snapshot validation; even a
+short, bounded unknown name is rejected. The website method `wallet_getCapabilities`
+returns only `{providerApiVersion:1,methods:[...]}`. Native bootstrap separately
+uses the authority-scoped private ABI capability request whose snapshot is
+`{providerSchemaVersion:1,approvalSchemaVersion:2,walletSessionId,
+permissionGeneration,methods}`. The native adapter retains its result binding;
+it must never project that private envelope to website code. Chromium must
+project exactly `{abiVersion,available,walletSession,permissionGeneration,
+methods}` from private negotiation. With provider dispatch unavailable, the
+private method set is empty and `available` remains false.
+
+Generation zero is valid only before the first grant or revocation;
+`wallet_getPermissions` preserves a nonzero tombstone generation with an empty
+capability list. An unimplemented method returns `unsupportedCapability`. The
+checked-in subprocess does not advertise provider dispatch, value movement, or
+browser integration.
+
+`hns_requestAccounts` remains in the canonical vocabulary but is
+unconditionally unavailable in this tranche. The current runtime interface
+cannot atomically join an approved Accounts grant to a real account result, so
+the service neither advertises nor invents that behavior.
 
 ## Explicitly forbidden
 
@@ -115,3 +134,5 @@ Unknown methods, forbidden methods, invalid params, oversized frames, insecure
 origins, unauthorized capabilities, replays, request flooding, stale context,
 stale approval, locked wallet, and unavailable module/backend are distinct
 errors. Errors minimize account and policy disclosure.
+
+The new provider/ABI/service contract tests are source-only and were not run.

@@ -7,7 +7,8 @@ use hns_wallet_types::{
     AccountId, Amount, ApprovalKind, BaseUnits, BrowserRuntimeSessionId, FinalityModel,
     HostAuthorityHandleId, HostSessionId, ModuleId, PermissionCapability, ProviderApprovalId,
     ProviderAuthorityFingerprint, ProviderRequestId, ReceiveTarget, SyncStatus, TransactionSummary,
-    WalletAsset, WalletId, WalletServiceSessionId, WorkflowId,
+    WalletAsset, WalletId, WalletServiceSessionId, WalletSessionId, WorkflowId,
+    PROVIDER_METHOD_WIRE_NAMES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +30,9 @@ pub const MAX_ORIGIN_BYTES: usize = 512;
 pub const MAX_PUBLIC_STRING_BYTES: usize = 4_096;
 pub const MAX_PUBLIC_ITEMS: usize = 128;
 pub const MAX_FAILURE_MESSAGE_BYTES: usize = 1_024;
+pub const PROVIDER_SCHEMA_VERSION: u16 = 1;
+pub const APPROVAL_SCHEMA_VERSION: u16 = 2;
+pub const MAX_PROVIDER_METHODS: usize = PROVIDER_METHOD_WIRE_NAMES.len();
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -152,6 +156,10 @@ pub enum ServiceRequest {
     RevokeAuthority {
         authority_handle: HostAuthorityHandleId,
         expected_authority_revision: u64,
+    },
+    ProviderCapabilities {
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
     },
     ProviderRequest {
         authority_handle: HostAuthorityHandleId,
@@ -282,6 +290,60 @@ pub enum ServiceFrame {
     },
 }
 
+/// Wallet-owned provider authority binding carried by every private provider
+/// output. Generation zero is valid only while the authority has never had a
+/// permission grant or revocation tombstone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProviderBinding {
+    pub authority_handle: HostAuthorityHandleId,
+    pub authority_revision: u64,
+    pub wallet_session_id: WalletSessionId,
+    pub permission_generation: u64,
+}
+
+impl ProviderBinding {
+    fn validate(&self) -> Result<(), AbiError> {
+        if self.authority_revision == 0 {
+            return Err(AbiError::InvalidEnvelope);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProviderCapabilitySnapshot {
+    pub provider_schema_version: u16,
+    pub approval_schema_version: u16,
+    pub wallet_session_id: WalletSessionId,
+    pub permission_generation: u64,
+    pub methods: BTreeSet<String>,
+}
+
+impl ProviderCapabilitySnapshot {
+    fn validate(&self, binding: &ProviderBinding) -> Result<(), AbiError> {
+        if self.provider_schema_version != PROVIDER_SCHEMA_VERSION
+            || self.approval_schema_version != APPROVAL_SCHEMA_VERSION
+            || self.wallet_session_id != binding.wallet_session_id
+            || self.permission_generation != binding.permission_generation
+            || self.methods.len() > MAX_PROVIDER_METHODS
+        {
+            return Err(AbiError::InvalidEnvelope);
+        }
+        for method in &self.methods {
+            if method.is_empty()
+                || method.len() > MAX_METHOD_BYTES
+                || !method.is_ascii()
+                || !PROVIDER_METHOD_WIRE_NAMES.contains(&method.as_str())
+            {
+                return Err(AbiError::InvalidEnvelope);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ServiceResponse {
@@ -296,9 +358,12 @@ pub enum ServiceResponse {
     AuthorityRevoked {
         authority_handle: HostAuthorityHandleId,
     },
+    ProviderCapabilities {
+        binding: ProviderBinding,
+        capabilities: ProviderCapabilitySnapshot,
+    },
     ProviderResult {
-        authority_handle: HostAuthorityHandleId,
-        authority_revision: u64,
+        binding: ProviderBinding,
         value: Value,
     },
     ApprovalRequired {
@@ -713,8 +778,7 @@ impl ApprovalSummary {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ApprovalPrompt {
     pub approval_id: ProviderApprovalId,
-    pub authority_handle: HostAuthorityHandleId,
-    pub authority_revision: u64,
+    pub binding: ProviderBinding,
     pub origin: String,
     pub method: String,
     pub expires_at_unix_ms: u64,
@@ -727,8 +791,8 @@ impl ApprovalPrompt {
         expected_kind: ApprovalKind,
         now_unix_ms: u64,
     ) -> Result<(), AbiError> {
-        if self.authority_revision == 0
-            || self.expires_at_unix_ms <= now_unix_ms
+        self.binding.validate().map_err(|_| AbiError::InvalidApproval)?;
+        if self.expires_at_unix_ms <= now_unix_ms
             || self.expires_at_unix_ms > now_unix_ms.saturating_add(MAX_APPROVAL_LIFETIME_MS)
             || self.origin.is_empty()
             || self.origin.len() > MAX_ORIGIN_BYTES
@@ -853,8 +917,7 @@ pub struct ProviderEventEnvelope {
     pub service_session_id: WalletServiceSessionId,
     pub restart_generation: u64,
     pub channel_sequence: u64,
-    pub authority_handle: HostAuthorityHandleId,
-    pub authority_revision: u64,
+    pub binding: ProviderBinding,
     pub event_sequence: u64,
     pub payload: ProviderEventPayload,
 }
@@ -1034,6 +1097,15 @@ fn validate_service_request(request: &ServiceRequest) -> Result<(), AbiError> {
             }
             Ok(())
         }
+        ServiceRequest::ProviderCapabilities {
+            authority_revision,
+            ..
+        } => {
+            if *authority_revision == 0 {
+                return Err(AbiError::InvalidAuthority);
+            }
+            Ok(())
+        }
         ServiceRequest::ProviderRequest {
             authority_revision,
             request_nonce,
@@ -1124,12 +1196,28 @@ fn validate_service_frame(frame: &ServiceFrame) -> Result<(), AbiError> {
             if event.protocol_version != WALLET_ABI_VERSION
                 || event.restart_generation == 0
                 || event.channel_sequence == 0
-                || event.authority_revision == 0
                 || event.event_sequence == 0
             {
                 return Err(AbiError::InvalidEvent);
             }
+            event.binding.validate().map_err(|_| AbiError::InvalidEvent)?;
             event.payload.validate()?;
+            match &event.payload {
+                ProviderEventPayload::Connect {
+                    permission_generation,
+                }
+                | ProviderEventPayload::PermissionsChanged {
+                    permission_generation,
+                    ..
+                } if *permission_generation != event.binding.permission_generation => {
+                    return Err(AbiError::InvalidEvent);
+                }
+                ProviderEventPayload::Disconnect { .. } => {}
+                _ if event.binding.permission_generation == 0 => {
+                    return Err(AbiError::InvalidEvent);
+                }
+                _ => {}
+            }
             if serde_json::to_vec(event)
                 .map_err(|_| AbiError::Encoding)?
                 .len()
@@ -1151,12 +1239,9 @@ fn validate_service_response(response: &ServiceResponse) -> Result<(), AbiError>
         | ServiceResponse::AuthorityReplaced {
             authority_revision,
             ..
-        }
-        | ServiceResponse::ProviderResult {
-            authority_revision,
-            ..
         } if *authority_revision == 0 => Err(AbiError::InvalidEnvelope),
-        ServiceResponse::ProviderResult { value, .. } => {
+        ServiceResponse::ProviderResult { binding, value } => {
+            binding.validate()?;
             if serde_json::to_vec(value)
                 .map_err(|_| AbiError::Encoding)?
                 .len()
@@ -1166,9 +1251,19 @@ fn validate_service_response(response: &ServiceResponse) -> Result<(), AbiError>
             }
             Ok(())
         }
+        ServiceResponse::ProviderCapabilities {
+            binding,
+            capabilities,
+        } => {
+            binding.validate()?;
+            capabilities.validate(binding)
+        }
         ServiceResponse::ApprovalRequired { approval } => {
-            if approval.authority_revision == 0
-                || approval.origin.is_empty()
+            approval
+                .binding
+                .validate()
+                .map_err(|_| AbiError::InvalidApproval)?;
+            if approval.origin.is_empty()
                 || approval.method.is_empty()
                 || approval.expires_at_unix_ms == 0
             {
@@ -1324,12 +1419,20 @@ mod tests {
         WalletServiceSessionId::from_bytes([2_u8; 32]).expect("service session")
     }
 
+    fn wallet_session() -> WalletSessionId {
+        WalletSessionId::from_bytes([5_u8; 32]).expect("wallet session")
+    }
+
     fn request_id() -> ProviderRequestId {
         ProviderRequestId::from_bytes([3_u8; 16]).expect("request id")
     }
 
     fn handle() -> HostAuthorityHandleId {
         HostAuthorityHandleId::from_bytes([4_u8; 32]).expect("handle")
+    }
+
+    fn approval_id() -> ProviderApprovalId {
+        ProviderApprovalId::from_bytes([6_u8; 16]).expect("approval id")
     }
 
     fn request(body: ServiceRequest) -> HostFrame {
@@ -1392,6 +1495,145 @@ mod tests {
         assert!(!json.contains("authenticated"));
         assert!(!json.contains("walletSession"));
         assert!(!json.contains("permissionGeneration"));
+    }
+
+    #[test]
+    fn provider_outputs_carry_the_private_authority_binding() {
+        let response = ServiceResponse::ProviderResult {
+            binding: ProviderBinding {
+                authority_handle: handle(),
+                authority_revision: 3,
+                wallet_session_id: wallet_session(),
+                permission_generation: 0,
+            },
+            value: Value::Null,
+        };
+        validate_service_response(&response).expect("fresh generation is valid");
+        let json = serde_json::to_string(&response).expect("json");
+        assert!(json.contains("walletSessionId"));
+        assert!(json.contains("permissionGeneration"));
+
+        let prompt = ApprovalPrompt {
+            approval_id: approval_id(),
+            binding: ProviderBinding {
+                authority_handle: handle(),
+                authority_revision: 3,
+                wallet_session_id: wallet_session(),
+                permission_generation: 0,
+            },
+            origin: "https://wallet.example".to_owned(),
+            method: "wallet_requestPermissions".to_owned(),
+            expires_at_unix_ms: 10_000,
+            summary: ApprovalSummary::Permissions {
+                capabilities: BTreeSet::from([PermissionCapability::Accounts]),
+            },
+        };
+        prompt
+            .validate(ApprovalKind::Permission, 1_000)
+            .expect("bound prompt");
+    }
+
+    #[test]
+    fn private_capability_snapshot_is_exact_and_matches_its_binding() {
+        assert_eq!(
+            validate_service_request(&ServiceRequest::ProviderCapabilities {
+                authority_handle: handle(),
+                authority_revision: 0,
+            }),
+            Err(AbiError::InvalidAuthority)
+        );
+        let binding = ProviderBinding {
+            authority_handle: handle(),
+            authority_revision: 1,
+            wallet_session_id: wallet_session(),
+            permission_generation: 0,
+        };
+        let capabilities = ProviderCapabilitySnapshot {
+            provider_schema_version: PROVIDER_SCHEMA_VERSION,
+            approval_schema_version: APPROVAL_SCHEMA_VERSION,
+            wallet_session_id: wallet_session(),
+            permission_generation: 0,
+            methods: BTreeSet::from(["wallet_getCapabilities".to_owned()]),
+        };
+        validate_service_response(&ServiceResponse::ProviderCapabilities {
+            binding,
+            capabilities: capabilities.clone(),
+        })
+        .expect("matching snapshot");
+
+        let mut mismatched = capabilities.clone();
+        mismatched.permission_generation = 1;
+        assert_eq!(
+            validate_service_response(&ServiceResponse::ProviderCapabilities {
+                binding,
+                capabilities: mismatched,
+            }),
+            Err(AbiError::InvalidEnvelope)
+        );
+        let mut mismatched_session = capabilities.clone();
+        mismatched_session.wallet_session_id =
+            WalletSessionId::from_bytes([7_u8; 32]).expect("other wallet session");
+        assert_eq!(
+            validate_service_response(&ServiceResponse::ProviderCapabilities {
+                binding,
+                capabilities: mismatched_session,
+            }),
+            Err(AbiError::InvalidEnvelope)
+        );
+        let mut invalid_schema = capabilities.clone();
+        invalid_schema.provider_schema_version += 1;
+        assert_eq!(
+            validate_service_response(&ServiceResponse::ProviderCapabilities {
+                binding,
+                capabilities: invalid_schema,
+            }),
+            Err(AbiError::InvalidEnvelope)
+        );
+        let mut unknown_method = capabilities.clone();
+        unknown_method.methods = BTreeSet::from(["wallet_unknown".to_owned()]);
+        assert_eq!(
+            validate_service_response(&ServiceResponse::ProviderCapabilities {
+                binding,
+                capabilities: unknown_method,
+            }),
+            Err(AbiError::InvalidEnvelope)
+        );
+        let mut oversized_method = capabilities;
+        oversized_method.methods = BTreeSet::from(["m".repeat(MAX_METHOD_BYTES + 1)]);
+        assert_eq!(
+            validate_service_response(&ServiceResponse::ProviderCapabilities {
+                binding,
+                capabilities: oversized_method,
+            }),
+            Err(AbiError::InvalidEnvelope)
+        );
+    }
+
+    #[test]
+    fn event_generation_must_match_its_authority_binding() {
+        let mut event = ProviderEventEnvelope {
+            protocol_version: WALLET_ABI_VERSION,
+            host_session_id: host_session(),
+            service_session_id: service_session(),
+            restart_generation: 1,
+            channel_sequence: 1,
+            binding: ProviderBinding {
+                authority_handle: handle(),
+                authority_revision: 1,
+                wallet_session_id: wallet_session(),
+                permission_generation: 6,
+            },
+            event_sequence: 1,
+            payload: ProviderEventPayload::Connect {
+                permission_generation: 7,
+            },
+        };
+        assert_eq!(
+            validate_service_frame(&ServiceFrame::Event { event: event.clone() }),
+            Err(AbiError::InvalidEvent)
+        );
+        event.binding.permission_generation = 7;
+        validate_service_frame(&ServiceFrame::Event { event }).expect("matching generation");
     }
 
     #[test]

@@ -5,6 +5,54 @@ use core::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+/// The complete canonical website-provider method vocabulary in stable enum
+/// order. Availability is negotiated separately.
+pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 43] = [
+    "wallet_getCapabilities",
+    "wallet_getEnabledModules",
+    "wallet_enableModule",
+    "wallet_disableModule",
+    "wallet_requestPermissions",
+    "wallet_getPermissions",
+    "wallet_revokePermissions",
+    "wallet_lock",
+    "wallet_getStatus",
+    "hns_requestAccounts",
+    "hns_accounts",
+    "hns_getBalance",
+    "hns_getTransactions",
+    "hns_getReceiveAddress",
+    "hns_send",
+    "hns_getNames",
+    "hns_getName",
+    "hns_importKnownName",
+    "hns_transferName",
+    "hns_finalizeName",
+    "hns_signTypedMessage",
+    "asset_getAccount",
+    "asset_getBalance",
+    "asset_getTransactions",
+    "asset_getReceiveTarget",
+    "asset_send",
+    "nameMarket_listOffers",
+    "nameMarket_createFixedPriceOffer",
+    "nameMarket_cancelOffer",
+    "nameMarket_acceptOffer",
+    "nameMarket_getSession",
+    "nameMarket_finalizePurchase",
+    "nameMarket_recoverName",
+    "swap_getSupportedPairs",
+    "swap_getPriceRound",
+    "swap_listMarketIntents",
+    "swap_publishMarketIntent",
+    "swap_cancelMarketIntent",
+    "swap_requestMatch",
+    "swap_acceptFill",
+    "swap_getSession",
+    "swap_redeem",
+    "swap_refund",
+];
+
 macro_rules! semantic_id {
     ($name:ident, $size:expr) => {
         #[derive(

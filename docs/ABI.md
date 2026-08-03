@@ -41,11 +41,11 @@ is affirmative; there are no authentication/injection booleans. The service
 never receives an engine authority object and does not reproduce engine policy.
 
 Register, exact-revision replace, and exact-revision revoke operations own the
-handle lifecycle. Provider and approval frames contain only the handle and its
-service-owned revision. They contain no origin assertion, wallet lock/session,
-permission generation, browser authority JSON, or capability secret supplied
-by a page. Handles, approvals, replay windows, request IDs, rate state, and
-event cursors are process-ephemeral.
+handle lifecycle. Every provider result, approval prompt, and event embeds one
+private ABI-v2 `binding`: handle, service-owned revision, wallet-session ID,
+and authority-scoped permission generation. Generation zero means no grant or
+revocation has ever existed; an absent record after revocation retains its
+nonzero tombstone generation. Pages supply none of these binding values.
 
 ## Approvals and events
 
@@ -59,14 +59,27 @@ summary fails closed. Recovery-phrase display is not a provider/service
 operation.
 
 Events are typed frames bound to host/service/restart sessions, the exact
-authority handle/revision, a monotonic service channel sequence, and a
-per-authority event sequence. Bounded collection and string limits are checked
-before encoding.
+provider binding, a monotonic service channel sequence, and a per-authority
+event sequence. Connect and permissions-changed payload generations must equal
+the binding generation. Bounded collection and string limits are checked.
 
 ## Capability posture
 
 Capabilities are a closed enum. Unsupported operations return the typed
 `unsupportedCapability` failure and are never inferred from compiled source.
+The authority-scoped private `providerCapabilities` request returns a typed
+snapshot with exactly `providerSchemaVersion: 1`, `approvalSchemaVersion: 2`,
+`walletSessionId`, `permissionGeneration`, and `methods`. Its session and
+generation must equal the accompanying binding, schema versions are exact, and
+method strings must belong to the exact shared 43-name wallet-types list; short
+unknown strings are rejected as well as oversized ones. When provider dispatch is
+absent, `methods` is empty.
+
+The website method `wallet_getCapabilities` instead returns only
+`providerApiVersion: 1` and `methods`. Its outer private result binding is
+retained by the native adapter and never projected to the page. A Chromium
+adapter must combine the private snapshot with negotiated service availability
+and project exactly `{abiVersion,available,walletSession,permissionGeneration,methods}`.
 The checked-in subprocess runtime advertises framing/restart/registry/
 structured-prompt/event foundations only. It does not advertise provider
 dispatch, wallet operations, value movement, or browser integration. The
@@ -80,3 +93,5 @@ released signed artifact. Mobile may drive the same state machine in process
 after generated JNI/C bindings exist. Filesystem paths, process commands, raw
 signing, recovery output, private keys, database keys, preimages, and arbitrary
 contract calls are absent from the protocol.
+
+Contract tests added with this tranche are source-only and were not executed.

@@ -7,6 +7,7 @@ use hns_wallet_store::{StoreError, WalletStore};
 use hns_wallet_types::{
     ApprovalId, ApprovalKind, BrowserRuntimeSessionId, HostAuthorityHandleId,
     PermissionCapability, ProviderAuthorityFingerprint, WalletSessionId,
+    PROVIDER_METHOD_WIRE_NAMES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,6 +23,7 @@ pub const RATE_WINDOW_SECONDS: u64 = 60;
 pub const MAX_REGISTERED_AUTHORITIES: usize = 256;
 pub const MAX_PENDING_APPROVALS: usize = 128;
 pub const MAX_REPLAY_NONCES: usize = 4_096;
+pub const PROVIDER_API_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Origin {
@@ -133,6 +135,7 @@ impl ProviderRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum ProviderMethod {
     WalletGetCapabilities,
     WalletGetEnabledModules,
@@ -180,57 +183,68 @@ pub enum ProviderMethod {
 }
 
 impl ProviderMethod {
+    pub const ALL: [Self; PROVIDER_METHOD_WIRE_NAMES.len()] = [
+        Self::WalletGetCapabilities,
+        Self::WalletGetEnabledModules,
+        Self::WalletEnableModule,
+        Self::WalletDisableModule,
+        Self::WalletRequestPermissions,
+        Self::WalletGetPermissions,
+        Self::WalletRevokePermissions,
+        Self::WalletLock,
+        Self::WalletGetStatus,
+        Self::HnsRequestAccounts,
+        Self::HnsAccounts,
+        Self::HnsGetBalance,
+        Self::HnsGetTransactions,
+        Self::HnsGetReceiveAddress,
+        Self::HnsSend,
+        Self::HnsGetNames,
+        Self::HnsGetName,
+        Self::HnsImportKnownName,
+        Self::HnsTransferName,
+        Self::HnsFinalizeName,
+        Self::HnsSignTypedMessage,
+        Self::AssetGetAccount,
+        Self::AssetGetBalance,
+        Self::AssetGetTransactions,
+        Self::AssetGetReceiveTarget,
+        Self::AssetSend,
+        Self::NameMarketListOffers,
+        Self::NameMarketCreateFixedPriceOffer,
+        Self::NameMarketCancelOffer,
+        Self::NameMarketAcceptOffer,
+        Self::NameMarketGetSession,
+        Self::NameMarketFinalizePurchase,
+        Self::NameMarketRecoverName,
+        Self::SwapGetSupportedPairs,
+        Self::SwapGetPriceRound,
+        Self::SwapListMarketIntents,
+        Self::SwapPublishMarketIntent,
+        Self::SwapCancelMarketIntent,
+        Self::SwapRequestMatch,
+        Self::SwapAcceptFill,
+        Self::SwapGetSession,
+        Self::SwapRedeem,
+        Self::SwapRefund,
+    ];
+
+    pub const fn wire_name(self) -> &'static str {
+        PROVIDER_METHOD_WIRE_NAMES[self as usize]
+    }
+
     pub fn parse(method: &str) -> Result<Self, ProviderError> {
-        let parsed = match method {
-            "wallet_getCapabilities" => Self::WalletGetCapabilities,
-            "wallet_getEnabledModules" => Self::WalletGetEnabledModules,
-            "wallet_enableModule" => Self::WalletEnableModule,
-            "wallet_disableModule" => Self::WalletDisableModule,
-            "wallet_requestPermissions" => Self::WalletRequestPermissions,
-            "wallet_getPermissions" => Self::WalletGetPermissions,
-            "wallet_revokePermissions" => Self::WalletRevokePermissions,
-            "wallet_lock" => Self::WalletLock,
-            "wallet_getStatus" => Self::WalletGetStatus,
-            "hns_requestAccounts" => Self::HnsRequestAccounts,
-            "hns_accounts" => Self::HnsAccounts,
-            "hns_getBalance" => Self::HnsGetBalance,
-            "hns_getTransactions" => Self::HnsGetTransactions,
-            "hns_getReceiveAddress" => Self::HnsGetReceiveAddress,
-            "hns_send" => Self::HnsSend,
-            "hns_getNames" => Self::HnsGetNames,
-            "hns_getName" => Self::HnsGetName,
-            "hns_importKnownName" => Self::HnsImportKnownName,
-            "hns_transferName" => Self::HnsTransferName,
-            "hns_finalizeName" => Self::HnsFinalizeName,
-            "hns_signTypedMessage" => Self::HnsSignTypedMessage,
-            "asset_getAccount" => Self::AssetGetAccount,
-            "asset_getBalance" => Self::AssetGetBalance,
-            "asset_getTransactions" => Self::AssetGetTransactions,
-            "asset_getReceiveTarget" => Self::AssetGetReceiveTarget,
-            "asset_send" => Self::AssetSend,
-            "nameMarket_listOffers" => Self::NameMarketListOffers,
-            "nameMarket_createFixedPriceOffer" => Self::NameMarketCreateFixedPriceOffer,
-            "nameMarket_cancelOffer" => Self::NameMarketCancelOffer,
-            "nameMarket_acceptOffer" => Self::NameMarketAcceptOffer,
-            "nameMarket_getSession" => Self::NameMarketGetSession,
-            "nameMarket_finalizePurchase" => Self::NameMarketFinalizePurchase,
-            "nameMarket_recoverName" => Self::NameMarketRecoverName,
-            "swap_getSupportedPairs" => Self::SwapGetSupportedPairs,
-            "swap_getPriceRound" => Self::SwapGetPriceRound,
-            "swap_listMarketIntents" => Self::SwapListMarketIntents,
-            "swap_publishMarketIntent" => Self::SwapPublishMarketIntent,
-            "swap_cancelMarketIntent" => Self::SwapCancelMarketIntent,
-            "swap_requestMatch" => Self::SwapRequestMatch,
-            "swap_acceptFill" => Self::SwapAcceptFill,
-            "swap_getSession" => Self::SwapGetSession,
-            "swap_redeem" => Self::SwapRedeem,
-            "swap_refund" => Self::SwapRefund,
-            method if FORBIDDEN_METHODS.contains(&method) => {
-                return Err(ProviderError::ForbiddenMethod);
-            }
-            _ => return Err(ProviderError::MethodNotFound),
-        };
-        Ok(parsed)
+        if let Some(index) = PROVIDER_METHOD_WIRE_NAMES
+            .iter()
+            .position(|candidate| *candidate == method)
+        {
+            return Ok(Self::ALL[index]);
+        }
+        if FORBIDDEN_METHODS.contains(&method) {
+            Err(ProviderError::ForbiddenMethod)
+        } else {
+            Err(ProviderError::MethodNotFound)
+        }
     }
 
     pub const fn permission(self) -> Option<PermissionCapability> {
@@ -336,6 +350,15 @@ pub struct PermissionRecord {
     pub approved_names: BTreeSet<[u8; 32]>,
     pub created_at_unix: u64,
     pub expires_at_unix: Option<u64>,
+}
+
+/// The current authority-scoped permission view. `generation` survives an
+/// absent or expired record so a revocation tombstone can never project as a
+/// fresh generation zero.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionSnapshot {
+    pub generation: u64,
+    pub record: Option<PermissionRecord>,
 }
 
 impl PermissionRecord {
@@ -624,6 +647,10 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         self.wallet_locked = wallet_locked;
     }
 
+    pub const fn wallet_session_id(&self) -> WalletSessionId {
+        self.wallet_session
+    }
+
     pub fn request(
         &mut self,
         handle: HostAuthorityHandleId,
@@ -783,28 +810,43 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         Ok(())
     }
 
+    pub fn permission_snapshot(
+        &mut self,
+        handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        now_unix_ms: u64,
+    ) -> Result<PermissionSnapshot, ProviderError> {
+        self.accept_time(now_unix_ms)?;
+        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
+        let scope = permission_scope(&authority.facts);
+        let generation = self.state.permission_generation(&scope)?.unwrap_or(0);
+        let stored = self.state.permission(&scope)?;
+        if stored
+            .as_ref()
+            .is_some_and(|permission| permission.generation != generation)
+        {
+            return Err(ProviderError::Persistence);
+        }
+        let permission = validate_permission_identity(
+            stored,
+            &authority.facts,
+            now_unix_ms / 1_000,
+        )?;
+        Ok(PermissionSnapshot {
+            generation,
+            record: permission,
+        })
+    }
+
     pub fn permission(
         &mut self,
         handle: HostAuthorityHandleId,
         authority_revision: u64,
         now_unix_ms: u64,
     ) -> Result<Option<PermissionRecord>, ProviderError> {
-        self.accept_time(now_unix_ms)?;
-        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
-        let scope = permission_scope(&authority.facts);
-        let generation = self.state.permission_generation(&scope)?.unwrap_or(0);
-        let permission = validate_permission_identity(
-            self.state.permission(&scope)?,
-            &authority.facts,
-            now_unix_ms / 1_000,
-        )?;
-        if permission
-            .as_ref()
-            .is_some_and(|permission| permission.generation != generation)
-        {
-            return Err(ProviderError::Persistence);
-        }
-        Ok(permission)
+        Ok(self
+            .permission_snapshot(handle, authority_revision, now_unix_ms)?
+            .record)
     }
 
     pub fn grant_permissions(
@@ -1051,7 +1093,7 @@ fn approval_id(
     }]);
     hasher.update((origin.as_str().len() as u64).to_be_bytes());
     hasher.update(origin.as_str().as_bytes());
-    hasher.update(format!("{method:?}").as_bytes());
+    hasher.update(method.wire_name().as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let mut id = [0_u8; 16];
     id.copy_from_slice(&digest[..16]);
@@ -1200,6 +1242,63 @@ mod tests {
             .register_authority(handle(), registration(), NOW_MS)
             .expect("register authority");
         provider
+    }
+
+    #[test]
+    fn canonical_provider_method_set_has_exact_wire_round_trips() {
+        assert_eq!(ProviderMethod::ALL.len(), 43);
+        let names: BTreeSet<_> = ProviderMethod::ALL
+            .into_iter()
+            .map(ProviderMethod::wire_name)
+            .collect();
+        assert_eq!(names.len(), 43);
+        for (index, method) in ProviderMethod::ALL.into_iter().enumerate() {
+            assert_eq!(method.wire_name(), PROVIDER_METHOD_WIRE_NAMES[index]);
+            assert!(matches!(
+                ProviderMethod::parse(method.wire_name()),
+                Ok(parsed) if parsed == method
+            ));
+        }
+        assert!(matches!(
+            ProviderMethod::parse("wallet_unknown"),
+            Err(ProviderError::MethodNotFound)
+        ));
+        assert!(matches!(
+            ProviderMethod::parse("eth_sendTransaction"),
+            Err(ProviderError::ForbiddenMethod)
+        ));
+    }
+
+    #[test]
+    fn permission_snapshot_preserves_fresh_and_tombstone_generations() {
+        let mut provider = provider();
+        let fresh = provider
+            .permission_snapshot(handle(), 1, NOW_MS)
+            .expect("fresh snapshot");
+        assert_eq!(fresh.generation, 0);
+        assert!(fresh.record.is_none());
+
+        let granted = provider
+            .grant_permissions(
+                handle(),
+                1,
+                BTreeSet::from([PermissionCapability::Accounts]),
+                BTreeSet::new(),
+                NOW_MS,
+                None,
+            )
+            .expect("grant");
+        assert_eq!(granted.generation, 1);
+        let revoked_generation = provider
+            .revoke_permissions(handle(), 1, NOW_MS)
+            .expect("revoke");
+        assert_eq!(revoked_generation, 2);
+
+        let tombstone = provider
+            .permission_snapshot(handle(), 1, NOW_MS)
+            .expect("tombstone snapshot");
+        assert_eq!(tombstone.generation, 2);
+        assert!(tombstone.record.is_none());
     }
 
     #[test]
