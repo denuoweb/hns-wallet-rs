@@ -1,13 +1,13 @@
 #![doc = "Release-gated fixed-price Shakedex persistence boundary."]
 #![forbid(unsafe_code)]
 
-use hns_swap::SwapProof;
+use hns_swap::{FixedPriceListing, MAX_FIXED_PRICE_LISTING_SIZE};
 use hns_wallet_store::{StoreError, WalletStore};
 use hns_wallet_types::{ObjectHash, TransactionHash, WorkflowId, WorkflowKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const MAX_LISTING_BYTES: usize = 64 * 1024;
+pub const MAX_LISTING_BYTES: usize = MAX_FIXED_PRICE_LISTING_SIZE;
 pub const MAX_NAME_BYTES: usize = 63;
 
 /// Canonical Shakedex V2 protocol integration has not been release-qualified.
@@ -135,13 +135,13 @@ impl SellerSession {
             }
             (
                 SellerState::Locked,
-                SellerEvidence::FixedPriceProofVerified {
-                    proof,
+                SellerEvidence::FixedPriceListingVerified {
+                    listing,
                     listing_hash,
                 },
             ) => {
-                let _ = decode_legacy_swap_proof(&proof)?;
-                self.listing_bytes = Some(proof);
+                let _ = decode_canonical_listing(&listing, listing_hash)?;
+                self.listing_bytes = Some(listing);
                 self.listing_hash = Some(listing_hash);
                 SellerState::OfferSigned
             }
@@ -209,8 +209,8 @@ pub enum SellerEvidence {
         owner_outpoint: Vec<u8>,
         height: u64,
     },
-    FixedPriceProofVerified {
-        proof: Vec<u8>,
+    FixedPriceListingVerified {
+        listing: Vec<u8>,
         listing_hash: ObjectHash,
     },
     DenuoPublicationPersisted,
@@ -264,7 +264,7 @@ impl BuyerSession {
         listing_bytes: Vec<u8>,
     ) -> Result<Self, ShakedexError> {
         require_release_qualified()?;
-        let _ = decode_legacy_swap_proof(&listing_bytes)?;
+        let _ = decode_canonical_listing(&listing_bytes, listing_hash)?;
         Ok(Self {
             workflow_id,
             revision: 0,
@@ -483,15 +483,33 @@ fn require_release_qualified() -> Result<(), ShakedexError> {
     Ok(())
 }
 
-/// Decodes the released v0.1 proof envelope for legacy persisted-state
-/// inspection only. Structural decoding does not verify signatures, network,
-/// current ownership, locking coins, or canonical V2 listing identity and must
-/// never authorize a workflow transition.
-fn decode_legacy_swap_proof(bytes: &[u8]) -> Result<SwapProof, ShakedexError> {
+/// Decodes the immutable canonical V2 fixed-price listing for bounded
+/// persisted-state inspection. This verifies the signed envelope and its
+/// content identifier, but not its current network, time window, ownership, or
+/// locking coin; those checks remain mandatory at an action boundary.
+fn decode_canonical_listing(
+    bytes: &[u8],
+    expected_hash: ObjectHash,
+) -> Result<FixedPriceListing, ShakedexError> {
     if bytes.is_empty() || bytes.len() > MAX_LISTING_BYTES {
         return Err(ShakedexError::InvalidListing);
     }
-    SwapProof::decode(bytes).map_err(|_| ShakedexError::InvalidListing)
+    let listing = FixedPriceListing::decode(bytes).map_err(|_| ShakedexError::InvalidListing)?;
+    let actual_hash = listing
+        .listing_hash()
+        .map_err(|_| ShakedexError::InvalidListing)?;
+    require_listing_hash(actual_hash, expected_hash)?;
+    Ok(listing)
+}
+
+fn require_listing_hash(
+    actual_hash: [u8; 32],
+    expected_hash: ObjectHash,
+) -> Result<(), ShakedexError> {
+    if actual_hash != expected_hash.into_bytes() {
+        return Err(ShakedexError::InvalidListing);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -504,7 +522,7 @@ pub enum ShakedexError {
     ValueRuntimeUnavailable,
     #[error("invalid Handshake name")]
     InvalidName,
-    #[error("invalid or oversized Shakedex proof")]
+    #[error("invalid, oversized, or mismatched Shakedex listing")]
     InvalidListing,
     #[error("verified evidence does not permit this transition")]
     InvalidTransition,
@@ -529,7 +547,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seller_entrypoints_fail_closed_for_new_and_restored_sessions() {
+    fn canonical_hns_v2_seller_entrypoints_remain_fail_closed() {
         assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
         assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
         assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
@@ -571,13 +589,9 @@ mod tests {
     }
 
     #[test]
-    fn buyer_entrypoints_fail_closed_for_discovery_and_restored_sessions() {
+    fn canonical_hns_v2_buyer_entrypoints_remain_fail_closed() {
         assert!(matches!(
-            BuyerSession::discover(
-                WorkflowId::new([3; 16]),
-                ObjectHash::new([4; 32]),
-                vec![1],
-            ),
+            BuyerSession::discover(WorkflowId::new([3; 16]), ObjectHash::new([4; 32]), vec![1],),
             Err(ShakedexError::CanonicalProtocolUnavailable)
         ));
 
@@ -601,5 +615,27 @@ mod tests {
         ));
         assert_eq!(buyer, original);
         assert!(journal.buyer.is_empty());
+    }
+
+    #[test]
+    fn canonical_hns_v2_listing_requires_bounded_envelope_and_identity() {
+        let expected = ObjectHash::new([4; 32]);
+        assert!(matches!(
+            decode_canonical_listing(&[], expected),
+            Err(ShakedexError::InvalidListing)
+        ));
+        assert!(matches!(
+            decode_canonical_listing(&vec![0; MAX_LISTING_BYTES + 1], expected),
+            Err(ShakedexError::InvalidListing)
+        ));
+        assert!(matches!(
+            decode_canonical_listing(&[1], expected),
+            Err(ShakedexError::InvalidListing)
+        ));
+        assert!(require_listing_hash([4; 32], expected).is_ok());
+        assert!(matches!(
+            require_listing_hash([5; 32], expected),
+            Err(ShakedexError::InvalidListing)
+        ));
     }
 }

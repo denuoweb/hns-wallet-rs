@@ -667,9 +667,8 @@ dependencies = [
 
 [[package]]
 name = "hns-covenants"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5e153ac1b5682b1cefe15b55187d1a8bcb706a751f63d0e1b61d5c4e379b0d"
+version = "0.2.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4b989aabc132e7e79b8fd57a10f2465073faf588#4b989aabc132e7e79b8fd57a10f2465073faf588"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -680,18 +679,16 @@ dependencies = [
 
 [[package]]
 name = "hns-encoding"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f15cd894ebb231089eb2313da65c7754d25abc80e2bee57fe954a6b70eb65786"
+version = "0.2.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4b989aabc132e7e79b8fd57a10f2465073faf588#4b989aabc132e7e79b8fd57a10f2465073faf588"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "hns-primitives"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c560d78d0e66956f2f5eb6e67632f53fba6f6f0b0d56fff2b4d921f65ad8c4e"
+version = "0.2.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4b989aabc132e7e79b8fd57a10f2465073faf588#4b989aabc132e7e79b8fd57a10f2465073faf588"
 dependencies = [
  "hex",
  "thiserror",
@@ -699,12 +696,12 @@ dependencies = [
 
 [[package]]
 name = "hns-script"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e56e4fe31c456aca72e7e2be842daf0cb0f60a0d9ce5267ab32c8275d1484a4"
+version = "0.2.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4b989aabc132e7e79b8fd57a10f2465073faf588#4b989aabc132e7e79b8fd57a10f2465073faf588"
 dependencies = [
  "blake2",
  "hns-encoding",
+ "hns-primitives",
  "hns-transaction",
  "k256",
  "ripemd",
@@ -716,9 +713,8 @@ dependencies = [
 
 [[package]]
 name = "hns-swap"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7a4c455698f763dea8ce0c3c3a1c032b04f832f9eb4b26250f00368dd02a660"
+version = "0.2.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4b989aabc132e7e79b8fd57a10f2465073faf588#4b989aabc132e7e79b8fd57a10f2465073faf588"
 dependencies = [
  "blake2",
  "hns-covenants",
@@ -727,15 +723,15 @@ dependencies = [
  "hns-script",
  "hns-transaction",
  "k256",
+ "sha2",
  "sha3",
  "thiserror",
 ]
 
 [[package]]
 name = "hns-transaction"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9537999e39dbeffe7ce7c79fc69e955a7f3554a4c67cf94102a8614a74d13da5"
+version = "0.2.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4b989aabc132e7e79b8fd57a10f2465073faf588#4b989aabc132e7e79b8fd57a10f2465073faf588"
 dependencies = [
  "blake2",
  "hns-covenants",
@@ -746,9 +742,8 @@ dependencies = [
 
 [[package]]
 name = "hns-urkel-proof"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74f4ec8aa3209144240385b6eb119f0f3b577755d7b9e8cadb58faab521312fe"
+version = "0.2.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4b989aabc132e7e79b8fd57a10f2465073faf588#4b989aabc132e7e79b8fd57a10f2465073faf588"
 dependencies = [
  "blake2",
  "hns-primitives",
@@ -819,8 +814,8 @@ name = "hns-wallet-hns"
 version = "0.1.0"
 dependencies = [
  "bech32",
- "blake2",
  "bip39",
+ "blake2",
  "getrandom 0.3.4",
  "hex",
  "hkdf",
@@ -876,17 +871,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hns-wallet-shakedex"
-version = "0.1.0"
-dependencies = [
- "hns-swap",
- "hns-wallet-store",
- "hns-wallet-types",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "hns-wallet-service"
 version = "0.1.0"
 dependencies = [
@@ -898,6 +882,17 @@ dependencies = [
  "serde_json",
  "thiserror",
  "zeroize",
+]
+
+[[package]]
+name = "hns-wallet-shakedex"
+version = "0.1.0"
+dependencies = [
+ "hns-swap",
+ "hns-wallet-store",
+ "hns-wallet-types",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

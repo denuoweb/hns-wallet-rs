@@ -72,8 +72,22 @@ Name-role scan advancement is monotonic and bounded across restart and reorg.
 Outputs to discovered name keys remain visible to history/reconciliation but
 are excluded from ordinary balance, input selection, reservations, and
 spendable UTXOs. This persistence establishes key discovery only: it neither
-populates authoritative name-owner outpoints nor converts current/proof owner
-hints into ownership before canonical NameState decoding is integrated.
+authorizes an action nor treats a node hint as ownership. Fresh reconciliation
+independently decodes the split current/proof NameState bytes, binds exact owner
+transactions and resource bytes, and persists canonical summaries plus
+account-bound `HnsName` ownership or transfer direction. Legacy rows keep their
+watch-only variant until replaced. Context-free imports authenticate canonical
+state but mark wallet ownership explicitly unevaluated. Runtime imports recheck
+the exact cache binding while holding the store lock immediately before their
+CAS write, so a concurrent reconciliation cannot be overwritten with stale
+evidence. Account, address, name, coin, transaction, and reservation reloads
+query the complete bounded binary ID prefix for the selected wallet/account
+(and the dedicated name role where applicable); a global list limit is never
+applied before account filtering. Workflow IDs remain opaque, so recovery and
+transaction lookup read the complete bounded kind or fail closed on overflow
+before filtering decrypted account ownership. An action must reacquire
+ephemeral ownership authority from the exact current snapshot; the encrypted
+cache is UI/recovery state only.
 
 Before HNS submission, the runtime loads the exact persisted signed bytes and
 prior quote, re-quotes only those bytes, and atomically saves the refreshed
@@ -101,8 +115,8 @@ The product runtime must:
 7. reconcile mempools, confirmations, replacements, and reorgs from atomic,
    validated evidence;
 8. restore the bounded name-role scan, revalidate split committed-proof/current
-   name views and Shakedex listings, and leave ownership watch-only until
-   canonical state decoding;
+   name views, replace legacy watch-only rows with exact canonical summaries,
+   and reacquire rather than restore any ephemeral ownership authority;
 9. expire price rounds, intents, fill grants, persisted workflow approvals, and replay rows only
    after their authenticated metadata verifies;
 10. restore swap sessions and independently verify every recorded funding,
@@ -117,9 +131,9 @@ transaction recovery. The learned durable chain epoch and process-instance/
 generation pair remain exact across both scans, gap expansion, and all point
 reads in one reconciliation;
 they are intentionally reacquired after process restart rather than persisted
-as timeless authority. Exact final-signed fee quotes are wired and persisted,
-but released `hns-script` 0.1 lacks the canonical policy-size fee algebra needed
-for independent validation; its explicit qualification gate remains false. The
+as timeless authority. Exact final-signed fee quotes are wired and persisted;
+the immutable `hns-script` 0.2 source has canonical policy-size algebra, but its
+wallet integration and explicit qualification gate remain incomplete and false. The
 complete multi-chain product supervisor and current qualification evidence are
 not integrated, so HNS value operations remain release-gated.
 

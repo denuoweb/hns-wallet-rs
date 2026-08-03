@@ -8,9 +8,9 @@ current commit has no recorded result for that gate.
 | --- | --- | --- | --- | --- | --- | --- |
 | Types/chain traits | pending consolidated gate | n/a | n/a | n/a | no external audit | qualification pending |
 | Encrypted store/schema v3 | pending consolidated gate | source includes migration checkpoint, encrypted typed CRUD/CAS/batches and restart-safe workflow rows | n/a | no device secure-store test | no DB benchmark/audit | qualification pending |
-| HNS wallet/names | name-role/adapter tranche pending consolidated gate | source includes authenticated loopback RPC configuration, strict HTTP/JSON parsing, atomic coin/name-role snapshot restoration, encrypted monotonic scan state, mempool-bound point reads, non-consuming approval authentication, atomic approval/workflow/reservation commit, exact signed-byte fee-quote persistence, and durable pre-submission `RequiresRebroadcast` recovery | source includes epoch-bound checkpoint rewind, ordered spender evidence, split current/proof evidence revalidation, exact cross-scan binding rejection, and one-reconciliation fee-quote recovery | concrete adapter source pinned to node RPC v1 commit `5ed38d15`; no multi-process regtest run, released canonical fee algebra, canonical NameState decoder, or executed name-role qualification | no resource measurement/audit | value runtime and fee-algebra gates unavailable; names watch-only |
+| HNS wallet/names | focused `canonical_hns_v2` PASS on NVMe: 6 passed, 0 failed, 9 filtered; account-scoped persistence regression: 1 passed, 0 failed, 15 filtered; consolidated gate pending | source includes authenticated loopback RPC configuration, strict HTTP/JSON parsing, atomic coin/name-role snapshot restoration, complete bounded account-prefix entity reloads, encrypted monotonic scan state, canonical current/proof summaries and exact resource bytes, legacy-row revalidation, ephemeral ownership authority, mempool-bound point reads, atomic approval/workflow/reservation commit, exact signed-byte fee-quote persistence, and durable pre-submission `RequiresRebroadcast` recovery | source includes epoch-bound checkpoint rewind, ordered spender evidence, split current/proof revalidation, exact cross-scan binding rejection, authority reacquisition, and one-reconciliation fee-quote recovery; no multi-process restart/reorg execution | concrete adapter source pinned to node RPC v1 commit `5ed38d15`; canonical protocol crates pinned coherently to immutable `hns-rs` `4b989aa`; no multi-process regtest or name-action run | no resource measurement/audit | canonical metadata/account ownership source implemented; transfer/finalize, value runtime, and fee-algebra gates unavailable |
 | Provider core | pending consolidated gate | encrypted grants/tombstones/approvals/replays implemented | n/a | no installed-browser E2E | no audit | product integration pending |
-| Fixed-price Shakedex | prior unit baseline only | CAS journal source | evidence incomplete | no regtest/Denuo E2E | no audit | unavailable |
+| Fixed-price Shakedex | focused immutable-V2 listing/gate filter PASS on NVMe: 3 passed, 0 failed | CAS journal source | evidence incomplete | no regtest/Denuo E2E | no audit | all workflow/value gates remain unavailable |
 | Market sessions | prior unit baseline only | CAS journal source | evidence incomplete | no pair E2E | no audit | unavailable |
 | Bitcoin Kyoto | targeted allocation filter PASS on NVMe: 10 passed, 0 failed, 8 filtered; consolidated gate pending | source includes encrypted CAS-backed monotonic session/role swap-key allocation, protected seed/allocation records, authenticated re-derivation, BDK-first sync journal, bounded reconciliation chunks, restart resume, and pre-broadcast intent; allocation database reopen covered by the targeted filter; pinned Kyoto header/filter/peer persistence unavailable | source queries exact canonical hash membership within a bounded retained window; no allocation reorg or snapshot-rollback evidence | no regtest/P2P/broadcast run | not measured/no audit | send and settlement hard-disabled |
 | Ethereum | containment tranche pending consolidated gate | offline derivation and dormant typed primitives only; no synchronization/history persistence | no restart/reorg evidence | deterministic contract compiled only in prior baseline; no embedded Helios/local-chain run; permits unavailable; mainnet denied | no contract audit | synchronization/history/send/signing/settlement unavailable |
@@ -29,9 +29,20 @@ disposable NVMe checkout with an NVMe target and temporary directory:
 `cargo test --locked -p hns-wallet-bitcoin-kyoto swap_key_store::tests --
 --test-threads=1`. It passed 10 tests with 0 failures and 8 filtered out. No
 standalone build/check, full workspace gate, optimized RocksDB compilation,
-network test, or benchmark was run. The remainder of this production-hardening
-and host-contract tranche has no new local evidence. Its next broad evidence
-event is one consolidated CI invocation of `scripts/check.sh`; do not run
+network test, or benchmark was run.
+
+The final canonical-name source was tested on 2026-08-03 from an isolated NVMe
+clone with NVMe target and temporary directories:
+`cargo test --locked --lib -p hns-wallet-hns -p hns-wallet-shakedex
+canonical_hns_v2 -- --test-threads=1`. The HNS crate passed 6 tests with 0
+failures and 9 filtered; Shakedex passed 3 listing/gate tests with 0 failures.
+The later exact regression
+`cargo test --locked --lib -p hns-wallet-hns
+canonical_hns_v2_persisted_queries_are_complete_and_account_scoped --
+--test-threads=1` passed 1 test with 0 failures and 15 filtered.
+No standalone build/check, full workspace gate, RocksDB compilation, network
+test, or benchmark was run. The next broad evidence event is one consolidated
+CI invocation of `scripts/check.sh`; do not run
 separate build, check, test, and pre-push copies of the same gate. Record its
 commit ID, runner/platform, full result, test count, and artifact hashes here.
 

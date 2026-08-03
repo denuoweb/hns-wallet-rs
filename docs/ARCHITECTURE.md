@@ -17,8 +17,12 @@ hostile website
 ```
 
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
-proofs, and Denuo wire objects remain in released `hns-rs` crates. Node indexes
-and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
+proofs, and signed fixed-price listings remain in `hns-rs`. This workspace
+currently consumes all six
+direct protocol crates from reviewed immutable revision `4b989aa`; its exact
+source and lock coherence are checked before the workspace gate. Denuo wire
+objects remain outside the wallet until their orchestration tranche. Node
+indexes and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
 remains in `hns-dane-engine`. Browser JavaScript and platform UI remain in the
 browser repositories. This workspace owns keys, encrypted local state, wallet
 semantics, approvals, and recoverable application workflows.
@@ -28,11 +32,11 @@ semantics, approvals, and recoverable application workflows.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `hns-wallet-types` | IDs, integer amounts, capabilities, UI-safe summaries | consensus/wire types |
-| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, atomic approval-consume/workflow/reservation commits, provider permission tombstones, persisted workflow approvals/replays | browser storage, ABI v2 authority handles, or remote truth |
+| `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, complete bounded binary-prefix entity and opaque-workflow reads, atomic approval-consume/workflow/reservation commits, provider permission tombstones, persisted workflow approvals/replays | browser storage, ABI v2 authority handles, or remote truth |
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | HNS key roles, address/coin/name evidence and workflows | canonical encodings |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
-| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state | proof codecs |
+| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state and release-gated canonical listing inspection | proof/listing codecs |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
@@ -83,8 +87,9 @@ approval, saves the authorized exact bytes and quote, and activates the input
 reservations. Broadcast re-quotes only those persisted bytes, saves the
 refreshed quote with `RequiresRebroadcast` before submission, and allows at most
 one full reconciliation and one retry for stale or unavailable quote evidence.
-The released `hns-script` 0.1 API lacks the canonical sigop-adjusted fee algebra
-needed to independently verify the quoted minimum, so
+The immutable `hns-script` 0.2 source includes canonical sigop-adjusted fee
+algebra, but that source has not passed consolidated wallet qualification and
+the independent local minimum-fee check is not yet wired. Therefore
 `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains false and no local copy of the
 node formula is used.
 
@@ -94,10 +99,15 @@ and height must exactly equal the bound tip. Ordinary HNS coin branches and the
 domain-separated `HnsName` branch are scanned in separate bounded queries that
 must share the exact chain epoch/tip and mempool instance/generation. Name-role
 outputs may enter history but are excluded from ordinary balance, selection,
-reservation, and spendability. A released canonical NameState decoder is still
-required to bind owner, transfer, renewal and resource fields to the committed
-bytes; until it is integrated and qualified, known names are watch-only and raw
-resource/ownership claims are unavailable.
+reservation, and spendability. The wallet independently decodes both raw
+NameState views, compares every node projection, binds owner txid/index/value/
+name covenant and typed TRANSFER/FINALIZE shape, and accepts current resource
+bytes only from the decoded state. Current control is attributed only when the
+owner address exactly matches a persisted `HnsName` program; incoming and
+outgoing transfers are distinguished. Reconciliation replaces this encrypted
+cache across restart/reorg, while legacy rows stay explicitly watch-only until
+fresh evidence succeeds. Cache state cannot authorize an action: the runtime
+must reacquire a non-serializable authority at the exact current snapshot.
 
 The concrete synchronous HNS adapter now speaks the authenticated loopback
 `hns-node-rs` wallet RPC v1 boundary, pinned to node commit `5ed38d15`. It

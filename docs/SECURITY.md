@@ -164,9 +164,16 @@ exact verified redeem witness.
 Name proof evidence is bound to the exact chain epoch, tip height and tip tree
 root, and the verified Urkel bytes must equal the separately returned proof
 state. The interval-committed proof view is not collapsed with the current node
-view. Because released protocol crates do not yet decode canonical NameState
-owner/resource/transfer/renewal fields, imported names remain watch-only;
-current/proof owner hints and raw resource bytes are not authorization evidence.
+view. Both raw states are independently decoded under the requested name hash;
+every node projection and exact owner transaction output must agree. Resource
+bytes come only from decoded current state, and ownership requires an exact
+persisted `HnsName` program rather than an ordinary coin address. Persisted
+TRANSFER state also requires its transfer height to equal the active-chain
+owner-transaction inclusion height. Context-free imports report ownership as
+unevaluated rather than incorrectly asserting that a name is not wallet-owned.
+Persisted ownership is display/recovery cache state, never action authority. The
+non-serializable authority is freshly reacquired at one snapshot and is denied
+for expired, revoked, unregistered, or pending-transfer state.
 
 Ethereum has no embedded Helios proof producer in this revision. Its exact
 synchronization, value-runtime, settlement-runtime, and mainnet gates are
@@ -181,11 +188,11 @@ Serializable observation fields are structural data only and cannot authorize
 settlement.
 
 Current cross-chain code is not qualified for live value. The concrete HNS node
-adapter source is present, but its consolidated qualification, released
-canonical HNS name-state/resource decoding, a published canonical HNS
-settlement profile, released canonical HSD sigop-adjusted fee algebra, Bitcoin
-supervisor qualification, embedded Helios proof construction/persistence,
-name-role scan qualification, restart/reorg
+adapter and canonical HNS name-state/resource ownership source are present, but
+their consolidated qualification, a published canonical HNS settlement
+profile, wallet-integrated and qualified HSD fee algebra, Bitcoin supervisor
+qualification, embedded Helios proof construction/persistence, name-role scan
+qualification, restart/reorg
 demonstrations, real-chain tests, resource benchmarks, and independent review
 remain blockers.
 

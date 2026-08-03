@@ -6,8 +6,10 @@
 - Persist workflow state before broadcasting an irreversible transaction.
 - Money uses checked integer base units and canonical rational arithmetic;
   floating point is forbidden.
-- Handshake consensus and wire types come from published `hns-rs` crates.
-  Do not copy them or add a committed sibling-path dependency.
+- Handshake consensus and wire types come from published `hns-rs` crates or one
+  reviewed immutable Git revision pinned coherently across every protocol
+  crate. Do not copy them, use mutable Git references, mix revisions, or add a
+  committed sibling-path dependency.
 - Bitcoin production synchronization uses Kyoto BIP157/158 only.
 - Ethereum is native-ETH-only. Offline receive derivation is the sole available
   capability; synchronization/history gates remain false, value/settlement

@@ -9,6 +9,31 @@ if rg -n 'path\s*=\s*"\.\./' --glob Cargo.toml .; then
   exit 1
 fi
 
+hns_revision="4b989aabc132e7e79b8fd57a10f2465073faf588"
+hns_repository="https://github.com/handshake-rs/hns-rs.git"
+hns_lock_source="git+${hns_repository}?rev=${hns_revision}#${hns_revision}"
+for package in hns-covenants hns-encoding hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
+  if ! awk -v package="$package" -v source="$hns_lock_source" '
+    BEGIN { RS = ""; found = 0 }
+    index($0, "name = \"" package "\"") {
+      found += 1
+      if (!index($0, "source = \"" source "\"")) bad = 1
+    }
+    END { exit found != 1 || bad }
+  ' Cargo.lock; then
+    echo "$package must resolve exactly once from immutable hns-rs revision $hns_revision" >&2
+    exit 1
+  fi
+done
+
+for package in hns-covenants hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
+  declaration="$package = { version = \"=0.2.0\", git = \"$hns_repository\", rev = \"$hns_revision\" }"
+  if ! rg --fixed-strings --line-regexp --quiet "$declaration" Cargo.toml; then
+    echo "$package must use the reviewed immutable hns-rs source" >&2
+    exit 1
+  fi
+done
+
 if rg -n 'name = "(electrum-client|esplora-client|bitcoincore-rpc)"' Cargo.lock; then
   echo "alternate Bitcoin production backend found" >&2
   exit 1

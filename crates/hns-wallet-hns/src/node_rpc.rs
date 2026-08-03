@@ -12,13 +12,13 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use blake2::Blake2bVar;
 use blake2::digest::{Update as BlakeUpdate, VariableOutput};
+use blake2::Blake2bVar;
 use hns_covenants::{
-    Covenant, CovenantKind, MAX_COVENANT_ITEMS, MAX_COVENANT_ITEM_SIZE, MAX_NAME_SIZE,
-    MAX_RESOURCE_SIZE, hash_name,
+    Covenant, CovenantKind, NameState, MAX_COVENANT_ITEMS, MAX_COVENANT_ITEM_SIZE,
+    MAX_NAME_STATE_SIZE,
 };
-use hns_primitives::Dollarydoos;
+use hns_primitives::{Dollarydoos, NameHash};
 use hns_transaction::{Address, Output, Transaction, MAX_TRANSACTION_RAW_SIZE};
 use hns_wallet_types::{BaseUnits, TransactionHash};
 use serde::de::DeserializeOwned;
@@ -44,8 +44,7 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_ENVELOPE_OVERHEAD: usize = 16 * 1024;
-const MAX_RESPONSE_BODY_BYTES: usize =
-    MAX_RESPONSE_RESULT_BYTES + MAX_RESPONSE_ENVELOPE_OVERHEAD;
+const MAX_RESPONSE_BODY_BYTES: usize = MAX_RESPONSE_RESULT_BYTES + MAX_RESPONSE_ENVELOPE_OVERHEAD;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const MAX_FEE_TARGET_BLOCKS: u16 = 1_008;
 const MAX_FEE_SAMPLES: usize = 4_096;
@@ -128,7 +127,9 @@ impl HnsNodeRpcConfig {
             || authorization.len() > MAX_AUTHORIZATION_BYTES
             || authorization[0] == b' '
             || authorization[authorization.len() - 1] == b' '
-            || authorization.iter().any(|byte| !(0x20..=0x7e).contains(byte))
+            || authorization
+                .iter()
+                .any(|byte| !(0x20..=0x7e).contains(byte))
         {
             return Err(configuration_error());
         }
@@ -200,9 +201,7 @@ impl HnsNodeRpcBackend {
             request_id: &request_id,
             call: &call,
         };
-        let mut body = Zeroizing::new(
-            serde_json::to_vec(&request).map_err(|_| protocol_error())?,
-        );
+        let mut body = Zeroizing::new(serde_json::to_vec(&request).map_err(|_| protocol_error())?);
         if body.is_empty() || body.len() > MAX_REQUEST_BODY_BYTES {
             return Err(protocol_error());
         }
@@ -215,9 +214,7 @@ impl HnsNodeRpcBackend {
             }
             return Err(backend_error("node wallet RPC authorization rejected"));
         }
-        if response.status == 404
-            && response.content_type.as_deref() != Some("application/json")
-        {
+        if response.status == 404 && response.content_type.as_deref() != Some("application/json") {
             return Err(backend_error("node wallet RPC route is unavailable"));
         }
         if response.status == 429 {
@@ -233,7 +230,9 @@ impl HnsNodeRpcBackend {
             return Err(backend_error("node wallet RPC timed out"));
         }
         if response.status == 413 && response.content_type.as_deref() != Some("application/json") {
-            return Err(backend_error("node wallet RPC request exceeded listener bounds"));
+            return Err(backend_error(
+                "node wallet RPC request exceeded listener bounds",
+            ));
         }
         if response.content_type.as_deref() != Some("application/json") {
             return Err(protocol_error());
@@ -291,11 +290,9 @@ impl HnsNodeRpcBackend {
     }
 
     fn post(&self, body: &[u8]) -> Result<HttpResponse, HnsWalletError> {
-        let mut stream = TcpStream::connect_timeout(
-            &self.config.endpoint,
-            self.config.connect_timeout,
-        )
-        .map_err(|_| transport_error())?;
+        let mut stream =
+            TcpStream::connect_timeout(&self.config.endpoint, self.config.connect_timeout)
+                .map_err(|_| transport_error())?;
         stream.set_nodelay(true).map_err(|_| transport_error())?;
 
         let host = self.config.endpoint.to_string();
@@ -351,7 +348,7 @@ struct RpcResponseEnvelope {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, bound(deserialize = "T: Deserialize<'de>"))]
 struct TypedRpcResponseEnvelope<T> {
     api_version: u16,
     #[serde(default)]
@@ -461,8 +458,7 @@ fn read_http_response(
         if read == 0 {
             return Err(protocol_error());
         }
-        if received.len().saturating_add(read)
-            > MAX_RESPONSE_HEADER_BYTES + MAX_RESPONSE_BODY_BYTES
+        if received.len().saturating_add(read) > MAX_RESPONSE_HEADER_BYTES + MAX_RESPONSE_BODY_BYTES
         {
             return Err(protocol_error());
         }
@@ -538,9 +534,7 @@ fn parse_response_head(bytes: &[u8]) -> Result<ParsedResponseHead, HnsWalletErro
         || reason.is_empty()
         || reason.starts_with(' ')
         || reason.ends_with(' ')
-        || reason
-            .bytes()
-            .any(|byte| !(0x20..=0x7e).contains(&byte))
+        || reason.bytes().any(|byte| !(0x20..=0x7e).contains(&byte))
     {
         return Err(protocol_error());
     }
@@ -557,16 +551,14 @@ fn parse_response_head(bytes: &[u8]) -> Result<ParsedResponseHead, HnsWalletErro
         let (name, raw_value) = line.split_once(':').ok_or_else(protocol_error)?;
         if name.is_empty()
             || !name.bytes().all(is_header_name_byte)
-            || raw_value.bytes().any(|byte| {
-                byte != b'\t' && !(0x20..=0x7e).contains(&byte)
-            })
+            || raw_value
+                .bytes()
+                .any(|byte| byte != b'\t' && !(0x20..=0x7e).contains(&byte))
         {
             return Err(protocol_error());
         }
         let name = name.to_ascii_lowercase();
-        let value = raw_value
-            .trim_matches(&[' ', '\t'][..])
-            .to_owned();
+        let value = raw_value.trim_matches(&[' ', '\t'][..]).to_owned();
         if headers.insert(name, value).is_some() {
             return Err(protocol_error());
         }
@@ -588,9 +580,7 @@ fn parse_response_head(bytes: &[u8]) -> Result<ParsedResponseHead, HnsWalletErro
     {
         return Err(protocol_error());
     }
-    let length = headers
-        .get("content-length")
-        .ok_or_else(protocol_error)?;
+    let length = headers.get("content-length").ok_or_else(protocol_error)?;
     if length.is_empty()
         || !length.bytes().all(|byte| byte.is_ascii_digit())
         || (length.len() > 1 && length.starts_with('0'))
@@ -598,7 +588,9 @@ fn parse_response_head(bytes: &[u8]) -> Result<ParsedResponseHead, HnsWalletErro
         return Err(protocol_error());
     }
     let content_length = length.parse::<usize>().map_err(|_| protocol_error())?;
-    let content_type = headers.get("content-type").map(|value| value.to_ascii_lowercase());
+    let content_type = headers
+        .get("content-type")
+        .map(|value| value.to_ascii_lowercase());
     Ok(ParsedResponseHead {
         status,
         content_length,
@@ -651,8 +643,11 @@ fn error_code_message(code: &str) -> &'static str {
         "authentication_required" => "node wallet RPC authentication is not configured",
         "wallet_profile_required" => "node wallet index profile is unavailable",
         "runtime_unavailable" => "node wallet runtime is unavailable",
-        "invalid_request" | "invalid_request_id" | "unsupported_api_version"
-        | "invalid_params" | "invalid_bounds" => "node wallet RPC rejected adapter parameters",
+        "invalid_request"
+        | "invalid_request_id"
+        | "unsupported_api_version"
+        | "invalid_params"
+        | "invalid_bounds" => "node wallet RPC rejected adapter parameters",
         "response_projection_limit" | "result_limit" => "node wallet RPC result limit reached",
         "internal_projection_failure" | "owner_output_missing" | "backend_inconsistent" => {
             "node wallet RPC returned inconsistent evidence"
@@ -712,8 +707,10 @@ fn validate_rpc_error(status: u16, error: &RpcWireError) -> Result<(), HnsWallet
         return Ok(());
     }
     let message_is_valid = match error.code.as_str() {
-        "authentication_required" => error.message
-            == "wallet RPC is unavailable unless the listener has configured authentication",
+        "authentication_required" => {
+            error.message
+                == "wallet RPC is unavailable unless the listener has configured authentication"
+        }
         "wallet_profile_required" => {
             error.message == "wallet RPC requires the durable wallet index profile"
         }
@@ -742,49 +739,50 @@ fn validate_rpc_error(status: u16, error: &RpcWireError) -> Result<(), HnsWallet
         "invalid_cursor" => {
             error.message == "the opaque continuation does not belong to this query"
         }
-        "invalid_bounds" => {
-            error.message == "the request violates a wallet RPC collection bound"
+        "invalid_bounds" => error.message == "the request violates a wallet RPC collection bound",
+        "response_projection_limit" => {
+            error.message
+                == "wallet RPC result exceeds the 8 MiB wire budget; use a smaller page where applicable"
         }
-        "response_projection_limit" => error.message
-            == "wallet RPC result exceeds the 8 MiB wire budget; use a smaller page where applicable",
         "result_limit" => {
             error.message == "the bounded mempool result contains too many relevant items"
         }
         "internal_projection_failure" => {
             error.message == "wallet RPC could not encode its bounded response"
         }
-        "owner_output_missing" => error.message
-            == "the indexed owner transaction does not contain its selected output",
+        "owner_output_missing" => {
+            error.message == "the indexed owner transaction does not contain its selected output"
+        }
         "backend_inconsistent" => {
             error.message == "wallet index evidence is inconsistent with the active chain"
         }
-        "index_unavailable" => {
-            error.message == "the required optional wallet index is not enabled"
-        }
+        "index_unavailable" => error.message == "the required optional wallet index is not enabled",
         "backend_unavailable" => {
             error.message == "the canonical wallet backend is temporarily unavailable"
         }
-        "payload_pruned" => {
-            error.message == "the confirmed transaction payload has been pruned"
-        }
-        "unknown_contract" => {
-            error.message == "the tracked-contract registration is unknown"
-        }
+        "payload_pruned" => error.message == "the confirmed transaction payload has been pruned",
+        "unknown_contract" => error.message == "the tracked-contract registration is unknown",
         "name_has_no_owner" => error.message == "the current name state has no owner",
         "invalid_contract" => {
             error.message == "the tracked-contract registration is invalid or conflicts"
         }
-        "stale_snapshot" => error.message
-            == "the bound chain or mempool generation changed; restart this reconciliation",
-        "transaction_orphan" => error.message
-            == "the transaction has unresolved inputs and was not relayed as accepted",
-        "fee_quote_input_unavailable" => error.message
-            == "an input coin is unavailable in the bound active chain and mempool snapshot",
+        "stale_snapshot" => {
+            error.message
+                == "the bound chain or mempool generation changed; restart this reconciliation"
+        }
+        "transaction_orphan" => {
+            error.message == "the transaction has unresolved inputs and was not relayed as accepted"
+        }
+        "fee_quote_input_unavailable" => {
+            error.message
+                == "an input coin is unavailable in the bound active chain and mempool snapshot"
+        }
         "contract_registry_full" => {
             error.message == "the append-only tracked-contract registry is full"
         }
-        "invalid_fee_quote_transaction" => error.message
-            == "the raw transaction is not eligible for a Handshake fee quote",
+        "invalid_fee_quote_transaction" => {
+            error.message == "the raw transaction is not eligible for a Handshake fee quote"
+        }
         _ => false,
     };
     if !message_is_valid {
@@ -1109,9 +1107,9 @@ fn script_query(scripts: &[WalletAddressKey]) -> Result<ScriptQuery, HnsWalletEr
 fn decode_lower_hex(encoded: &str, maximum: usize) -> Result<Vec<u8>, HnsWalletError> {
     if !encoded.len().is_multiple_of(2)
         || encoded.len() > maximum.saturating_mul(2)
-        || encoded.bytes().any(|byte| {
-            !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte)
-        })
+        || encoded
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
     {
         return Err(protocol_error());
     }
@@ -1246,14 +1244,9 @@ fn canonical_transaction(
     Ok((raw, transaction))
 }
 
-fn inclusion(
-    wire: WireInclusion,
-    tip: ChainTip,
-) -> Result<TransactionInclusion, HnsWalletError> {
+fn inclusion(wire: WireInclusion, tip: ChainTip) -> Result<TransactionInclusion, HnsWalletError> {
     let height = u64::from(wire.height);
-    if height > tip.height
-        || u64::from(wire.confirmations) != tip.height - height + 1
-    {
+    if height > tip.height || u64::from(wire.confirmations) != tip.height - height + 1 {
         return Err(protocol_error());
     }
     Ok(TransactionInclusion {
@@ -1344,8 +1337,7 @@ impl HnsBackend for HnsNodeRpcBackend {
                 .ok_or_else(protocol_error)?;
             let txid = TransactionHash::new(decode_hex_32(&row.txid)?);
             let block_hash = decode_hex_32(&row.block_hash)?;
-            if !row.received
-                && !row.spent
+            if !row.received && !row.spent
                 || u64::from(row.height) > binding.tip.height
                 || !history_keys.insert((txid, request_index))
             {
@@ -1386,8 +1378,8 @@ impl HnsBackend for HnsNodeRpcBackend {
             {
                 return Err(protocol_error());
             }
-            let confirmation_count = u32::try_from(binding.tip.height - height + 1)
-                .map_err(|_| protocol_error())?;
+            let confirmation_count =
+                u32::try_from(binding.tip.height - height + 1).map_err(|_| protocol_error())?;
             utxos.push(IndexedWalletCoin {
                 coin: WalletCoin {
                     outpoint,
@@ -1474,15 +1466,17 @@ impl HnsBackend for HnsNodeRpcBackend {
                 {
                     return Err(protocol_error());
                 }
-                let entry = histories.entry((txid, request_index)).or_insert(HistoryEntry {
-                    txid,
-                    height: None,
-                    block_hash: None,
-                    transaction_position: None,
-                    spent: false,
-                    first_seen_unix: Some(activity.admitted_at),
-                    script_index: request_index,
-                });
+                let entry = histories
+                    .entry((txid, request_index))
+                    .or_insert(HistoryEntry {
+                        txid,
+                        height: None,
+                        block_hash: None,
+                        transaction_position: None,
+                        spent: false,
+                        first_seen_unix: Some(activity.admitted_at),
+                        script_index: request_index,
+                    });
                 if entry.first_seen_unix != Some(activity.admitted_at) {
                     return Err(protocol_error());
                 }
@@ -1498,15 +1492,17 @@ impl HnsBackend for HnsNodeRpcBackend {
                 if !spent_relations.insert((request_index, outpoint)) {
                     return Err(protocol_error());
                 }
-                let entry = histories.entry((txid, request_index)).or_insert(HistoryEntry {
-                    txid,
-                    height: None,
-                    block_hash: None,
-                    transaction_position: None,
-                    spent: true,
-                    first_seen_unix: Some(activity.admitted_at),
-                    script_index: request_index,
-                });
+                let entry = histories
+                    .entry((txid, request_index))
+                    .or_insert(HistoryEntry {
+                        txid,
+                        height: None,
+                        block_hash: None,
+                        transaction_position: None,
+                        spent: true,
+                        first_seen_unix: Some(activity.admitted_at),
+                        script_index: request_index,
+                    });
                 if entry.first_seen_unix != Some(activity.admitted_at) {
                     return Err(protocol_error());
                 }
@@ -1553,11 +1549,7 @@ impl HnsBackend for HnsNodeRpcBackend {
             .map(|wire| inclusion(wire, binding.tip))
             .transpose()?;
         if let Some(confirmed) = inclusion {
-            self.require_active_block_hash(
-                confirmed.height,
-                confirmed.block_hash,
-                binding,
-            )?;
+            self.require_active_block_hash(confirmed.height, confirmed.block_hash, binding)?;
         }
         let raw = response
             .transaction_hex
@@ -1565,22 +1557,14 @@ impl HnsBackend for HnsNodeRpcBackend {
             .map(|encoded| canonical_transaction(encoded, Some(txid)).map(|value| value.0))
             .transpose()?;
         let status = match response.status.as_str() {
-            "mempool"
-                if response.payload == "retained"
-                    && inclusion.is_none()
-                    && raw.is_some() =>
-            {
+            "mempool" if response.payload == "retained" && inclusion.is_none() && raw.is_some() => {
                 TransactionStatus {
                     in_mempool: true,
                     confirmation_count: 0,
                     conflicted: false,
                 }
             }
-            "unknown"
-                if response.payload == "absent"
-                    && inclusion.is_none()
-                    && raw.is_none() =>
-            {
+            "unknown" if response.payload == "absent" && inclusion.is_none() && raw.is_none() => {
                 TransactionStatus {
                     in_mempool: false,
                     confirmation_count: 0,
@@ -1600,10 +1584,8 @@ impl HnsBackend for HnsNodeRpcBackend {
                 }
                 TransactionStatus {
                     in_mempool: false,
-                    confirmation_count: u32::try_from(
-                        binding.tip.height - confirmed.height + 1,
-                    )
-                    .map_err(|_| protocol_error())?,
+                    confirmation_count: u32::try_from(binding.tip.height - confirmed.height + 1)
+                        .map_err(|_| protocol_error())?,
                     conflicted: false,
                 }
             }
@@ -1715,9 +1697,7 @@ impl HnsBackend for HnsNodeRpcBackend {
         }))?;
         let returned = TransactionHash::new(decode_hex_32(&response.txid)?);
         if returned != expected
-            || response
-                .queued_peers
-                .checked_add(response.failed_peers)
+            || response.queued_peers.checked_add(response.failed_peers)
                 != Some(response.attempted_peers)
         {
             return Err(protocol_error());
@@ -1768,20 +1748,17 @@ impl HnsBackend for HnsNodeRpcBackend {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
         let rate_source = match response.rate_source.as_str() {
-            "minimum_relay" if response.rate_sample_count == 0 => {
-                HnsFeeRateSource::MinimumRelay
-            }
+            "minimum_relay" if response.rate_sample_count == 0 => HnsFeeRateSource::MinimumRelay,
             "mempool" if response.rate_sample_count > 0 => HnsFeeRateSource::Mempool,
             _ => return Err(protocol_error()),
         };
         let minimum_policy_fee =
             BaseUnits::new(u128::from(response.minimum_policy_fee_atomic_units));
         let actual_fee = BaseUnits::new(u128::from(response.actual_fee_atomic_units));
-        let minimum_policy_fee_shortfall =
-            BaseUnits::new(u128::from(response.minimum_policy_fee_shortfall_atomic_units));
-        let expected_shortfall = minimum_policy_fee
-            .get()
-            .saturating_sub(actual_fee.get());
+        let minimum_policy_fee_shortfall = BaseUnits::new(u128::from(
+            response.minimum_policy_fee_shortfall_atomic_units,
+        ));
+        let expected_shortfall = minimum_policy_fee.get().saturating_sub(actual_fee.get());
         if TransactionHash::new(decode_hex_32(&response.txid)?) != expected_txid
             || response.target_blocks != u32::from(target_blocks)
             || response.rate_atomic_units_per_1000_policy_vbytes < 1_000
@@ -1789,8 +1766,7 @@ impl HnsBackend for HnsNodeRpcBackend {
             || response.transaction_weight != transaction_weight
             || response.transaction_weight == 0
             || response.sigop_adjusted_policy_vbytes == 0
-            || response.meets_minimum_policy_fee
-                != (actual_fee >= minimum_policy_fee)
+            || response.meets_minimum_policy_fee != (actual_fee >= minimum_policy_fee)
             || minimum_policy_fee_shortfall.get() != expected_shortfall
         {
             return Err(protocol_error());
@@ -1836,9 +1812,7 @@ impl HnsBackend for HnsNodeRpcBackend {
         {
             return Err(protocol_error());
         }
-        Ok(BaseUnits::new(u128::from(
-            response.atomic_units_per_kvb,
-        )))
+        Ok(BaseUnits::new(u128::from(response.atomic_units_per_kvb)))
     }
 
     fn get_name_evidence(
@@ -1853,7 +1827,7 @@ impl HnsBackend for HnsNodeRpcBackend {
                 "expected_chain_epoch": binding.chain_epoch,
             },
         }))?;
-        require_binding(response.chain_epoch, response.tip, binding)?;
+        require_binding(response.chain_epoch, response.tip.clone(), binding)?;
         validated_name_response(self, response, name_hash, binding)
     }
 }
@@ -1864,8 +1838,7 @@ fn validated_name_response(
     expected_name_hash: [u8; 32],
     binding: SnapshotBinding,
 ) -> Result<NameEvidence, HnsWalletError> {
-    if response.data_semantics
-        != "projected_data_hex_is_resource_bytes_not_encoded_name_state"
+    if response.data_semantics != "projected_data_hex_is_resource_bytes_not_encoded_name_state"
         || response.current_state_hex.is_some() != response.current_state.is_some()
         || response.proof_state_hex.is_some() != response.proof_state.is_some()
         || response.current_owner.is_some() && response.current_state.is_none()
@@ -1873,17 +1846,21 @@ fn validated_name_response(
     {
         return Err(protocol_error());
     }
-    if let Some(state) = response.current_state.as_ref() {
-        validate_projected_name_state(state, expected_name_hash)?;
-    }
-    if let Some(state) = response.proof_state.as_ref() {
-        validate_projected_name_state(state, expected_name_hash)?;
-    }
-    let current_resource = response
-        .current_state
-        .as_ref()
-        .map(|state| decode_lower_hex(&state.data_hex, MAX_RESOURCE_SIZE))
+    let canonical_current = response
+        .current_state_hex
+        .as_deref()
+        .zip(response.current_state.as_ref())
+        .map(|(raw, projected)| decode_projected_name_state(raw, projected, expected_name_hash))
         .transpose()?;
+    let canonical_proof = response
+        .proof_state_hex
+        .as_deref()
+        .zip(response.proof_state.as_ref())
+        .map(|(raw, projected)| decode_projected_name_state(raw, projected, expected_name_hash))
+        .transpose()?;
+    let current_resource = canonical_current
+        .as_ref()
+        .map(|(_, state)| state.resource_data.clone());
     let (current_owner_outpoint, current_owner_transaction) = response
         .current_owner
         .map(|owner| {
@@ -1891,14 +1868,12 @@ fn validated_name_response(
                 backend,
                 owner,
                 response.current_state.as_ref().ok_or_else(protocol_error)?,
-                expected_name_hash,
+                &canonical_current.as_ref().ok_or_else(protocol_error)?.1,
                 binding,
             )
         })
         .transpose()?
-        .map_or((None, None), |(outpoint, raw)| {
-            (Some(outpoint), Some(raw))
-        });
+        .map_or((None, None), |(outpoint, raw)| (Some(outpoint), Some(raw)));
     let (proof_owner_outpoint, proof_owner_transaction) = response
         .proof_owner
         .map(|owner| {
@@ -1906,28 +1881,15 @@ fn validated_name_response(
                 backend,
                 owner,
                 response.proof_state.as_ref().ok_or_else(protocol_error)?,
-                expected_name_hash,
+                &canonical_proof.as_ref().ok_or_else(protocol_error)?.1,
                 binding,
             )
         })
         .transpose()?
-        .map_or((None, None), |(outpoint, raw)| {
-            (Some(outpoint), Some(raw))
-        });
+        .map_or((None, None), |(outpoint, raw)| (Some(outpoint), Some(raw)));
 
-    let current_state = response
-        .current_state_hex
-        .map(|encoded| decode_lower_hex(&encoded, 1_024))
-        .transpose()?;
-    let proof_state = response
-        .proof_state_hex
-        .map(|encoded| decode_lower_hex(&encoded, 1_024))
-        .transpose()?;
-    if current_state.as_ref().is_some_and(Vec::is_empty)
-        || proof_state.as_ref().is_some_and(Vec::is_empty)
-    {
-        return Err(protocol_error());
-    }
+    let current_state = canonical_current.map(|(raw, _)| raw);
+    let proof_state = canonical_proof.map(|(raw, _)| raw);
     let proof_name_hash = decode_hex_32(&response.proof.name_hash)?;
     let proof_root = decode_hex_32(&response.proof.root)?;
     let proof = decode_lower_hex(&response.proof.proof_hex, 1_000_000)?;
@@ -1961,53 +1923,61 @@ fn validated_name_response(
     })
 }
 
-fn validate_projected_name_state(
+fn decode_projected_name_state(
+    encoded: &str,
     state: &WireNameState,
     expected_name_hash: [u8; 32],
-) -> Result<(), HnsWalletError> {
-    if decode_hex_32(&state.name_hash)? != expected_name_hash {
-        return Err(protocol_error());
-    }
-    let name = decode_lower_hex(&state.name_hex, MAX_NAME_SIZE)?;
-    let data = decode_lower_hex(&state.data_hex, MAX_RESOURCE_SIZE)?;
-    let canonical_name_hash = hash_name(&name)
-        .map_err(|_| protocol_error())?
-        .into_bytes();
-    if name.is_empty()
-        || canonical_name_hash != expected_name_hash
-        || hns_outpoint(&state.owner).is_err()
+) -> Result<(Vec<u8>, NameState), HnsWalletError> {
+    let raw = decode_lower_hex(encoded, MAX_NAME_STATE_SIZE)?;
+    let canonical =
+        NameState::decode(NameHash::new(expected_name_hash), &raw).map_err(|_| protocol_error())?;
+    let projected_owner = hns_outpoint(&state.owner)?;
+    let canonical_owner = HnsOutpoint {
+        transaction: TransactionHash::new(canonical.owner.transaction_hash.into_bytes()),
+        output_index: canonical.owner.index,
+    };
+    if decode_hex_32(&state.name_hash)? != expected_name_hash
+        || decode_lower_hex(&state.name_hex, 63)? != canonical.name
+        || state.height != canonical.height.get()
+        || state.renewal != canonical.renewal.get()
+        || projected_owner != canonical_owner
+        || state.value != canonical.value.get()
+        || state.highest != canonical.highest.get()
+        || decode_lower_hex(&state.data_hex, 512)? != canonical.resource_data
+        || state.transfer != canonical.transfer.get()
+        || state.revoked != canonical.revoked.get()
+        || state.claimed != canonical.claimed.get()
+        || state.renewals != canonical.renewals
+        || state.registered != canonical.registered
+        || state.expired != canonical.expired
+        || state.weak != canonical.weak
     {
         return Err(protocol_error());
     }
-    let _ = (
-        state.height,
-        state.renewal,
-        state.value,
-        state.highest,
-        state.transfer,
-        state.revoked,
-        state.claimed,
-        state.renewals,
-        state.registered,
-        state.expired,
-        state.weak,
-        data,
-    );
-    Ok(())
+    Ok((raw, canonical))
 }
 
 fn validate_name_owner(
     backend: &HnsNodeRpcBackend,
     owner: WireNameOwner,
     expected_state: &WireNameState,
-    expected_name_hash: [u8; 32],
+    canonical_state: &NameState,
     binding: SnapshotBinding,
 ) -> Result<(HnsOutpoint, Vec<u8>), HnsWalletError> {
     if &owner.name_state != expected_state || owner.owner != owner.name_state.owner {
         return Err(protocol_error());
     }
-    validate_projected_name_state(&owner.name_state, expected_name_hash)?;
     let outpoint = hns_outpoint(&owner.owner)?;
+    let canonical_outpoint = canonical_state
+        .owner_outpoint()
+        .map(|canonical| HnsOutpoint {
+            transaction: TransactionHash::new(canonical.transaction_hash.into_bytes()),
+            output_index: canonical.index,
+        })
+        .ok_or_else(protocol_error)?;
+    if outpoint != canonical_outpoint {
+        return Err(protocol_error());
+    }
     let (raw, transaction) =
         canonical_transaction(&owner.transaction_hex, Some(outpoint.transaction))?;
     let output = wire_output(&owner.owner_output)?;
@@ -2018,6 +1988,112 @@ fn validate_name_owner(
     if inclusion.transaction_index.is_none() {
         return Err(protocol_error());
     }
+    validate_name_owner_inclusion(canonical_state, output.covenant.kind, inclusion.height)?;
     backend.require_active_block_hash(inclusion.height, inclusion.block_hash, binding)?;
     Ok((outpoint, raw))
+}
+
+fn validate_name_owner_inclusion(
+    canonical_state: &NameState,
+    owner_covenant: CovenantKind,
+    inclusion_height: u64,
+) -> Result<(), HnsWalletError> {
+    let transfer_height = u64::from(canonical_state.transfer.get());
+    match owner_covenant {
+        CovenantKind::Transfer if transfer_height != 0 && transfer_height == inclusion_height => {
+            Ok(())
+        }
+        CovenantKind::Transfer => Err(protocol_error()),
+        _ if transfer_height != 0 => Err(protocol_error()),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hns_covenants::hash_name;
+    use hns_primitives::{Height, Outpoint};
+
+    #[test]
+    fn canonical_hns_v2_node_projection_must_equal_raw_name_state() {
+        let name = b"alpha".to_vec();
+        let name_hash = hash_name(&name).expect("name hash");
+        let state = NameState {
+            name_hash,
+            name: name.clone(),
+            height: Height::new(10),
+            renewal: Height::new(11),
+            owner: Outpoint::NULL,
+            value: Dollarydoos::new(12),
+            highest: Dollarydoos::new(13),
+            resource_data: vec![1],
+            transfer: Height::new(0),
+            revoked: Height::new(0),
+            claimed: Height::new(0),
+            renewals: 2,
+            registered: true,
+            expired: false,
+            weak: true,
+        };
+        let raw = state.encode().expect("name state");
+        let projection = WireNameState {
+            name_hash: hex::encode(name_hash.as_bytes()),
+            name_hex: hex::encode(name),
+            height: 10,
+            renewal: 11,
+            owner: WireOutpoint {
+                txid: hex::encode([0; 32]),
+                index: u32::MAX,
+            },
+            value: 12,
+            highest: 13,
+            data_hex: hex::encode([1]),
+            transfer: 0,
+            revoked: 0,
+            claimed: 0,
+            renewals: 2,
+            registered: true,
+            expired: false,
+            weak: true,
+        };
+        let encoded = hex::encode(&raw);
+        assert!(decode_projected_name_state(&encoded, &projection, name_hash.into_bytes()).is_ok());
+
+        let mut mismatches = Vec::new();
+        let mut mismatch = projection.clone();
+        mismatch.value += 1;
+        mismatches.push(mismatch);
+        let mut mismatch = projection.clone();
+        mismatch.data_hex = hex::encode([2]);
+        mismatches.push(mismatch);
+        let mut mismatch = projection.clone();
+        mismatch.owner.index = 0;
+        mismatches.push(mismatch);
+        let mut mismatch = projection.clone();
+        mismatch.transfer = 1;
+        mismatches.push(mismatch);
+        let mut mismatch = projection.clone();
+        mismatch.registered = false;
+        mismatches.push(mismatch);
+        let mut mismatch = projection;
+        mismatch.renewals += 1;
+        mismatches.push(mismatch);
+        assert!(mismatches.into_iter().all(|projection| {
+            decode_projected_name_state(&encoded, &projection, name_hash.into_bytes()).is_err()
+        }));
+    }
+
+    #[test]
+    fn canonical_hns_v2_transfer_height_must_match_owner_inclusion() {
+        let mut state = NameState::null(NameHash::new([1; 32]));
+        state.transfer = Height::new(42);
+        assert!(validate_name_owner_inclusion(&state, CovenantKind::Transfer, 42).is_ok());
+        assert!(validate_name_owner_inclusion(&state, CovenantKind::Transfer, 41).is_err());
+        assert!(validate_name_owner_inclusion(&state, CovenantKind::Finalize, 42).is_err());
+
+        state.transfer = Height::new(0);
+        assert!(validate_name_owner_inclusion(&state, CovenantKind::Finalize, 42).is_ok());
+        assert!(validate_name_owner_inclusion(&state, CovenantKind::Transfer, 0).is_err());
+    }
 }

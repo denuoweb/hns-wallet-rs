@@ -77,12 +77,11 @@ refreshed quote and `RequiresRebroadcast` state, and then submits those same
 bytes. A stale snapshot or temporarily unavailable quote input permits exactly
 one complete reconciliation and one quote retry; there is no polling loop.
 
-The released `hns-script` 0.1 API does not expose the canonical HSD
-sigop-adjusted policy-size/fee algebra needed for an independent wallet check
-of the node's minimum. The wallet must not copy that consensus/policy formula.
-`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` therefore remains `false`, so the
-wired quote path cannot authorize value until a released canonical helper is
-integrated and qualified.
+The reviewed immutable `hns-script` 0.2 source exposes canonical HSD
+sigop-adjusted policy-size/fee algebra, but the wallet has not yet wired and
+qualified its independent minimum check. The wallet must not copy that policy
+formula. `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` therefore remains `false`,
+so the wired quote path cannot authorize value.
 
 Confirmed coinbase identity is preserved exactly, but coinbase outputs are
 conservatively excluded from selection. No local maturity constant is invented;
@@ -95,24 +94,35 @@ Every unique spender block and every confirmed transaction/name-owner inclusion
 is cross-checked through the epoch-bound active-chain block-hash method before
 the runtime accepts it.
 Name responses preserve the exact canonical current/proof NameState bytes and
-strict Urkel proof bytes. Projected name fields are checked for structural and
-transaction consistency but are not reconstructed into canonical state or
-used as ownership/resource authority.
+strict Urkel proof bytes. The adapter decodes each raw state under the requested
+name hash and requires every projected name, height, owner, value, resource,
+transfer, renewal, claim, and flag field to equal it. The HNS runtime separately
+checks strict proof inclusion, owner txid/index, exact output value, name
+covenant and typed TRANSFER/FINALIZE shape. Current resources are retained only
+when byte-identical to decoded `resource_data`; malformed typed DNS data remains
+lossless canonical opaque data rather than invalidating consensus state.
+For a TRANSFER owner, canonical NameState transfer height must equal that owner
+transaction's active-chain inclusion height. A non-TRANSFER owner is rejected
+while transfer height remains nonzero; FINALIZE is not incorrectly bound to its
+own inclusion height.
 
 ## Release policy
 
 This adapter removes the missing source boundary; it does not by itself enable
 value movement. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` remains `false`, runtime
-configuration rejects HNS send and settlement on every network, imported names
-remain watch-only, and Shakedex/HTLC descriptor or preimage transport remains
-unavailable until published canonical `hns-rs` 0.2 types, canonical NameState/
-resource decoding, canonical fee-quote algebra, product integration, and the
-recorded qualification gates land. The separately persisted name-role scan is
-source-only key discovery and does not authorize ownership. Ordinary HNS send
+configuration rejects HNS send and settlement on every network. Imported names
+now retain authoritative decoded metadata and account-bound ownership status,
+while the context-free library import reports ownership as explicitly
+unevaluated instead of claiming `NotWalletOwned`. That persisted status cannot
+authorize value. `verify_name_ownership`
+reacquires a non-serializable authority from the exact live snapshot and only
+for a registered, unexpired, unrevoked, non-transferring owner output matching a
+persisted `HnsName` derivation. Shakedex/HTLC descriptor or preimage transport
+remains unavailable until protocol qualification, canonical fee-quote
+integration, product integration, and the recorded gates land. Ordinary HNS send
 and the exposed settlement lock, redeem, and refund paths are within this quote
 boundary. Name transfer and FINALIZE transaction construction are not exposed
 here and are not implied to be complete.
 
-No local build or test result was produced for this tranche. The next evidence
-event is the single consolidated CI gate described in
-[QUALIFICATION.md](QUALIFICATION.md).
+Focused and consolidated evidence for this source is recorded only in
+[QUALIFICATION.md](QUALIFICATION.md); no test result changes a value gate.

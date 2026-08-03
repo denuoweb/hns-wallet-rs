@@ -10,18 +10,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bech32::{Hrp, segwit};
+use bech32::{segwit, Hrp};
 use bip39::{Language, Mnemonic};
+use blake2::digest::VariableOutput;
 use blake2::Blake2bVar;
-use blake2::digest::{Update as BlakeUpdate, VariableOutput};
 use hkdf::Hkdf;
-use hns_covenants::{Covenant, hash_name, validate_name};
+use hns_covenants::{
+    hash_name, validate_name, Covenant, CovenantKind, FinalizeCovenant, NameState, TransferCovenant,
+};
 use hns_primitives::{
     Dollarydoos, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
 };
 use hns_script::{
-    OP_BLAKE160, OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF,
-    OP_EQUALVERIFY, OP_IF, OP_SHA256, SIGHASH_ALL, signature_hash,
+    signature_hash, OP_BLAKE160, OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP, OP_DUP, OP_ELSE,
+    OP_ENDIF, OP_EQUALVERIFY, OP_IF, OP_SHA256, SIGHASH_ALL,
 };
 use hns_transaction::{Address, Input, Outpoint, Output, Transaction, Witness};
 use hns_urkel_proof::{ProofKind, UrkelProof};
@@ -38,7 +40,7 @@ use hns_wallet_chain_api::{
 };
 use hns_wallet_store::{
     EntityBatchDelete, EntityBatchSave, EntityKind, SecretKind, StoreError, StoredEntity,
-    WalletStore,
+    StoredWorkflow, WalletStore,
 };
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, BaseUnits, ChainCapabilities, DerivationReference, FeeModel,
@@ -77,10 +79,10 @@ pub const MAX_SCAN_CURSOR_BYTES: usize = 4_096;
 pub const MAX_SCAN_PAGES: usize = 128;
 pub const MAX_SNAPSHOT_RESTARTS: usize = 3;
 pub const DEFAULT_FEE_TARGET_BLOCKS: u16 = 6;
-/// The wallet is still pinned to released hns-script 0.1, which does not
-/// expose canonical HSD fee-policy algebra. Exact node quotes are adopted and
-/// persisted, but cannot authorize value until the released 0.2 helper is
-/// consumed without duplicating node policy in this crate.
+/// Canonical HSD fee-policy algebra is available from the reviewed immutable
+/// protocol source, but it has not passed the wallet's consolidated release
+/// qualification. Exact node quotes remain evidence only until that gate is
+/// independently enabled.
 pub const HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED: bool = false;
 /// Release gate: value operations stay unavailable until the concrete node
 /// adapter and the complete runtime qualification suite pass together.
@@ -563,34 +565,70 @@ pub struct NameEvidence {
     /// The interval-committed state bytes. These must exactly equal the bytes
     /// recovered by strict Urkel proof verification.
     pub proof_state: Option<Vec<u8>>,
-    /// Node-decoded hint, not independently linked to `proof_state` until a
-    /// released canonical NameState decoder is available.
+    /// Node projection that the wallet independently binds to `proof_state`.
     pub proof_owner_outpoint: Option<HnsOutpoint>,
     pub proof_owner_transaction: Option<Vec<u8>>,
     /// The node's current canonical view at `binding`. It may differ from the
     /// most recently committed name-tree proof view.
     pub current_state: Option<Vec<u8>>,
-    /// Node-decoded hint, not independently linked to `current_state` yet.
+    /// Node projection that the wallet independently binds to `current_state`.
     pub current_owner_outpoint: Option<HnsOutpoint>,
     pub current_owner_transaction: Option<Vec<u8>>,
-    /// Resource bytes cannot yet be parsed from and bound to canonical name
-    /// state by a released `hns-rs` API. Callers must not display these as
-    /// proof-authenticated.
+    /// Legacy field name retained at the RPC/storage boundary. The wallet
+    /// accepts these bytes only when they exactly equal canonical
+    /// `NameState::resource_data` for `current_state`.
     pub untrusted_current_raw_resource: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NameResourceStatus {
+    /// Legacy persisted records remain non-authoritative until reconciliation.
     UnavailableCanonicalBinding,
+    NoCurrentState,
+    Empty,
+    CanonicalDecoded,
+    /// Consensus-authenticated bytes that are not a typed DNS Resource.
+    CanonicalOpaque,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NameOwnershipStatus {
-    /// The released protocol crates cannot yet decode canonical NameState and
-    /// bind its owner fields to the separately returned owner transaction.
+    /// Legacy persisted records remain watch-only until fresh reconciliation.
     WatchOnlyCanonicalStateDecoderUnavailable,
+    /// Canonical name state was authenticated without an account address set,
+    /// so wallet ownership was deliberately not classified.
+    WalletContextUnavailable,
+    NoCurrentOwner,
+    NotWalletOwned,
+    WalletOwned {
+        derivation: DerivationReference,
+    },
+    IncomingTransfer {
+        recipient_derivation: DerivationReference,
+        current_owner: WalletAddressKey,
+    },
+    OutgoingTransfer {
+        owner_derivation: DerivationReference,
+        recipient: WalletAddressKey,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalNameStateSummary {
+    pub owner_outpoint: Option<HnsOutpoint>,
+    pub value: u64,
+    pub highest: u64,
+    pub start_height: u32,
+    pub renewal_height: u32,
+    pub transfer_height: u32,
+    pub revoked_height: u32,
+    pub claimed_height: u32,
+    pub renewals: u32,
+    pub registered: bool,
+    pub expired: bool,
+    pub weak: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -602,8 +640,93 @@ pub struct KnownName {
     pub unbound_current_owner_outpoint: Option<HnsOutpoint>,
     pub proof_state: Option<Vec<u8>>,
     pub current_state: Option<Vec<u8>>,
+    #[serde(default)]
+    pub canonical_proof_state: Option<CanonicalNameStateSummary>,
+    #[serde(default)]
+    pub canonical_current_state: Option<CanonicalNameStateSummary>,
+    #[serde(default)]
+    pub current_raw_resource: Option<Vec<u8>>,
     pub resource_status: NameResourceStatus,
     pub ownership_status: NameOwnershipStatus,
+}
+
+/// Ephemeral proof that the current runtime snapshot binds a canonical name
+/// owner output to one persisted `HnsName` derivation. It is deliberately not
+/// serializable or cloneable; every value workflow must reacquire it and check
+/// that its exact snapshot is still current before preparing an action.
+pub struct VerifiedNameOwnership {
+    binding: SnapshotBinding,
+    name: Vec<u8>,
+    name_hash: [u8; 32],
+    current_state: Vec<u8>,
+    owner_outpoint: HnsOutpoint,
+    owner_transaction: Vec<u8>,
+    owner_output: Output,
+    derivation: DerivationReference,
+}
+
+impl fmt::Debug for VerifiedNameOwnership {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedNameOwnership")
+            .field("binding", &self.binding)
+            .field("name", &String::from_utf8_lossy(&self.name))
+            .field("name_hash", &hex::encode(self.name_hash))
+            .field("owner_outpoint", &self.owner_outpoint)
+            .field("derivation", &self.derivation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedNameOwnership {
+    pub const fn binding(&self) -> SnapshotBinding {
+        self.binding
+    }
+
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    pub const fn name_hash(&self) -> [u8; 32] {
+        self.name_hash
+    }
+
+    pub fn current_state(&self) -> &[u8] {
+        &self.current_state
+    }
+
+    pub const fn owner_outpoint(&self) -> HnsOutpoint {
+        self.owner_outpoint
+    }
+
+    pub fn owner_transaction(&self) -> &[u8] {
+        &self.owner_transaction
+    }
+
+    pub fn owner_output(&self) -> &Output {
+        &self.owner_output
+    }
+
+    pub const fn derivation(&self) -> DerivationReference {
+        self.derivation
+    }
+}
+
+struct ValidatedNameEvidence {
+    known_name: KnownName,
+    current: Option<ValidatedCanonicalNameState>,
+}
+
+struct ValidatedCanonicalNameState {
+    state: NameState,
+    summary: CanonicalNameStateSummary,
+    owner: Option<ValidatedNameOwner>,
+}
+
+struct ValidatedNameOwner {
+    outpoint: HnsOutpoint,
+    raw_transaction: Vec<u8>,
+    output: Output,
 }
 
 pub fn import_known_name<B: HnsBackend>(
@@ -611,14 +734,15 @@ pub fn import_known_name<B: HnsBackend>(
     name: &[u8],
     binding: SnapshotBinding,
 ) -> Result<KnownName, HnsWalletError> {
-    validated_name_evidence(backend, name, binding)
+    Ok(validated_name_evidence(backend, name, binding, None)?.known_name)
 }
 
 fn validated_name_evidence<B: HnsBackend>(
     backend: &B,
     name: &[u8],
     binding: SnapshotBinding,
-) -> Result<KnownName, HnsWalletError> {
+    wallet_name_addresses: Option<&[DerivedHnsAddress]>,
+) -> Result<ValidatedNameEvidence, HnsWalletError> {
     if !validate_name(name) {
         return Err(HnsWalletError::InvalidName);
     }
@@ -648,23 +772,33 @@ fn validated_name_evidence<B: HnsBackend>(
     let proof_state = proof
         .verify_strict(TreeRoot::new(response.tree_root))
         .map_err(|_| HnsWalletError::InvalidEvidence)?;
-    if proof_state != evidence.proof_state
-        || (evidence.proof_state.is_none() && evidence.proof_owner_outpoint.is_some())
-        || (evidence.current_state.is_none() && evidence.current_owner_outpoint.is_some())
-        || evidence.proof_owner_outpoint.is_some() != evidence.proof_owner_transaction.is_some()
-        || evidence.current_owner_outpoint.is_some() != evidence.current_owner_transaction.is_some()
-    {
+    if proof_state != evidence.proof_state {
         return Err(HnsWalletError::InvalidEvidence);
     }
-    validate_name_owner_transaction(
+    if let Some(wallet_name_addresses) = wallet_name_addresses {
+        validate_wallet_name_addresses(wallet_name_addresses)?;
+    }
+    let canonical_proof = validate_canonical_name_state(
+        name,
+        name_hash,
+        evidence.proof_state.as_deref(),
         evidence.proof_owner_outpoint,
         evidence.proof_owner_transaction.as_deref(),
     )?;
-    validate_name_owner_transaction(
+    let canonical_current = validate_canonical_name_state(
+        name,
+        name_hash,
+        evidence.current_state.as_deref(),
         evidence.current_owner_outpoint,
         evidence.current_owner_transaction.as_deref(),
     )?;
-    Ok(KnownName {
+    let (current_raw_resource, resource_status) = bind_current_name_resource(
+        canonical_current.as_ref(),
+        evidence.untrusted_current_raw_resource,
+    )?;
+    let ownership_status =
+        classify_name_ownership(canonical_current.as_ref(), wallet_name_addresses)?;
+    let known_name = KnownName {
         name: name.to_vec(),
         name_hash,
         proof_height: response.proof_height,
@@ -672,26 +806,214 @@ fn validated_name_evidence<B: HnsBackend>(
         unbound_current_owner_outpoint: evidence.current_owner_outpoint,
         proof_state,
         current_state: evidence.current_state,
-        resource_status: NameResourceStatus::UnavailableCanonicalBinding,
-        ownership_status: NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable,
+        canonical_proof_state: canonical_proof.as_ref().map(|state| state.summary.clone()),
+        canonical_current_state: canonical_current
+            .as_ref()
+            .map(|state| state.summary.clone()),
+        current_raw_resource,
+        resource_status,
+        ownership_status,
+    };
+    Ok(ValidatedNameEvidence {
+        known_name,
+        current: canonical_current,
     })
 }
 
-fn validate_name_owner_transaction(
+fn bind_current_name_resource(
+    current: Option<&ValidatedCanonicalNameState>,
+    projected: Option<Vec<u8>>,
+) -> Result<(Option<Vec<u8>>, NameResourceStatus), HnsWalletError> {
+    let canonical = current.map(|current| current.state.resource_data.clone());
+    if canonical != projected {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let status = match current {
+        None => NameResourceStatus::NoCurrentState,
+        Some(current) if current.state.resource_data.is_empty() => NameResourceStatus::Empty,
+        Some(current) if current.state.resource().is_ok() => NameResourceStatus::CanonicalDecoded,
+        Some(_) => NameResourceStatus::CanonicalOpaque,
+    };
+    Ok((canonical, status))
+}
+
+fn validate_canonical_name_state(
+    expected_name: &[u8],
+    expected_name_hash: [u8; 32],
+    raw_state: Option<&[u8]>,
     owner: Option<HnsOutpoint>,
     raw: Option<&[u8]>,
-) -> Result<(), HnsWalletError> {
-    match (owner, raw) {
-        (None, None) => Ok(()),
-        (Some(owner), Some(raw)) => {
-            let transaction = decode_transaction_for_id(raw, owner.transaction)?;
-            transaction
-                .outputs
-                .get(owner.output_index as usize)
-                .ok_or(HnsWalletError::InvalidEvidence)?;
-            Ok(())
+) -> Result<Option<ValidatedCanonicalNameState>, HnsWalletError> {
+    let Some(raw_state) = raw_state else {
+        if owner.is_some() || raw.is_some() {
+            return Err(HnsWalletError::InvalidEvidence);
         }
-        _ => Err(HnsWalletError::InvalidEvidence),
+        return Ok(None);
+    };
+    let state = NameState::decode(NameHash::new(expected_name_hash), raw_state)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    if state.is_null() || state.name != expected_name {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let canonical_owner = state.owner_outpoint().map(|owner| HnsOutpoint {
+        transaction: TransactionHash::new(owner.transaction_hash.into_bytes()),
+        output_index: owner.index,
+    });
+    if canonical_owner != owner {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let validated_owner = match (canonical_owner, raw) {
+        (None, None) => None,
+        (Some(owner), Some(raw)) => Some(validate_name_owner_transaction(&state, owner, raw)?),
+        _ => return Err(HnsWalletError::InvalidEvidence),
+    };
+    let summary = CanonicalNameStateSummary {
+        owner_outpoint: canonical_owner,
+        value: state.value.get(),
+        highest: state.highest.get(),
+        start_height: state.height.get(),
+        renewal_height: state.renewal.get(),
+        transfer_height: state.transfer.get(),
+        revoked_height: state.revoked.get(),
+        claimed_height: state.claimed.get(),
+        renewals: state.renewals,
+        registered: state.registered,
+        expired: state.expired,
+        weak: state.weak,
+    };
+    Ok(Some(ValidatedCanonicalNameState {
+        state,
+        summary,
+        owner: validated_owner,
+    }))
+}
+
+fn validate_name_owner_transaction(
+    state: &NameState,
+    owner: HnsOutpoint,
+    raw: &[u8],
+) -> Result<ValidatedNameOwner, HnsWalletError> {
+    let transaction = decode_transaction_for_id(raw, owner.transaction)?;
+    let output = transaction
+        .outputs
+        .get(owner.output_index as usize)
+        .cloned()
+        .ok_or(HnsWalletError::InvalidEvidence)?;
+    if output.value != state.value
+        || output.covenant.item_name_hash(0) != Some(state.name_hash)
+        || !output.covenant.kind.is_name()
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    match output.covenant.kind {
+        CovenantKind::Transfer => {
+            let transfer = TransferCovenant::try_from(&output.covenant)
+                .map_err(|_| HnsWalletError::InvalidEvidence)?;
+            if state.transfer.get() == 0 || transfer.start_height != state.height {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+        }
+        CovenantKind::Finalize => {
+            let finalize = FinalizeCovenant::try_from(&output.covenant)
+                .map_err(|_| HnsWalletError::InvalidEvidence)?;
+            if state.transfer.get() != 0
+                || finalize.start_height != state.height
+                || finalize.name != state.name
+                || finalize.claimed != state.claimed
+                || finalize.renewals != state.renewals
+                || finalize.weak() != state.weak
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+        }
+        _ if state.transfer.get() != 0 => return Err(HnsWalletError::InvalidEvidence),
+        _ => {}
+    }
+    Ok(ValidatedNameOwner {
+        outpoint: owner,
+        raw_transaction: raw.to_vec(),
+        output,
+    })
+}
+
+fn validate_wallet_name_addresses(
+    wallet_name_addresses: &[DerivedHnsAddress],
+) -> Result<(), HnsWalletError> {
+    if wallet_name_addresses.len() > MAX_RESTORE_SCRIPTS_PER_QUERY {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let mut programs = BTreeSet::new();
+    let mut identity = None;
+    for address in wallet_name_addresses {
+        let current_identity = (address.account_id, address.derivation.account);
+        if address.derivation.role != KeyRole::HnsName
+            || address.derivation.change != 0
+            || address.program.len() != 20
+            || !programs.insert(address.program.clone())
+            || identity.is_some_and(|expected| expected != current_identity)
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        identity = Some(current_identity);
+    }
+    Ok(())
+}
+
+fn wallet_name_derivation(
+    address: &Address,
+    wallet_name_addresses: &[DerivedHnsAddress],
+) -> Option<DerivationReference> {
+    (address.version == 0).then_some(())?;
+    wallet_name_addresses
+        .iter()
+        .find(|candidate| candidate.program == address.hash)
+        .map(|candidate| candidate.derivation)
+}
+
+fn classify_name_ownership(
+    current: Option<&ValidatedCanonicalNameState>,
+    wallet_name_addresses: Option<&[DerivedHnsAddress]>,
+) -> Result<NameOwnershipStatus, HnsWalletError> {
+    let Some(wallet_name_addresses) = wallet_name_addresses else {
+        return Ok(NameOwnershipStatus::WalletContextUnavailable);
+    };
+    let Some(current) = current else {
+        return Ok(NameOwnershipStatus::NoCurrentOwner);
+    };
+    let Some(owner) = current.owner.as_ref() else {
+        return Ok(NameOwnershipStatus::NoCurrentOwner);
+    };
+    let owner_derivation = wallet_name_derivation(&owner.output.address, wallet_name_addresses);
+    if current.state.transfer.get() == 0 {
+        return Ok(
+            owner_derivation.map_or(NameOwnershipStatus::NotWalletOwned, |derivation| {
+                NameOwnershipStatus::WalletOwned { derivation }
+            }),
+        );
+    }
+    let transfer = TransferCovenant::try_from(&owner.output.covenant)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    let recipient = WalletAddressKey {
+        version: transfer.recipient_version,
+        hash: transfer.recipient_hash,
+    };
+    let recipient_derivation = wallet_name_addresses
+        .iter()
+        .find(|candidate| recipient.version == 0 && candidate.program == recipient.hash)
+        .map(|candidate| candidate.derivation);
+    match (owner_derivation, recipient_derivation) {
+        (Some(owner_derivation), _) => Ok(NameOwnershipStatus::OutgoingTransfer {
+            owner_derivation,
+            recipient,
+        }),
+        (None, Some(recipient_derivation)) => Ok(NameOwnershipStatus::IncomingTransfer {
+            recipient_derivation,
+            current_owner: WalletAddressKey {
+                version: owner.output.address.version,
+                hash: owner.output.address.hash.clone(),
+            },
+        }),
+        (None, None) => Ok(NameOwnershipStatus::NotWalletOwned),
     }
 }
 
@@ -779,8 +1101,7 @@ impl HnsRuntimeConfig {
         {
             return Err(HnsWalletError::MainnetDisabled);
         }
-        if (!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED
-            || !HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED)
+        if (!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED || !HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED)
             && (self.value_operations_enabled || self.settlement_enabled)
         {
             return Err(HnsWalletError::RuntimeIntegrationUnavailable);
@@ -1057,17 +1378,21 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         if store.is_locked() {
             return Err(HnsWalletError::StoreLocked);
         }
-        if store
-            .wallet_accounts::<HnsAccountRecord>(MAX_HISTORY_RESULTS)?
-            .into_iter()
-            .any(|stored| {
-                stored.value.config.wallet_id == config.wallet_id
-                    && stored.value.config.account_id != config.account_id
-                    && stored.value.config.account_derivation_index
-                        == config.account_derivation_index
-            })
-        {
-            return Err(HnsWalletError::DuplicateAccountDerivation);
+        for stored in store.list_entities_by_id_prefix::<HnsAccountRecord>(
+            EntityKind::WalletAccount,
+            config.wallet_id.as_bytes(),
+            MAX_HISTORY_RESULTS,
+        )? {
+            if stored.id != account_entity_id(&stored.value.config)
+                || stored.value.config.wallet_id != config.wallet_id
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            if stored.value.config.account_id != config.account_id
+                && stored.value.config.account_derivation_index == config.account_derivation_index
+            {
+                return Err(HnsWalletError::DuplicateAccountDerivation);
+            }
         }
         let existing: Option<StoredEntity<HnsAccountRecord>> =
             store.wallet_account(&account_entity_id(&config))?;
@@ -1110,24 +1435,23 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 (account, revision)
             }
         };
+        let entity_prefix = account_entity_prefix(&account.config);
         let coins = store
-            .hns_utxos::<TrackedHnsCoin>(MAX_HISTORY_RESULTS)?
+            .list_entities_by_id_prefix::<TrackedHnsCoin>(
+                EntityKind::HnsUtxo,
+                &entity_prefix,
+                MAX_WALLET_COINS,
+            )?
             .into_iter()
-            .filter(|entity| {
-                entity
-                    .id
-                    .starts_with(&account_entity_prefix(&account.config))
-            })
             .map(|entity| entity.value)
             .collect();
         let transactions = store
-            .hns_transactions::<HnsTransactionRecord>(MAX_HISTORY_RESULTS)?
+            .list_entities_by_id_prefix::<HnsTransactionRecord>(
+                EntityKind::HnsTransaction,
+                &entity_prefix,
+                MAX_HISTORY_RESULTS,
+            )?
             .into_iter()
-            .filter(|entity| {
-                entity
-                    .id
-                    .starts_with(&account_entity_prefix(&account.config))
-            })
             .map(|entity| entity.value)
             .collect();
         Ok(Self {
@@ -1297,14 +1621,101 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
         let config = cache.account.config.clone();
         drop(cache);
-        let current = import_known_name(&self.backend, name, binding)?;
+        let wallet_name_addresses = {
+            let store = self.store_lock()?;
+            persisted_name_addresses(&store, &config)?
+        };
+        let current =
+            validated_name_evidence(&self.backend, name, binding, Some(&wallet_name_addresses))?
+                .known_name;
         let id = namespaced_name_id(&config, current.name_hash);
         let mut store = self.store_lock()?;
+        if self.cache_read()?.binding != Some(binding) {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
         let revision = store
             .known_name::<KnownName>(&id)?
             .map_or(0, |stored| stored.revision);
         store.save_known_name(&id, revision, &current, now)?;
         Ok(current)
+    }
+
+    /// Return the bounded, account-scoped canonical name cache. Every entry is
+    /// replaced from fresh node evidence during reconciliation; legacy rows
+    /// retain their explicit watch-only status until that succeeds.
+    pub fn list_names(&self) -> Result<Vec<KnownName>, HnsWalletError> {
+        let config = self.cache_read()?.account.config.clone();
+        let mut names = self
+            .store_lock()?
+            .list_entities_by_id_prefix::<KnownName>(
+                EntityKind::KnownName,
+                &account_entity_prefix(&config),
+                MAX_HISTORY_RESULTS,
+            )?
+            .into_iter()
+            .map(|stored| stored.value)
+            .collect::<Vec<_>>();
+        names.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.name_hash.cmp(&right.name_hash))
+        });
+        Ok(names)
+    }
+
+    pub fn get_name(&self, name_hash: [u8; 32]) -> Result<Option<KnownName>, HnsWalletError> {
+        let config = self.cache_read()?.account.config.clone();
+        Ok(self
+            .store_lock()?
+            .known_name::<KnownName>(&namespaced_name_id(&config, name_hash))?
+            .map(|stored| stored.value))
+    }
+
+    /// Reacquire ephemeral action authority from the exact current snapshot.
+    /// Cached `KnownName` ownership is never accepted as authorization.
+    pub fn verify_name_ownership(
+        &self,
+        name: &[u8],
+    ) -> Result<VerifiedNameOwnership, HnsWalletError> {
+        let cache = self.cache_read()?;
+        let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        let wallet_name_addresses = {
+            let store = self.store_lock()?;
+            persisted_name_addresses(&store, &config)?
+        };
+        let validated =
+            validated_name_evidence(&self.backend, name, binding, Some(&wallet_name_addresses))?;
+        if self.cache_read()?.binding != Some(binding) {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        let current = validated.current.ok_or(HnsWalletError::NameNotOwned)?;
+        if !current.state.registered
+            || current.state.expired
+            || current.state.revoked.get() != 0
+            || current.state.transfer.get() != 0
+        {
+            return Err(HnsWalletError::NameNotOwned);
+        }
+        let derivation = match validated.known_name.ownership_status {
+            NameOwnershipStatus::WalletOwned { derivation } => derivation,
+            _ => return Err(HnsWalletError::NameNotOwned),
+        };
+        let owner = current.owner.ok_or(HnsWalletError::NameNotOwned)?;
+        Ok(VerifiedNameOwnership {
+            binding,
+            name: validated.known_name.name,
+            name_hash: validated.known_name.name_hash,
+            current_state: validated
+                .known_name
+                .current_state
+                .ok_or(HnsWalletError::InvalidEvidence)?,
+            owner_outpoint: owner.outpoint,
+            owner_transaction: owner.raw_transaction,
+            owner_output: owner.output,
+            derivation,
+        })
     }
 
     pub fn cancel_prepared_send(&self, workflow_id: WorkflowId) -> Result<(), HnsWalletError> {
@@ -1391,8 +1802,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         refund: bool,
     ) -> Result<String, HnsWalletError> {
         let account = self.cache_read()?.account.clone();
-        derive_settlement_public_key(&self.store_lock()?, &account, session_id, refund)
-            .map(hex::encode)
+        let store = self.store_lock()?;
+        derive_settlement_public_key(&store, &account, session_id, refund).map(hex::encode)
     }
 
     pub fn broadcast_prepared_settlement(
@@ -1550,14 +1961,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         }
         let mut state = current.state;
         state.stage = HnsSettlementStage::Broadcast;
-        store.save_workflow(
-            stored.id,
-            kind,
-            current.revision,
-            &state,
-            true,
-            accepted_at,
-        )?;
+        store.save_workflow(stored.id, kind, current.revision, &state, true, accepted_at)?;
         Ok(BroadcastReceipt {
             module: ModuleId::Handshake,
             txid: accepted,
@@ -1684,7 +2088,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let account = cache.account.clone();
         drop(cache);
         let config = account.config.clone();
-        let mut store = self.store_lock().map_err(map_chain_error)?;
+        let store = self.store_lock().map_err(map_chain_error)?;
         let record = store
             .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
                 &config, session_id,
@@ -1849,13 +2253,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             addresses,
             history,
             indexed_coins,
-        ) = self.restore_scan(
-            &mut store,
-            account,
-            stored_account_revision,
-            tip,
-            now,
-        )?;
+        ) = self.restore_scan(&mut store, account, stored_account_revision, tip, now)?;
         let common_ancestor = self.find_common_ancestor(&recovery, binding)?;
         let reorg_detected = recovery.last_tip.is_some()
             && common_ancestor
@@ -2196,10 +2594,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let mut expected_binding = None;
         let mut expected_mempool = None;
         let (mut addresses, mut history, indexed_coins, binding, mempool_binding) = loop {
-            let coin_addresses =
-                derive_restore_addresses(store, &account, KeyRole::HnsCoin)?;
-            let name_addresses =
-                derive_restore_addresses(store, &account, KeyRole::HnsName)?;
+            let coin_addresses = derive_restore_addresses(store, &account, KeyRole::HnsCoin)?;
+            let name_addresses = derive_restore_addresses(store, &account, KeyRole::HnsName)?;
             validate_disjoint_restore_programs(&coin_addresses, &name_addresses)?;
 
             let (coin_scripts, coin_index_remap) = sorted_restore_scripts(&coin_addresses)?;
@@ -2219,19 +2615,15 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             }
 
             let (name_scripts, name_index_remap) = sorted_restore_scripts(&name_addresses)?;
-            let (
-                name_binding,
-                name_mempool_binding,
-                name_history,
-                name_coins,
-            ) = load_wallet_snapshot(
-                &self.backend,
-                &name_scripts,
-                &name_index_remap,
-                expected_tip,
-                Some(binding),
-                Some(mempool_binding),
-            )?;
+            let (name_binding, name_mempool_binding, name_history, name_coins) =
+                load_wallet_snapshot(
+                    &self.backend,
+                    &name_scripts,
+                    &name_index_remap,
+                    expected_tip,
+                    Some(binding),
+                    Some(mempool_binding),
+                )?;
             validate_same_restore_snapshot(
                 binding,
                 mempool_binding,
@@ -2271,16 +2663,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     .derivation;
                 match restore_derivation_key(derivation)? {
                     (HNS_COIN_DERIVATION_TAG, 0, index) => {
-                        last_external = Some(
-                            last_external
-                                .map_or(index, |last: u32| last.max(index)),
-                        )
+                        last_external =
+                            Some(last_external.map_or(index, |last: u32| last.max(index)))
                     }
                     (HNS_COIN_DERIVATION_TAG, 1, index) => {
-                        last_internal = Some(
-                            last_internal
-                                .map_or(index, |last: u32| last.max(index)),
-                        )
+                        last_internal =
+                            Some(last_internal.map_or(index, |last: u32| last.max(index)))
                     }
                     (HNS_NAME_DERIVATION_TAG, 0, index) => {
                         last_name = Some(last_name.map_or(index, |last: u32| last.max(index)))
@@ -2302,13 +2690,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 && required_internal <= account.internal_scan_end
                 && required_name <= account.name_scan_end
             {
-                break (
-                    addresses,
-                    history,
-                    indexed_coins,
-                    binding,
-                    mempool_binding,
-                );
+                break (addresses, history, indexed_coins, binding, mempool_binding);
             }
             account.external_scan_end = required_external;
             account.internal_scan_end = required_internal;
@@ -2340,14 +2722,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .filter(|(role, change, _)| *role == HNS_NAME_DERIVATION_TAG && *change == 0)
             .map(|(_, _, index)| *index)
             .max();
-        account.next_receive_index = advance_next_derivation_index(
-            account.next_receive_index,
-            account.last_used_external,
-        );
-        account.next_change_index = advance_next_derivation_index(
-            account.next_change_index,
-            account.last_used_internal,
-        );
+        account.next_receive_index =
+            advance_next_derivation_index(account.next_receive_index, account.last_used_external);
+        account.next_change_index =
+            advance_next_derivation_index(account.next_change_index, account.last_used_internal);
         account.next_name_index =
             advance_next_derivation_index(account.next_name_index, account.last_used_name);
         persist_derived_addresses(store, &account.config, &addresses, now_unix)?;
@@ -2403,12 +2781,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .mempool_binding
             .ok_or(HnsWalletError::StaleNodeSnapshot)?;
         drop(cache);
-        let quote = self.backend.quote_transaction_fee(
-            raw,
-            DEFAULT_FEE_TARGET_BLOCKS,
-            binding,
-            mempool,
-        )?;
+        let quote =
+            self.backend
+                .quote_transaction_fee(raw, DEFAULT_FEE_TARGET_BLOCKS, binding, mempool)?;
         validate_final_fee_quote(raw, &quote, binding, mempool, expected_fee, maximum_fee)?;
         Ok(quote)
     }
@@ -2578,14 +2953,21 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         now_unix: u64,
     ) -> Result<usize, HnsWalletError> {
         let config = self.cache_read()?.account.config.clone();
-        let names = store
-            .known_names::<KnownName>(MAX_HISTORY_RESULTS)?
-            .into_iter()
-            .filter(|entity| entity.id.starts_with(&account_entity_prefix(&config)))
-            .collect::<Vec<_>>();
+        let wallet_name_addresses = persisted_name_addresses(store, &config)?;
+        let names = store.list_entities_by_id_prefix::<KnownName>(
+            EntityKind::KnownName,
+            &account_entity_prefix(&config),
+            MAX_HISTORY_RESULTS,
+        )?;
         let mut count = 0;
         for stored in names {
-            let current = validated_name_evidence(&self.backend, &stored.value.name, binding)?;
+            let current = validated_name_evidence(
+                &self.backend,
+                &stored.value.name,
+                binding,
+                Some(&wallet_name_addresses),
+            )?
+            .known_name;
             if current.proof_height != binding.tip.height {
                 return Err(HnsWalletError::InvalidEvidence);
             }
@@ -2607,8 +2989,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         mempool_binding: MempoolSnapshotBinding,
         now_unix: u64,
     ) -> Result<Vec<WorkflowId>, HnsWalletError> {
-        let workflows =
-            store.list_workflows::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)?;
+        let workflows = store.list_workflows_complete::<HnsSendWorkflow>(
+            WorkflowKind::HnsSend,
+            MAX_HISTORY_RESULTS,
+        )?;
         let config = self.cache_read()?.account.config.clone();
         let mut pending = Vec::new();
         for stored in workflows {
@@ -2639,11 +3023,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let Some(txid) = stored.state.transaction else {
                 continue;
             };
-            let evidence = self.backend.get_transaction_evidence(
-                txid,
-                binding,
-                Some(mempool_binding),
-            )?;
+            let evidence =
+                self.backend
+                    .get_transaction_evidence(txid, binding, Some(mempool_binding))?;
             if evidence.binding != binding || evidence.mempool != mempool_binding {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
@@ -2655,12 +3037,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 .iter()
                 .map(|input| input.coin.outpoint)
                 .collect();
-            let competing_spender = has_competing_spender_in_batches(
-                &self.backend,
-                &outpoints,
-                binding,
-                txid,
-            )?;
+            let competing_spender =
+                has_competing_spender_in_batches(&self.backend, &outpoints, binding, txid)?;
             let next_stage = if chain_status.conflicted || competing_spender {
                 HnsSendStage::Conflicted
             } else if chain_status.confirmation_count > 0 {
@@ -2742,14 +3120,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .filter(|coin| is_ordinary_hns_derivation(coin.derivation))
             .map(|coin| coin.coin.outpoint)
             .collect();
-        let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+        let reservations = account_input_reservations(store, config)?;
         let mut deletes = Vec::new();
         for stored in reservations {
-            if stored.value.wallet_id != config.wallet_id
-                || stored.value.account_id != config.account_id
-            {
-                continue;
-            }
             let expired = stored
                 .value
                 .expires_at_unix
@@ -2758,13 +3131,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let conflicted = if stored.value.expires_at_unix.is_none() {
                 match store.load_workflow::<HnsPreparedSettlement>(stored.value.workflow_id) {
                     Ok(Some(workflow)) => {
-                        let evidence = self
-                            .backend
-                            .get_transaction_evidence(
-                                workflow.state.transaction,
-                                binding,
-                                Some(mempool_binding),
-                            )?;
+                        let evidence = self.backend.get_transaction_evidence(
+                            workflow.state.transaction,
+                            binding,
+                            Some(mempool_binding),
+                        )?;
                         if evidence.binding != binding || evidence.mempool != mempool_binding {
                             return Err(HnsWalletError::StaleNodeSnapshot);
                         }
@@ -2803,8 +3174,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let config = self.cache_read()?.account.config.clone();
         let mut pending = Vec::new();
         for kind in [WorkflowKind::AtomicSwap, WorkflowKind::Refund] {
-            let workflows =
-                store.list_workflows::<HnsPreparedSettlement>(kind, MAX_HISTORY_RESULTS)?;
+            let workflows = store
+                .list_workflows_complete::<HnsPreparedSettlement>(kind, MAX_HISTORY_RESULTS)?;
             for mut stored in workflows {
                 if stored.state.wallet_id != config.wallet_id
                     || stored.state.account_id != config.account_id
@@ -2814,13 +3185,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 }
                 let previous_stage = stored.state.stage;
                 let next_stage = if previous_stage == HnsSettlementStage::Prepared {
-                    let evidence = self
-                        .backend
-                        .get_transaction_evidence(
-                            stored.state.transaction,
-                            binding,
-                            Some(mempool_binding),
-                        )?;
+                    let evidence = self.backend.get_transaction_evidence(
+                        stored.state.transaction,
+                        binding,
+                        Some(mempool_binding),
+                    )?;
                     if evidence.binding != binding || evidence.mempool != mempool_binding {
                         return Err(HnsWalletError::StaleNodeSnapshot);
                     }
@@ -2841,13 +3210,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                         | HnsSettlementStage::Mempool
                         | HnsSettlementStage::RequiresRebroadcast
                 ) {
-                    let evidence = self
-                        .backend
-                        .get_transaction_evidence(
-                            stored.state.transaction,
-                            binding,
-                            Some(mempool_binding),
-                        )?;
+                    let evidence = self.backend.get_transaction_evidence(
+                        stored.state.transaction,
+                        binding,
+                        Some(mempool_binding),
+                    )?;
                     if evidence.binding != binding || evidence.mempool != mempool_binding {
                         return Err(HnsWalletError::StaleNodeSnapshot);
                     }
@@ -3048,9 +3415,7 @@ fn derive_restore_addresses(
                 derivation,
                 address: receive_address(account.config.network, &public_key)?,
                 program,
-                used: persisted
-                    .as_ref()
-                    .is_some_and(|address| address.value.used),
+                used: persisted.as_ref().is_some_and(|address| address.value.used),
             };
             if let Some(persisted) = persisted
                 && (persisted.id != id
@@ -3126,8 +3491,8 @@ fn append_restore_branch(
     {
         return Err(HnsWalletError::ScanCapacityExhausted);
     }
-    let offset = u32::try_from(addresses.len())
-        .map_err(|_| HnsWalletError::ScanCapacityExhausted)?;
+    let offset =
+        u32::try_from(addresses.len()).map_err(|_| HnsWalletError::ScanCapacityExhausted)?;
     for entry in &mut branch_history {
         if entry.script_index as usize >= branch_addresses.len() {
             return Err(HnsWalletError::InvalidEvidence);
@@ -3259,11 +3624,7 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
         })?;
         if page.binding.tip != expected_tip
             || binding.is_some_and(|expected| expected != page.binding)
-            || page
-                .history
-                .len()
-                .saturating_add(page.utxos.len())
-                > MAX_SCAN_PAGE_RESULTS
+            || page.history.len().saturating_add(page.utxos.len()) > MAX_SCAN_PAGE_RESULTS
         {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
@@ -3400,8 +3761,7 @@ fn validate_spend_evidence(
     for (entry, expected) in evidence.entries.iter().zip(expected_outpoints) {
         if entry.outpoint != *expected
             || entry.spending.is_some_and(|spending| {
-                spending.height > binding.tip.height
-                    || spending.block_hash == [0; 32]
+                spending.height > binding.tip.height || spending.block_hash == [0; 32]
             })
         {
             return Err(HnsWalletError::InvalidEvidence);
@@ -3431,7 +3791,7 @@ fn has_competing_spender_in_batches<B: HnsBackend>(
 
 fn public_key_hash(public_key: &[u8; 33]) -> Result<[u8; 20], HnsWalletError> {
     let mut hasher = Blake2bVar::new(20).map_err(|_| HnsWalletError::KeyDerivation)?;
-    BlakeUpdate::update(&mut hasher, public_key);
+    blake2::digest::Update::update(&mut hasher, public_key);
     let mut output = [0_u8; 20];
     hasher
         .finalize_variable(&mut output)
@@ -3464,7 +3824,7 @@ fn bounded_history(
 fn coalesce_transaction_history(
     history: &[HistoryEntry],
 ) -> Result<Vec<HistoryEntry>, HnsWalletError> {
-    let mut transactions = BTreeMap::new();
+    let mut transactions: BTreeMap<TransactionHash, HistoryEntry> = BTreeMap::new();
     for entry in history {
         match transactions.get_mut(&entry.txid) {
             Some(previous) => {
@@ -3524,9 +3884,7 @@ const fn is_ordinary_hns_derivation(derivation: DerivationReference) -> bool {
 }
 
 fn is_ordinary_hns_spend_candidate(coin: &TrackedHnsCoin) -> bool {
-    is_ordinary_hns_derivation(coin.derivation)
-        && !coin.coin.name_locked
-        && !coin.coin.coinbase
+    is_ordinary_hns_derivation(coin.derivation) && !coin.coin.name_locked && !coin.coin.coinbase
 }
 
 fn decode_transaction_for_id(
@@ -3557,8 +3915,7 @@ fn validate_inclusion(
         Some(inclusion) => {
             if inclusion.height > tip.height
                 || (observed_in_current_history && entry.height != Some(inclusion.height))
-                || (observed_in_current_history
-                    && entry.block_hash != Some(inclusion.block_hash))
+                || (observed_in_current_history && entry.block_hash != Some(inclusion.block_hash))
                 || (observed_in_current_history
                     && inclusion.transaction_index.is_some()
                     && entry.transaction_position != inclusion.transaction_index)
@@ -3612,11 +3969,8 @@ fn transaction_value_effect<B: HnsBackend>(
         }
         let parent_id = TransactionHash::new(input.previous_output.transaction_hash.into_bytes());
         if !raw_cache.contains_key(&parent_id) {
-            let evidence = backend.get_transaction_evidence(
-                parent_id,
-                binding,
-                Some(mempool_binding),
-            )?;
+            let evidence =
+                backend.get_transaction_evidence(parent_id, binding, Some(mempool_binding))?;
             if evidence.binding != binding || evidence.mempool != mempool_binding {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
@@ -3683,10 +4037,14 @@ fn persist_reconciled_entities(
     transactions: &[HnsTransactionRecord],
     now_unix: u64,
 ) -> Result<(), HnsWalletError> {
-    let existing_coins = store.hns_utxos::<TrackedHnsCoin>(MAX_HISTORY_RESULTS)?;
+    let entity_prefix = account_entity_prefix(config);
+    let existing_coins = store.list_entities_by_id_prefix::<TrackedHnsCoin>(
+        EntityKind::HnsUtxo,
+        &entity_prefix,
+        MAX_WALLET_COINS,
+    )?;
     let mut revisions: BTreeMap<Vec<u8>, u64> = existing_coins
         .iter()
-        .filter(|entity| entity.id.starts_with(&account_entity_prefix(config)))
         .map(|entity| (entity.id.clone(), entity.revision))
         .collect();
     for coin in coins {
@@ -3698,11 +4056,13 @@ fn persist_reconciled_entities(
         store.delete_hns_utxo(&id, revision)?;
     }
 
-    let existing_transactions =
-        store.hns_transactions::<HnsTransactionRecord>(MAX_HISTORY_RESULTS)?;
+    let existing_transactions = store.list_entities_by_id_prefix::<HnsTransactionRecord>(
+        EntityKind::HnsTransaction,
+        &entity_prefix,
+        MAX_HISTORY_RESULTS,
+    )?;
     let mut revisions: BTreeMap<Vec<u8>, u64> = existing_transactions
         .iter()
-        .filter(|entity| entity.id.starts_with(&account_entity_prefix(config)))
         .map(|entity| (entity.id.clone(), entity.revision))
         .collect();
     for transaction in transactions {
@@ -3742,17 +4102,20 @@ fn derived_address_id(config: &HnsRuntimeConfig, change: u32, index: u32) -> [u8
     id
 }
 
-fn name_derived_address_id(
-    config: &HnsRuntimeConfig,
-    change: u32,
-    index: u32,
-) -> [u8; 41] {
+fn name_derived_address_id(config: &HnsRuntimeConfig, change: u32, index: u32) -> [u8; 41] {
     let mut id = [0_u8; 41];
     id[..32].copy_from_slice(&account_entity_prefix(config));
     id[32] = HNS_NAME_DERIVATION_TAG;
     id[33..37].copy_from_slice(&change.to_be_bytes());
     id[37..].copy_from_slice(&index.to_be_bytes());
     id
+}
+
+fn name_derived_address_prefix(config: &HnsRuntimeConfig) -> [u8; 33] {
+    let mut prefix = [0_u8; 33];
+    prefix[..32].copy_from_slice(&account_entity_prefix(config));
+    prefix[32] = HNS_NAME_DERIVATION_TAG;
+    prefix
 }
 
 fn derived_address_record_id(
@@ -3795,6 +4158,32 @@ fn namespaced_name_id(config: &HnsRuntimeConfig, name_hash: [u8; 32]) -> [u8; 64
     id
 }
 
+fn persisted_name_addresses(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+) -> Result<Vec<DerivedHnsAddress>, HnsWalletError> {
+    let mut addresses = Vec::new();
+    for stored in store.list_entities_by_id_prefix::<DerivedHnsAddress>(
+        EntityKind::DerivedAddress,
+        &name_derived_address_prefix(config),
+        MAX_RESTORE_SCRIPTS_PER_QUERY,
+    )? {
+        let expected_id = derived_address_record_id(config, stored.value.derivation)?;
+        if stored.id != expected_id
+            || stored.value.account_id != config.account_id
+            || stored.value.derivation.role != KeyRole::HnsName
+            || stored.value.derivation.account != config.account_derivation_index
+            || stored.value.derivation.change != 0
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        addresses.push(stored.value);
+    }
+    addresses.sort_by_key(|address| address.derivation.index);
+    validate_wallet_name_addresses(&addresses)?;
+    Ok(addresses)
+}
+
 fn persist_derived_addresses(
     store: &mut WalletStore,
     config: &HnsRuntimeConfig,
@@ -3833,21 +4222,37 @@ fn persist_derived_addresses(
     Ok(())
 }
 
+fn account_input_reservations(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+) -> Result<Vec<StoredEntity<HnsInputReservation>>, HnsWalletError> {
+    let reservations = store.list_entities_by_id_prefix::<HnsInputReservation>(
+        EntityKind::InputReservation,
+        &account_entity_prefix(config),
+        MAX_WALLET_COINS,
+    )?;
+    for stored in &reservations {
+        let expected_id = namespaced_outpoint_id(config, stored.value.outpoint);
+        if stored.value.wallet_id != config.wallet_id
+            || stored.value.account_id != config.account_id
+            || stored.id.as_slice() != expected_id.as_slice()
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
+    Ok(reservations)
+}
+
 fn available_unreserved_coins(
     store: &mut WalletStore,
     config: &HnsRuntimeConfig,
     coins: Vec<TrackedHnsCoin>,
     now_unix: u64,
 ) -> Result<Vec<TrackedHnsCoin>, HnsWalletError> {
-    let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+    let reservations = account_input_reservations(store, config)?;
     let mut reserved = BTreeSet::new();
     let mut expired = Vec::new();
     for stored in reservations {
-        if stored.value.wallet_id != config.wallet_id
-            || stored.value.account_id != config.account_id
-        {
-            continue;
-        }
         if stored
             .value
             .expires_at_unix
@@ -3871,8 +4276,7 @@ fn available_unreserved_coins(
     Ok(coins
         .into_iter()
         .filter(|coin| {
-            is_ordinary_hns_derivation(coin.derivation)
-                && !reserved.contains(&coin.coin.outpoint)
+            is_ordinary_hns_derivation(coin.derivation) && !reserved.contains(&coin.coin.outpoint)
         })
         .collect())
 }
@@ -3920,14 +4324,10 @@ fn validate_prepared_reservations(
     if expected.len() != outpoints.len() {
         return Err(HnsWalletError::InvalidWorkflow);
     }
-    let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+    let reservations = account_input_reservations(store, config)?;
     let matching: Vec<_> = reservations
         .into_iter()
-        .filter(|stored| {
-            stored.value.wallet_id == config.wallet_id
-                && stored.value.account_id == config.account_id
-                && stored.value.workflow_id == workflow_id
-        })
+        .filter(|stored| stored.value.workflow_id == workflow_id)
         .collect();
     if matching.len() != expected.len() {
         return Err(HnsWalletError::InvalidWorkflow);
@@ -3950,13 +4350,10 @@ fn reservation_activation_saves(
     workflow_id: WorkflowId,
     now_unix: u64,
 ) -> Result<Vec<EntityBatchSave<HnsInputReservation>>, HnsWalletError> {
-    let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+    let reservations = account_input_reservations(store, config)?;
     let mut saves = Vec::new();
     for stored in reservations {
-        if stored.value.wallet_id != config.wallet_id
-            || stored.value.account_id != config.account_id
-            || stored.value.workflow_id != workflow_id
-        {
+        if stored.value.workflow_id != workflow_id {
             continue;
         }
         let mut reservation = stored.value;
@@ -3976,13 +4373,10 @@ fn reservation_deletes(
     config: &HnsRuntimeConfig,
     workflow_id: WorkflowId,
 ) -> Result<Vec<EntityBatchDelete>, HnsWalletError> {
-    let reservations = store.input_reservations::<HnsInputReservation>(MAX_WALLET_COINS)?;
+    let reservations = account_input_reservations(store, config)?;
     let mut deletes = Vec::new();
     for stored in reservations {
-        if stored.value.wallet_id == config.wallet_id
-            && stored.value.account_id == config.account_id
-            && stored.value.workflow_id == workflow_id
-        {
+        if stored.value.workflow_id == workflow_id {
             deletes.push(EntityBatchDelete {
                 id: stored.id,
                 expected_revision: stored.revision,
@@ -4093,12 +4487,9 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             change: 0,
             index: account.next_receive_index,
         };
-        let public_key = derive_hns_public_key(
-            &self.store_lock().map_err(map_chain_error)?,
-            account.config.wallet_id,
-            derivation,
-        )
-        .map_err(map_chain_error)?;
+        let store = self.store_lock().map_err(map_chain_error)?;
+        let public_key = derive_hns_public_key(&store, account.config.wallet_id, derivation)
+            .map_err(map_chain_error)?;
         Ok(ReceiveTarget {
             module: ModuleId::Handshake,
             account: account.config.account_id,
@@ -4277,9 +4668,8 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
                 .get_pending_approval(request.approval_id, now)
                 .map_err(map_chain_error)?
                 .ok_or(ChainError::ApprovalRequired)?;
-            let approved: HnsSendApproval =
-                serde_json::from_slice(&pending_approval.request_json)
-                    .map_err(|_| ChainError::ApprovalRequired)?;
+            let approved: HnsSendApproval = serde_json::from_slice(&pending_approval.request_json)
+                .map_err(|_| ChainError::ApprovalRequired)?;
             let commitment: [u8; 32] =
                 Sha256::digest(request.prepared.authorization_commitment()).into();
             if approved.workflow_id != plan.workflow_id || approved.commitment != commitment {
@@ -4330,14 +4720,13 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             signed_transaction: Some(signed.clone()),
             fee_quote: Some(quote),
         };
-        let reservation_saves =
-            reservation_activation_saves(
-                &store,
-                &account.config,
-                workflow.plan.workflow_id,
-                commit_now,
-            )
-            .map_err(map_chain_error)?;
+        let reservation_saves = reservation_activation_saves(
+            &store,
+            &account.config,
+            workflow.plan.workflow_id,
+            commit_now,
+        )
+        .map_err(map_chain_error)?;
         let committed = store
             .consume_approval_and_save_workflow_with_entity_batch(
                 &pending_approval,
@@ -4363,15 +4752,26 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
         let transaction =
             Transaction::decode(&raw).map_err(|_| ChainError::InvalidTransactionSize)?;
         let txid = wallet_transaction_hash(&transaction).map_err(map_chain_error)?;
+        let config = self
+            .cache_read()
+            .map_err(map_chain_error)?
+            .account
+            .config
+            .clone();
         let stored = {
             let store = self.store_lock().map_err(map_chain_error)?;
             let workflows = store
-                .list_workflows::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)
+                .list_workflows_complete::<HnsSendWorkflow>(
+                    WorkflowKind::HnsSend,
+                    MAX_HISTORY_RESULTS,
+                )
                 .map_err(map_chain_error)?;
             let stored = workflows
                 .into_iter()
                 .find(|workflow| {
-                    workflow.state.transaction == Some(txid)
+                    workflow.state.plan.wallet_id == config.wallet_id
+                        && workflow.state.plan.account_id == config.account_id
+                        && workflow.state.transaction == Some(txid)
                         && workflow.state.signed_transaction.as_deref() == Some(raw.as_slice())
                 })
                 .ok_or(ChainError::InvalidEvidence)?;
@@ -4400,11 +4800,7 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             .clone()
             .ok_or(ChainError::InvalidEvidence)?;
         let quote = self
-            .quote_final_transaction(
-                &raw,
-                stored.state.plan.fee,
-                stored.state.plan.maximum_fee,
-            )
+            .quote_final_transaction(&raw, stored.state.plan.fee, stored.state.plan.maximum_fee)
             .map_err(map_chain_error)?;
         let submission_started_at = self.clock.now_unix().map_err(map_chain_error)?;
         let (submission_revision, submission_state) = {
@@ -4775,9 +5171,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         ensure_settlement_ready(&cache)?;
         let configured_minimum = cache.account.config.minimum_confirmations;
         let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
-        let mempool_binding = cache
-            .mempool_binding
-            .ok_or(ChainError::NotSynchronized)?;
+        let mempool_binding = cache.mempool_binding.ok_or(ChainError::NotSynchronized)?;
         let config = cache.account.config.clone();
         drop(cache);
         if request.expected.module != ModuleId::Handshake
@@ -4949,9 +5343,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         let cache = self.cache_read().map_err(map_chain_error)?;
         ensure_settlement_ready(&cache)?;
         let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
-        let mempool_binding = cache
-            .mempool_binding
-            .ok_or(ChainError::NotSynchronized)?;
+        let mempool_binding = cache.mempool_binding.ok_or(ChainError::NotSynchronized)?;
         let config = cache.account.config.clone();
         drop(cache);
         let record = self
@@ -4971,11 +5363,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         }
         let evidence = self
             .backend
-            .get_transaction_evidence(
-                request.spending_transaction,
-                binding,
-                Some(mempool_binding),
-            )
+            .get_transaction_evidence(request.spending_transaction, binding, Some(mempool_binding))
             .map_err(map_chain_error)?;
         if evidence.binding != binding || evidence.mempool != mempool_binding {
             return Err(ChainError::InvalidEvidence);
@@ -5035,7 +5423,11 @@ fn ensure_ready(cache: &HnsRuntimeCache) -> Result<(), ChainError> {
     }
 }
 
-fn map_chain_error(error: HnsWalletError) -> ChainError {
+fn map_chain_error<E>(error: E) -> ChainError
+where
+    HnsWalletError: From<E>,
+{
+    let error = HnsWalletError::from(error);
     match error {
         HnsWalletError::StoreLocked | HnsWalletError::MissingSeed => ChainError::Locked,
         HnsWalletError::MainnetDisabled | HnsWalletError::RuntimeIntegrationUnavailable => {
@@ -5172,9 +5564,7 @@ fn build_unsigned_payment(
     if amount == 0 || fee_rate.is_zero() || maximum_fee.is_zero() {
         return Err(HnsWalletError::InvalidAmount);
     }
-    coins.retain(|coin| {
-        is_ordinary_hns_spend_candidate(coin) && coin.coin.confirmation_count > 0
-    });
+    coins.retain(|coin| is_ordinary_hns_spend_candidate(coin) && coin.coin.confirmation_count > 0);
     coins.sort_by(|left, right| {
         left.coin
             .value
@@ -5700,6 +6090,7 @@ impl From<serde_json::Error> for HnsWalletError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hns_primitives::{BlockHash, Height, Outpoint as CanonicalOutpoint};
 
     fn test_runtime_config() -> HnsRuntimeConfig {
         HnsRuntimeConfig {
@@ -5748,6 +6139,368 @@ mod tests {
             instance_nonce: [23; 32],
             generation,
         }
+    }
+
+    fn canonical_name_view(
+        owner_program: Vec<u8>,
+        resource_data: Vec<u8>,
+        transfer_recipient: Option<Address>,
+    ) -> (Vec<u8>, NameState, Transaction, HnsOutpoint) {
+        let name = b"alpha".to_vec();
+        let name_hash = hash_name(&name).expect("name hash");
+        let mut state = NameState {
+            name_hash,
+            name: name.clone(),
+            height: Height::new(100),
+            renewal: Height::new(120),
+            owner: CanonicalOutpoint::NULL,
+            value: Dollarydoos::new(50_000),
+            highest: Dollarydoos::new(60_000),
+            resource_data,
+            transfer: Height::new(if transfer_recipient.is_some() { 400 } else { 0 }),
+            revoked: Height::new(0),
+            claimed: Height::new(0),
+            renewals: 1,
+            registered: true,
+            expired: false,
+            weak: false,
+        };
+        let covenant = match transfer_recipient {
+            Some(recipient) => {
+                TransferCovenant::new(name_hash, state.height, recipient.version, recipient.hash)
+                    .expect("transfer")
+                    .to_covenant()
+                    .expect("transfer covenant")
+            }
+            None => FinalizeCovenant::from_name_state(&state, BlockHash::new([9; 32]))
+                .expect("finalize")
+                .to_covenant()
+                .expect("finalize covenant"),
+        };
+        let transaction = Transaction {
+            version: 0,
+            inputs: Vec::new(),
+            outputs: vec![Output {
+                value: state.value,
+                address: Address::new(0, owner_program).expect("owner address"),
+                covenant,
+            }],
+            locktime: 0,
+        };
+        let transaction_hash = transaction.transaction_hash().expect("transaction hash");
+        state.owner = CanonicalOutpoint {
+            transaction_hash,
+            index: 0,
+        };
+        let outpoint = HnsOutpoint {
+            transaction: TransactionHash::new(transaction_hash.into_bytes()),
+            output_index: 0,
+        };
+        (name, state, transaction, outpoint)
+    }
+
+    fn validate_test_name_view(
+        name: &[u8],
+        state: &NameState,
+        transaction: &Transaction,
+        outpoint: HnsOutpoint,
+    ) -> Result<ValidatedCanonicalNameState, HnsWalletError> {
+        let raw_state = state.encode().expect("name state");
+        let raw_transaction = transaction.encode().expect("owner transaction");
+        validate_canonical_name_state(
+            name,
+            state.name_hash.into_bytes(),
+            Some(&raw_state),
+            Some(outpoint),
+            Some(&raw_transaction),
+        )?
+        .ok_or(HnsWalletError::InvalidEvidence)
+    }
+
+    #[test]
+    fn canonical_hns_v2_binds_owner_resource_and_name_role() {
+        assert_eq!(
+            classify_name_ownership(None, None).expect("context-free classification"),
+            NameOwnershipStatus::WalletContextUnavailable
+        );
+        let address = test_derived_address(KeyRole::HnsName, 31);
+        let (name, state, transaction, outpoint) =
+            canonical_name_view(address.program.clone(), vec![1], None);
+        let current =
+            validate_test_name_view(&name, &state, &transaction, outpoint).expect("canonical view");
+        assert_eq!(current.summary.owner_outpoint, Some(outpoint));
+        assert_eq!(current.summary.value, 50_000);
+        assert_eq!(
+            classify_name_ownership(Some(&current), Some(&[address.clone()])).expect("ownership"),
+            NameOwnershipStatus::WalletOwned {
+                derivation: address.derivation
+            }
+        );
+        let (resource, status) =
+            bind_current_name_resource(Some(&current), Some(vec![1])).expect("canonical resource");
+        assert_eq!(resource, Some(vec![1]));
+        assert_eq!(status, NameResourceStatus::CanonicalOpaque);
+
+        let coin_role = test_derived_address(KeyRole::HnsCoin, 31);
+        assert!(validate_wallet_name_addresses(&[coin_role]).is_err());
+    }
+
+    #[test]
+    fn canonical_hns_v2_rejects_owner_value_covenant_and_resource_mismatch() {
+        let address = test_derived_address(KeyRole::HnsName, 32);
+        let (name, state, transaction, outpoint) =
+            canonical_name_view(address.program.clone(), Vec::new(), None);
+        let raw_state = state.encode().expect("state");
+        let raw_transaction = transaction.encode().expect("transaction");
+        let wrong_outpoint = HnsOutpoint {
+            output_index: 1,
+            ..outpoint
+        };
+        assert!(validate_canonical_name_state(
+            &name,
+            state.name_hash.into_bytes(),
+            Some(&raw_state),
+            Some(wrong_outpoint),
+            Some(&raw_transaction),
+        )
+        .is_err());
+
+        let mut wrong_value_transaction = transaction.clone();
+        wrong_value_transaction.outputs[0].value = Dollarydoos::new(state.value.get() + 1);
+        let wrong_value_hash = wrong_value_transaction
+            .transaction_hash()
+            .expect("wrong-value hash");
+        let mut wrong_value_state = state.clone();
+        wrong_value_state.owner.transaction_hash = wrong_value_hash;
+        assert!(validate_test_name_view(
+            &name,
+            &wrong_value_state,
+            &wrong_value_transaction,
+            HnsOutpoint {
+                transaction: TransactionHash::new(wrong_value_hash.into_bytes()),
+                output_index: 0,
+            },
+        )
+        .is_err());
+
+        let mut wrong_covenant_transaction = transaction;
+        wrong_covenant_transaction.outputs[0].covenant.items[0] = vec![7; 32];
+        let wrong_covenant_hash = wrong_covenant_transaction
+            .transaction_hash()
+            .expect("wrong-covenant hash");
+        let mut wrong_covenant_state = state;
+        wrong_covenant_state.owner.transaction_hash = wrong_covenant_hash;
+        assert!(validate_test_name_view(
+            &name,
+            &wrong_covenant_state,
+            &wrong_covenant_transaction,
+            HnsOutpoint {
+                transaction: TransactionHash::new(wrong_covenant_hash.into_bytes()),
+                output_index: 0,
+            },
+        )
+        .is_err());
+
+        let (name, state, transaction, outpoint) =
+            canonical_name_view(address.program, vec![1], None);
+        let current =
+            validate_test_name_view(&name, &state, &transaction, outpoint).expect("canonical view");
+        assert!(bind_current_name_resource(Some(&current), Some(vec![2])).is_err());
+    }
+
+    #[test]
+    fn canonical_hns_v2_classifies_incoming_and_outgoing_transfers() {
+        let owner = test_derived_address(KeyRole::HnsName, 41);
+        let recipient = test_derived_address(KeyRole::HnsName, 42);
+        let recipient_address = Address::new(0, recipient.program.clone()).expect("recipient");
+        let (name, state, transaction, outpoint) =
+            canonical_name_view(owner.program.clone(), Vec::new(), Some(recipient_address));
+        let current =
+            validate_test_name_view(&name, &state, &transaction, outpoint).expect("transfer view");
+        assert_eq!(
+            classify_name_ownership(Some(&current), Some(&[owner.clone()])).expect("outgoing"),
+            NameOwnershipStatus::OutgoingTransfer {
+                owner_derivation: owner.derivation,
+                recipient: WalletAddressKey {
+                    version: 0,
+                    hash: recipient.program.clone(),
+                },
+            }
+        );
+        assert_eq!(
+            classify_name_ownership(Some(&current), Some(&[recipient.clone()])).expect("incoming"),
+            NameOwnershipStatus::IncomingTransfer {
+                recipient_derivation: recipient.derivation,
+                current_owner: WalletAddressKey {
+                    version: 0,
+                    hash: owner.program,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_hns_v2_legacy_cache_requires_fresh_revalidation() {
+        let legacy = KnownName {
+            name: b"alpha".to_vec(),
+            name_hash: [1; 32],
+            proof_height: 10,
+            unbound_proof_owner_outpoint: None,
+            unbound_current_owner_outpoint: None,
+            proof_state: None,
+            current_state: None,
+            canonical_proof_state: None,
+            canonical_current_state: None,
+            current_raw_resource: None,
+            resource_status: NameResourceStatus::UnavailableCanonicalBinding,
+            ownership_status: NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable,
+        };
+        let mut encoded = serde_json::to_value(legacy).expect("legacy cache");
+        let object = encoded.as_object_mut().expect("known name object");
+        object.remove("canonical_proof_state");
+        object.remove("canonical_current_state");
+        object.remove("current_raw_resource");
+        let decoded: KnownName = serde_json::from_value(encoded).expect("legacy decode");
+        assert_eq!(decoded.canonical_proof_state, None);
+        assert_eq!(decoded.canonical_current_state, None);
+        assert_eq!(decoded.current_raw_resource, None);
+        assert_eq!(
+            decoded.ownership_status,
+            NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable
+        );
+    }
+
+    #[test]
+    fn canonical_hns_v2_persisted_queries_are_complete_and_account_scoped() {
+        assert_eq!(
+            MAX_RESTORE_SCRIPTS_PER_QUERY,
+            hns_wallet_store::MAX_ENTITY_LIST_RESULTS
+        );
+        let mut store = WalletStore::create(":memory:", "passphrase").expect("store");
+        let config = test_runtime_config();
+        let mut other_config = config.clone();
+        other_config.account_id = AccountId::new([13; 16]);
+        other_config.account_derivation_index = 8;
+        let address = |config: &HnsRuntimeConfig, role, index, program| DerivedHnsAddress {
+            account_id: config.account_id,
+            derivation: DerivationReference {
+                role,
+                account: config.account_derivation_index,
+                change: 0,
+                index,
+            },
+            address: format!("test-address-{program}"),
+            program: vec![program; 20],
+            used: false,
+        };
+        let coin = address(&config, KeyRole::HnsCoin, 1, 21);
+        let name = address(&config, KeyRole::HnsName, 2, 22);
+        let other_name = address(&other_config, KeyRole::HnsName, 3, 23);
+        for (owner, value) in [
+            (&config, coin),
+            (&config, name.clone()),
+            (&other_config, other_name),
+        ] {
+            let id = derived_address_record_id(owner, value.derivation).expect("address id");
+            store
+                .save_derived_address(&id, 0, &value, 1)
+                .expect("persist address");
+        }
+        assert_eq!(
+            persisted_name_addresses(&store, &config).expect("scoped name addresses"),
+            vec![name]
+        );
+
+        let current_name_id = namespaced_name_id(&config, [31; 32]);
+        let other_name_id = namespaced_name_id(&other_config, [32; 32]);
+        store
+            .save_known_name(
+                &current_name_id,
+                0,
+                &serde_json::json!({"name":"current"}),
+                2,
+            )
+            .expect("current name");
+        store
+            .save_known_name(&other_name_id, 0, &serde_json::json!({"name":"other"}), 2)
+            .expect("other name");
+        let scoped = store
+            .list_entities_by_id_prefix::<serde_json::Value>(
+                EntityKind::KnownName,
+                &account_entity_prefix(&config),
+                MAX_HISTORY_RESULTS,
+            )
+            .expect("scoped names");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, current_name_id);
+
+        let current_reservation = HnsInputReservation {
+            wallet_id: config.wallet_id,
+            account_id: config.account_id,
+            outpoint: HnsOutpoint {
+                transaction: TransactionHash::new([41; 32]),
+                output_index: 1,
+            },
+            workflow_id: WorkflowId::new([42; 16]),
+            expires_at_unix: Some(10),
+        };
+        let other_reservation = HnsInputReservation {
+            wallet_id: other_config.wallet_id,
+            account_id: other_config.account_id,
+            outpoint: HnsOutpoint {
+                transaction: TransactionHash::new([43; 32]),
+                output_index: 2,
+            },
+            workflow_id: WorkflowId::new([44; 16]),
+            expires_at_unix: Some(10),
+        };
+        for (owner, reservation) in [
+            (&config, current_reservation.clone()),
+            (&other_config, other_reservation),
+        ] {
+            store
+                .save_input_reservation(
+                    &namespaced_outpoint_id(owner, reservation.outpoint),
+                    0,
+                    &reservation,
+                    3,
+                )
+                .expect("reservation");
+        }
+        assert_eq!(
+            account_input_reservations(&store, &config)
+                .expect("scoped reservations")
+                .into_iter()
+                .map(|stored| stored.value)
+                .collect::<Vec<_>>(),
+            vec![current_reservation]
+        );
+
+        for (id, account) in [
+            (WorkflowId::new([51; 16]), config.account_id),
+            (WorkflowId::new([52; 16]), other_config.account_id),
+        ] {
+            store
+                .save_workflow(
+                    id,
+                    WorkflowKind::HnsSend,
+                    0,
+                    &serde_json::json!({"account": account}),
+                    false,
+                    4,
+                )
+                .expect("workflow");
+        }
+        assert_eq!(
+            store
+                .list_workflows_complete::<serde_json::Value>(
+                    WorkflowKind::HnsSend,
+                    MAX_HISTORY_RESULTS,
+                )
+                .expect("complete workflows")
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -5841,11 +6594,9 @@ mod tests {
         assert_eq!(coin_id.len(), 40);
         assert_eq!(name_id.len(), 41);
         assert_ne!(coin_id, name_id);
-        assert!(derived_address_record_id(
-            &config,
-            DerivationReference { change: 1, ..name }
-        )
-        .is_err());
+        assert!(
+            derived_address_record_id(&config, DerivationReference { change: 1, ..name }).is_err()
+        );
     }
 
     #[test]
@@ -5863,9 +6614,7 @@ mod tests {
             instance_nonce: [24; 32],
             generation: mempool.generation,
         };
-        assert!(
-            validate_same_restore_snapshot(binding, mempool, binding, restarted).is_err()
-        );
+        assert!(validate_same_restore_snapshot(binding, mempool, binding, restarted).is_err());
     }
 
     #[test]
@@ -5979,12 +6728,10 @@ mod tests {
         assert_eq!(selected.coins.len(), 2);
         assert_eq!(selected.total, BaseUnits::new(9));
         assert_eq!(selected.change, BaseUnits::new(1));
-        assert!(
-            selected
-                .coins
-                .iter()
-                .all(|coin| !coin.name_locked && !coin.coinbase)
-        );
+        assert!(selected
+            .coins
+            .iter()
+            .all(|coin| !coin.name_locked && !coin.coinbase));
     }
 
     #[test]
@@ -6017,15 +6764,11 @@ mod tests {
             .as_bytes()
             .try_into()
             .expect("compressed key");
-        assert!(
-            receive_address(HnsNetwork::Mainnet, &public)
-                .expect("mainnet")
-                .starts_with("hs1")
-        );
-        assert!(
-            receive_address(HnsNetwork::Regtest, &public)
-                .expect("regtest")
-                .starts_with("rs1")
-        );
+        assert!(receive_address(HnsNetwork::Mainnet, &public)
+            .expect("mainnet")
+            .starts_with("hs1"));
+        assert!(receive_address(HnsNetwork::Regtest, &public)
+            .expect("regtest")
+            .starts_with("rs1"));
     }
 }

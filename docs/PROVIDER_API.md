@@ -28,13 +28,15 @@ Handshake:
 `hns_getName`, `hns_importKnownName`, `hns_transferName`, `hns_finalizeName`,
 `hns_signTypedMessage`.
 
-The method vocabulary is stable even when a capability is unavailable. In the
-current release-gated runtime, imported names expose watch-only split proof/
-current status. `hns_transferName` and `hns_finalizeName` must return unavailable
-until released canonical NameState/resource parsing independently proves
-current ownership from committed bytes. The dedicated `HnsName` derivation scan
-is persisted but is key discovery only; unbound owner hints or raw resource
-bytes are not returned as proof-authenticated data.
+The method vocabulary is stable even when a capability is unavailable. The HNS
+runtime now persists split proof/current canonical summaries, exact current
+resource bytes, and account-bound ownership/transfer direction after fresh
+reconciliation; legacy rows stay explicitly watch-only. Provider dispatch for
+these methods is not yet product-integrated. `hns_transferName` and
+`hns_finalizeName` must remain unavailable until transaction workflows and
+trusted approvals consume a freshly reacquired exact-snapshot ownership
+authority. Persisted name status or node projections alone never authorize an
+action.
 
 External assets:
 

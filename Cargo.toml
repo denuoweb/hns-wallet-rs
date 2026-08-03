@@ -61,13 +61,15 @@ thiserror = "2.0.12"
 url = { version = "2.5.4", features = ["serde"] }
 zeroize = { version = "1.8.1", features = ["derive"] }
 
-# Published canonical Handshake protocol crates. No sibling checkout is used.
-hns-covenants = "=0.1.0"
-hns-primitives = "=0.1.0"
-hns-script = "=0.1.0"
-hns-swap = "=0.1.0"
-hns-transaction = "=0.1.0"
-hns-urkel-proof = "=0.1.0"
+# Reviewed canonical Handshake protocol source. Every protocol crate is pinned
+# to one immutable revision; no mutable branch, tag, or sibling checkout is
+# allowed. This source adoption does not imply downstream release qualification.
+hns-covenants = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
+hns-primitives = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
+hns-script = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
+hns-swap = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
+hns-transaction = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
+hns-urkel-proof = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
 
 # The only Bitcoin production synchronization implementation.
 bdk_wallet = { version = "3.1.0", features = ["rusqlite", "keys-bip39"] }

@@ -7,7 +7,8 @@ persistence boundary, chain-neutral market settlement, and deliberately narrow
 Bitcoin and Ethereum modules.
 
 The workspace does not combine the browser, node, or canonical protocol
-repositories. It consumes released protocol crates and exposes a private,
+repositories. It consumes one coherent published or reviewed immutable
+protocol source and exposes a private,
 length-prefixed wallet-service ABI, a fail-closed host-side protocol state
 machine, and machine-readable contracts for separately released browser
 adapters.
@@ -22,8 +23,12 @@ recorded in [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
 never a mainnet authorization signal. Shakedex creation, discovery, and state
 transitions are likewise fail-closed behind canonical V2, Denuo V2, and value
 runtime release gates. HNS name-role keys are scanned and persisted separately,
-but names remain watch-only until released canonical NameState/resource decoding
-can prove ownership from the committed bytes.
+and the wallet now decodes canonical NameState/resource bytes, verifies every
+node projection and exact owner output, and binds current control only to a
+persisted `HnsName` derivation. TRANSFER owners must also bind the canonical
+transfer height to the active-chain owner-transaction inclusion height.
+Persisted name status is never action authority: value workflows must reacquire
+an ephemeral exact-snapshot proof, and name transfer/finalize remain unavailable.
 
 ## Crates
 

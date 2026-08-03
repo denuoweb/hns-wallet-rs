@@ -4,10 +4,13 @@
 
 The crate preserves the encrypted compare-and-swap seller, buyer, and recovery
 schemas and their historical transition ordering for persisted-state
-compatibility. It does not expose an executable Shakedex workflow. The released
-`hns-swap` v0.1 proof envelope is decoded only as a structural legacy format;
-that decode does not verify signatures, network, current ownership, locking
-coins, or canonical V2 listing identity and cannot authorize a transition.
+compatibility. It does not expose an executable Shakedex workflow. The wallet
+dependency boundary now consumes the canonical V2 `hns-swap` source from
+immutable revision `4b989aa`; the complete signed fixed-price listing envelope
+is decoded only for bounded structural inspection. Decoding verifies the
+envelope signature, its embedded claimed hash, and the caller-supplied listing
+identity. It does not verify the current network/time window, current ownership,
+or locking coin and cannot authorize a transition.
 
 Three compile-time gates are immutable and `false`:
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
@@ -17,14 +20,14 @@ Three compile-time gates are immutable and `false`:
 check these gates before validation or mutation. Existing sessions restored
 from legacy persisted records therefore cannot bypass the boundary.
 
-A published coherent canonical V2 protocol dependency, canonical NameState and
-resource decoding, qualification of the separately persisted bounded `HnsName`
-key-role scan, signed name transfer/finalize and fulfillment/recovery
-construction, concrete node evidence, live Denuo V2 publication and discovery,
-trusted browser approval, and restart/reorg/regtest qualification are required
-before any gate can change. The scan establishes key discovery, not ownership;
-imported names remain watch-only, and node-supplied owner/resource hints cannot
-authorize seller actions. Reverse Dutch is deferred.
+The wallet now has coherent canonical V2 source plus exact NameState/resource/
+owner-output validation and ephemeral account ownership authority. Those are
+prerequisites, not Shakedex authorization. Signed name transfer/finalize and
+fulfillment/recovery construction, locked-name key handling, concrete node
+workflow evidence, live Denuo V2 publication/discovery, trusted browser
+approval, consolidated protocol qualification, and restart/reorg/regtest
+evidence are still required before any gate can change. Reverse Dutch is
+deferred.
 
 ## Market intents and sessions
 

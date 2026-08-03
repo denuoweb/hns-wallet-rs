@@ -8,12 +8,12 @@ use std::path::Path;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
 };
 use hmac::{Hmac, Mac};
 use hns_wallet_types::{ApprovalId, WorkflowId, WorkflowKind};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
@@ -394,13 +394,8 @@ impl WalletStore {
                 return Err(StoreError::KindMismatch);
             }
             if kind == SecretKind::RecoverySeed {
-                let current_clear = decrypt_record(
-                    key,
-                    &self.database_id,
-                    kind.label(),
-                    id,
-                    &current_encrypted,
-                )?;
+                let current_clear =
+                    decrypt_record(key, &self.database_id, kind.label(), id, &current_encrypted)?;
                 if current_clear.as_slice() == cleartext {
                     transaction.commit()?;
                     return Ok(());
@@ -596,6 +591,70 @@ impl WalletStore {
         let mut entities = Vec::new();
         for row in rows {
             let (id, revision, encrypted, updated_at_unix) = row?;
+            validate_id(&id)?;
+            let clear = decrypt_record(
+                key,
+                &self.database_id,
+                &entity_label(kind),
+                &revisioned_aad_id(&id, revision, updated_at_unix, None)?,
+                &encrypted,
+            )?;
+            entities.push(StoredEntity {
+                kind,
+                id,
+                revision,
+                value: serde_json::from_slice(&clear)?,
+                updated_at_unix,
+            });
+        }
+        Ok(entities)
+    }
+
+    /// Return the complete bounded set for one binary record-ID prefix.
+    /// Unlike [`Self::list_entities`], this rejects a matching set larger than
+    /// `limit` instead of silently truncating account-scoped recovery state.
+    pub fn list_entities_by_id_prefix<T: for<'de> Deserialize<'de>>(
+        &self,
+        kind: EntityKind,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredEntity<T>>, StoreError> {
+        validate_id(prefix)?;
+        if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+            return Err(StoreError::InvalidListLimit);
+        }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let query_limit = limit
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(StoreError::InvalidListLimit)?;
+        let prefix_length = i64::try_from(prefix.len()).map_err(|_| StoreError::InvalidRecordId)?;
+        let mut statement = self.connection.prepare(
+            "SELECT record_id, revision, encrypted_value, updated_at_unix
+             FROM encrypted_entities
+             WHERE entity_kind=?1 AND substr(record_id, 1, ?2)=?3
+             ORDER BY record_id LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![kind.label(), prefix_length, prefix, query_limit],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            },
+        )?;
+        let mut encrypted_entities = Vec::new();
+        for row in rows {
+            encrypted_entities.push(row?);
+        }
+        if encrypted_entities.len() > limit {
+            return Err(StoreError::ListCapacity);
+        }
+        let mut entities = Vec::with_capacity(encrypted_entities.len());
+        for (id, revision, encrypted, updated_at_unix) in encrypted_entities {
             validate_id(&id)?;
             let clear = decrypt_record(
                 key,
@@ -1019,10 +1078,7 @@ impl WalletStore {
     /// missing, expired, or changed approval returns None without advancing
     /// the workflow. No validation failure consumes the approval.
     #[allow(clippy::too_many_arguments)]
-    pub fn consume_approval_and_save_workflow_with_entity_batch<
-        W: Serialize,
-        E: Serialize,
-    >(
+    pub fn consume_approval_and_save_workflow_with_entity_batch<W: Serialize, E: Serialize>(
         &mut self,
         expected_approval: &PendingApproval,
         now_unix: u64,
@@ -1063,8 +1119,7 @@ impl WalletStore {
         }
         if current_approval.origin.as_str() != expected_approval.origin.as_str()
             || current_approval.expires_at_unix != expected_approval.expires_at_unix
-            || current_approval.request_json.as_slice()
-                != expected_approval.request_json.as_slice()
+            || current_approval.request_json.as_slice() != expected_approval.request_json.as_slice()
         {
             return Ok(None);
         }
@@ -1097,12 +1152,7 @@ impl WalletStore {
             )?,
             &encoded_workflow,
         )?;
-        write_entity_batch_in_transaction(
-            &transaction,
-            entity_kind,
-            &encrypted_entities,
-            deletes,
-        )?;
+        write_entity_batch_in_transaction(&transaction, entity_kind, &encrypted_entities, deletes)?;
         transaction.execute(
             "DELETE FROM private_pending_approvals WHERE id=?1",
             params![expected_approval.id.as_bytes().as_slice()],
@@ -1364,6 +1414,75 @@ impl WalletStore {
         for row in rows {
             let (id, revision, state, broadcast_prepared, updated_at_unix, encryption_version) =
                 row?;
+            if encryption_version != 1 {
+                return Err(StoreError::LegacyEncryptionPending);
+            }
+            let id = WorkflowId::new(id.try_into().map_err(|_| StoreError::CorruptMetadata)?);
+            let clear = decrypt_record(
+                key,
+                &self.database_id,
+                &workflow_label(kind),
+                &revisioned_aad_id(
+                    id.as_bytes(),
+                    revision,
+                    updated_at_unix,
+                    Some(broadcast_prepared),
+                )?,
+                &state,
+            )?;
+            workflows.push(StoredWorkflow {
+                id,
+                kind,
+                revision,
+                state: serde_json::from_slice(&clear)?,
+                irreversible_broadcast_prepared: broadcast_prepared,
+                updated_at_unix,
+            });
+        }
+        Ok(workflows)
+    }
+
+    /// Return every workflow of `kind` within one explicit bound, rejecting
+    /// overflow instead of silently omitting recovery state with opaque IDs.
+    pub fn list_workflows_complete<T: for<'de> Deserialize<'de>>(
+        &self,
+        kind: WorkflowKind,
+        limit: usize,
+    ) -> Result<Vec<StoredWorkflow<T>>, StoreError> {
+        if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+            return Err(StoreError::InvalidListLimit);
+        }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let query_limit = limit
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(StoreError::InvalidListLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, revision, state_json, broadcast_prepared, updated_at_unix,
+                    encryption_version
+             FROM workflows WHERE kind=?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![workflow_kind(kind), query_limit], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, u32>(5)?,
+            ))
+        })?;
+        let mut encrypted_workflows = Vec::new();
+        for row in rows {
+            encrypted_workflows.push(row?);
+        }
+        if encrypted_workflows.len() > limit {
+            return Err(StoreError::ListCapacity);
+        }
+        let mut workflows = Vec::with_capacity(encrypted_workflows.len());
+        for (id, revision, state, broadcast_prepared, updated_at_unix, encryption_version) in
+            encrypted_workflows
+        {
             if encryption_version != 1 {
                 return Err(StoreError::LegacyEncryptionPending);
             }
@@ -1683,13 +1802,10 @@ impl WalletStore {
         now_unix: u64,
     ) -> Result<Option<PendingApproval>, StoreError> {
         let key = self.key.as_ref().ok_or(StoreError::Locked)?;
-        Ok(authenticated_pending_approval(
-            &self.connection,
-            key,
-            &self.database_id,
-            id,
-        )?
-        .filter(|approval| approval.expires_at_unix > now_unix))
+        Ok(
+            authenticated_pending_approval(&self.connection, key, &self.database_id, id)?
+                .filter(|approval| approval.expires_at_unix > now_unix),
+        )
     }
 
     /// Atomically removes and decrypts a pending approval. Expired approvals
@@ -2989,6 +3105,8 @@ pub enum StoreError {
     StaleGeneration { expected: u64, actual: u64 },
     #[error("entity or workflow list limit is invalid")]
     InvalidListLimit,
+    #[error("complete bounded entity or workflow list exceeds its capacity")]
+    ListCapacity,
     #[error("record revision must be nonzero")]
     InvalidRevision,
     #[error("managed encrypted entity records cannot be deleted")]
@@ -3034,10 +3152,9 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("raw envelope");
-        assert!(
-            !raw.windows(b"never persist me clear".len())
-                .any(|window| window == b"never persist me clear")
-        );
+        assert!(!raw
+            .windows(b"never persist me clear".len())
+            .any(|window| window == b"never persist me clear"));
         assert_eq!(
             store
                 .get_secret(b"seed", SecretKind::RecoverySeed)
@@ -3140,23 +3257,19 @@ mod tests {
             .expect("take approval")
             .expect("live approval");
         assert_eq!(approval.request_json.as_slice(), b"approval commitment");
-        assert!(
-            store
-                .take_pending_approval(id, 10)
-                .expect("second take")
-                .is_none()
-        );
+        assert!(store
+            .take_pending_approval(id, 10)
+            .expect("second take")
+            .is_none());
 
         let expired = ApprovalId::new([8; 16]);
         store
             .put_pending_approval(expired, "https://wallet.example", b"expired", 20, 30)
             .expect("put expired approval");
-        assert!(
-            store
-                .take_pending_approval(expired, 30)
-                .expect("expire approval")
-                .is_none()
-        );
+        assert!(store
+            .take_pending_approval(expired, 30)
+            .expect("expire approval")
+            .is_none());
     }
 
     #[test]
@@ -3215,12 +3328,10 @@ mod tests {
             .expect("account present");
         assert_eq!(account.revision, 1);
         assert_eq!(account.value["next_change"], 0);
-        assert!(
-            store
-                .load_workflow::<serde_json::Value>(workflow_id)
-                .expect("load workflow")
-                .is_none()
-        );
+        assert!(store
+            .load_workflow::<serde_json::Value>(workflow_id)
+            .expect("load workflow")
+            .is_none());
 
         let reservation = EntityBatchSave {
             id: vec![3_u8; 36],
@@ -3251,18 +3362,14 @@ mod tests {
                 .value["next_change"],
             1
         );
-        assert!(
-            store
-                .load_workflow::<serde_json::Value>(workflow_id)
-                .expect("load workflow")
-                .is_some()
-        );
-        assert!(
-            store
-                .input_reservation::<serde_json::Value>(&[3_u8; 36])
-                .expect("load reservation")
-                .is_some()
-        );
+        assert!(store
+            .load_workflow::<serde_json::Value>(workflow_id)
+            .expect("load workflow")
+            .is_some());
+        assert!(store
+            .input_reservation::<serde_json::Value>(&[3_u8; 36])
+            .expect("load reservation")
+            .is_some());
     }
 
     #[test]
