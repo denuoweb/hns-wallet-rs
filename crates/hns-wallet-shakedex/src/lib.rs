@@ -1,4 +1,4 @@
-#![doc = "Crash-recoverable fixed-price Shakedex orchestration."]
+#![doc = "Release-gated fixed-price Shakedex persistence boundary."]
 #![forbid(unsafe_code)]
 
 use hns_swap::SwapProof;
@@ -9,6 +9,13 @@ use thiserror::Error;
 
 pub const MAX_LISTING_BYTES: usize = 64 * 1024;
 pub const MAX_NAME_BYTES: usize = 63;
+
+/// Canonical Shakedex V2 protocol integration has not been release-qualified.
+pub const SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED: bool = false;
+/// Denuo V2 publication and discovery have not been release-qualified.
+pub const SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED: bool = false;
+/// Shakedex transaction construction and value movement have not been release-qualified.
+pub const SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +60,7 @@ impl SellerSession {
         name: Vec<u8>,
         name_hash: ObjectHash,
     ) -> Result<Self, ShakedexError> {
+        require_release_qualified()?;
         validate_name(&name)?;
         Ok(Self {
             workflow_id,
@@ -77,6 +85,7 @@ impl SellerSession {
         evidence: SellerEvidence,
         journal: &mut J,
     ) -> Result<(), ShakedexError> {
+        require_release_qualified()?;
         let mut next = self.clone();
         next.transition(evidence)?;
         next.revision = self
@@ -131,7 +140,7 @@ impl SellerSession {
                     listing_hash,
                 },
             ) => {
-                verify_swap_proof(&proof)?;
+                let _ = decode_legacy_swap_proof(&proof)?;
                 self.listing_bytes = Some(proof);
                 self.listing_hash = Some(listing_hash);
                 SellerState::OfferSigned
@@ -254,7 +263,8 @@ impl BuyerSession {
         listing_hash: ObjectHash,
         listing_bytes: Vec<u8>,
     ) -> Result<Self, ShakedexError> {
-        verify_swap_proof(&listing_bytes)?;
+        require_release_qualified()?;
+        let _ = decode_legacy_swap_proof(&listing_bytes)?;
         Ok(Self {
             workflow_id,
             revision: 0,
@@ -273,6 +283,7 @@ impl BuyerSession {
         evidence: BuyerEvidence,
         journal: &mut J,
     ) -> Result<(), ShakedexError> {
+        require_release_qualified()?;
         let mut next = self.clone();
         next.transition(evidence)?;
         next.revision = self
@@ -459,16 +470,38 @@ fn validate_name(name: &[u8]) -> Result<(), ShakedexError> {
     Ok(())
 }
 
-fn verify_swap_proof(bytes: &[u8]) -> Result<(), ShakedexError> {
+fn require_release_qualified() -> Result<(), ShakedexError> {
+    if !SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED {
+        return Err(ShakedexError::CanonicalProtocolUnavailable);
+    }
+    if !SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED {
+        return Err(ShakedexError::DenuoProtocolUnavailable);
+    }
+    if !SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED {
+        return Err(ShakedexError::ValueRuntimeUnavailable);
+    }
+    Ok(())
+}
+
+/// Decodes the released v0.1 proof envelope for legacy persisted-state
+/// inspection only. Structural decoding does not verify signatures, network,
+/// current ownership, locking coins, or canonical V2 listing identity and must
+/// never authorize a workflow transition.
+fn decode_legacy_swap_proof(bytes: &[u8]) -> Result<SwapProof, ShakedexError> {
     if bytes.is_empty() || bytes.len() > MAX_LISTING_BYTES {
         return Err(ShakedexError::InvalidListing);
     }
-    SwapProof::decode(bytes).map_err(|_| ShakedexError::InvalidListing)?;
-    Ok(())
+    SwapProof::decode(bytes).map_err(|_| ShakedexError::InvalidListing)
 }
 
 #[derive(Debug, Error)]
 pub enum ShakedexError {
+    #[error("canonical Shakedex V2 protocol is not release-qualified")]
+    CanonicalProtocolUnavailable,
+    #[error("Denuo V2 publication and discovery are not release-qualified")]
+    DenuoProtocolUnavailable,
+    #[error("Shakedex value runtime is not release-qualified")]
+    ValueRuntimeUnavailable,
     #[error("invalid Handshake name")]
     InvalidName,
     #[error("invalid or oversized Shakedex proof")]
@@ -496,57 +529,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seller_recovery_is_available_from_locked_and_cancelled_states() {
-        let mut session = SellerSession::new(
-            WorkflowId::new([1; 16]),
-            b"example".to_vec(),
-            ObjectHash::new([2; 32]),
-        )
-        .expect("seller");
-        session.state = SellerState::Cancelled;
+    fn seller_entrypoints_fail_closed_for_new_and_restored_sessions() {
+        assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
+        assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+        assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+        assert!(matches!(
+            SellerSession::new(
+                WorkflowId::new([1; 16]),
+                b"example".to_vec(),
+                ObjectHash::new([2; 32]),
+            ),
+            Err(ShakedexError::CanonicalProtocolUnavailable)
+        ));
+
+        // Existing persisted records can deserialize directly into this public
+        // schema, so apply must enforce the gate independently of creation.
+        let mut session = SellerSession {
+            workflow_id: WorkflowId::new([1; 16]),
+            revision: 7,
+            state: SellerState::Cancelled,
+            name: b"example".to_vec(),
+            name_hash: ObjectHash::new([2; 32]),
+            transfer_txid: None,
+            finalize_txid: None,
+            locked_owner_outpoint: None,
+            listing_hash: None,
+            listing_bytes: None,
+            fulfillment_txid: None,
+            recovery_txid: None,
+            last_verified_height: 0,
+            failure: None,
+        };
+        let original = session.clone();
         let mut journal = MemoryJournal::default();
-        session
-            .apply(SellerEvidence::RecoveryPrepared, &mut journal)
-            .expect("prepare recovery");
-        session
-            .apply(
-                SellerEvidence::RecoveryPersistedAndBroadcast {
-                    txid: TransactionHash::new([3; 32]),
-                },
-                &mut journal,
-            )
-            .expect("broadcast recovery");
-        session
-            .apply(
-                SellerEvidence::RecoveryOwnershipVerified { height: 10 },
-                &mut journal,
-            )
-            .expect("verify recovery");
-        assert_eq!(session.state, SellerState::Recovered);
-        assert_eq!(journal.seller.last(), Some(&session));
+        assert!(matches!(
+            session.apply(SellerEvidence::RecoveryPrepared, &mut journal),
+            Err(ShakedexError::CanonicalProtocolUnavailable)
+        ));
+        assert_eq!(session, original);
+        assert!(journal.seller.is_empty());
     }
 
     #[test]
-    fn buyer_cannot_finalize_before_verified_transfer_lock() {
-        // This test constructs the state after canonical proof verification;
-        // proof codec vectors live in hns-swap.
+    fn buyer_entrypoints_fail_closed_for_discovery_and_restored_sessions() {
+        assert!(matches!(
+            BuyerSession::discover(
+                WorkflowId::new([3; 16]),
+                ObjectHash::new([4; 32]),
+                vec![1],
+            ),
+            Err(ShakedexError::CanonicalProtocolUnavailable)
+        ));
+
+        // A deserialized pre-gate session must not bypass the apply boundary.
         let mut buyer = BuyerSession {
-            workflow_id: WorkflowId::new([4; 16]),
-            revision: 0,
+            workflow_id: WorkflowId::new([3; 16]),
+            revision: 9,
             state: BuyerState::ListingVerified,
-            listing_hash: ObjectHash::new([5; 32]),
+            listing_hash: ObjectHash::new([4; 32]),
             listing_bytes: vec![1],
             fulfillment_txid: None,
             finalize_txid: None,
             last_verified_height: 0,
             failure: None,
         };
+        let original = buyer.clone();
+        let mut journal = MemoryJournal::default();
         assert!(matches!(
-            buyer.apply(
-                BuyerEvidence::FinalizePrepared,
-                &mut MemoryJournal::default()
-            ),
-            Err(ShakedexError::InvalidTransition)
+            buyer.apply(BuyerEvidence::FulfillmentPrepared, &mut journal),
+            Err(ShakedexError::CanonicalProtocolUnavailable)
         ));
+        assert_eq!(buyer, original);
+        assert!(journal.buyer.is_empty());
     }
 }

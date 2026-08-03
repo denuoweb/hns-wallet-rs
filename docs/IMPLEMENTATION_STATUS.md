@@ -12,7 +12,7 @@ mainnet settlement remains disabled independently.
 | Store | schema v3; Argon2id and XChaCha20-Poly1305; encrypted typed entities/workflows/provider records; metadata-bound AEAD; bounded heterogeneous CAS batches; non-consuming authenticated approval reads; atomic unchanged-approval consume plus workflow/reservation CAS; bounded passphrase input, approvals and replays; monotonic permission tombstones; migration checkpoint; Linux file-boundary enforcement | platform key wrapping, supported secure-open policy on non-Linux targets, migration/import tooling for populated schema-v1 entity tables, DB benchmarks and audit |
 | HNS | create/restore, separated keys, BLAKE2b-160 version-0 addresses, authenticated loopback `hns-node-rs` wallet RPC v1 adapter, bounded paginated atomic snapshots, durable chain epoch and restart-safe mempool instance/generation binding, restore/history/reorg reconciliation, ordered spender evidence, optional exact time/transaction positions, exact current/proof NameState bytes, send construction/signing, exact final-signed fee-quote schema and persistence, pre-submission re-quote with durable `RequiresRebroadcast`, atomic account/workflow/input reservation preparation, watch-only split name evidence, canonical HTLC construction/spends, settlement evidence and restart supervision | consolidated adapter CI plus regtest/restart/reorg/adversarial qualification, released `hns-script` canonical sigop-adjusted fee algebra, released canonical NameState/resource decoder plus dedicated HNS-name key scan before ownership actions, published canonical settlement profile |
 | Provider | exact secure origin, bounded opaque host-handle registry, exact revisions, service-owned wallet/permission state, encrypted permission generations/tombstones, ephemeral approvals/replay/rates, forbidden methods | published engine authority adapter, browser-native dispatch and complete trusted approval UI |
-| Shakedex | persisted seller/buyer/recovery state machines and canonical proof decoding | complete signed transaction construction, live node/Denuo integration, restart/reorg/regtest qualification |
+| Shakedex | encrypted/CAS seller, buyer, and recovery schemas; structural legacy v0.1 proof decoding; all creation, discovery, and transition entrypoints hard-disabled | published coherent canonical V2 protocol dependency, signed transaction construction, live node/Denuo V2 integration, trusted approval UI, restart/reorg/regtest qualification |
 | Denuo market | chain-neutral reservations/sessions; canonical V2 protocol implemented in `hns-rs` | released protocol dependency, reporter governance, live relay/board integration |
 | Bitcoin | BDK BIP84 create/load/receive/send primitives; deterministic domain/network/role-separated atomic-swap keys with public recovery vectors; bounded Kyoto tip discovery and supervisor; encrypted birthday/phase/checkpoint journal; BDK-first restart reconciliation; bounded transaction/output mirrors; exact fee-bound pre-broadcast journal; HTLC funding/spend/evidence units | pinned Kyoto durable header/filter/peer API, record archival, durable swap-key allocation, signed-spend/settlement integration, consolidated CI, regtest/restart/reorg/adversarial qualification and benchmarks; value gate remains false |
 | Ethereum | separated accounts, typed EIP-1559 native/HTLC signing, Helios policy, exact code/state/receipt/event checks, deterministic contract | embedded Helios proof source, persistence/history, local-chain qualification, approved address and audit |
@@ -64,6 +64,17 @@ Other exact blockers are:
   and non-Linux secure persistent database opening are unavailable; and
 - regtest, restart/reorg, installed-product, resource, and independent security
   qualification have not been recorded for this source tranche.
+
+## Shakedex release gates
+
+`SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
+`SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`, and
+`SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED` are `false`. Seller creation and
+transition and buyer discovery and transition return an explicit unavailable
+error before validation, decoding, persistence, or mutation. This also blocks
+sessions restored from legacy persisted records. Released `hns-swap` v0.1
+proof decoding is structural migration compatibility only and is not protocol,
+ownership, listing, or value authorization.
 
 ## Bitcoin value release gate
 

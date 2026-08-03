@@ -2,24 +2,28 @@
 
 ## Fixed-price Shakedex
 
-The wallet consumes canonical `hns-swap` proof decoding. Seller state covers
-ownership verification, transfer preparation/broadcast/lock, lock finalization,
-fixed-price proof verification, Denuo publication/cancellation, fulfillment,
-and recovery back to ownership. Buyer state covers listing/current-name proof,
-fulfillment, transfer lock, finalization, conflicting fulfillment, and failure.
+The crate preserves the encrypted compare-and-swap seller, buyer, and recovery
+schemas and their historical transition ordering for persisted-state
+compatibility. It does not expose an executable Shakedex workflow. The released
+`hns-swap` v0.1 proof envelope is decoded only as a structural legacy format;
+that decode does not verify signatures, network, current ownership, locking
+coins, or canonical V2 listing identity and cannot authorize a transition.
 
-Every transition is journaled with a compare-and-swap revision. Recovery is
-available from locked, offered, published, and cancelled seller states. Buyer
-finalization cannot occur before verified transfer lock.
+Three compile-time gates are immutable and `false`:
+`SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
+`SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`, and
+`SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`. `SellerSession::new`,
+`SellerSession::apply`, `BuyerSession::discover`, and `BuyerSession::apply`
+check these gates before validation or mutation. Existing sessions restored
+from legacy persisted records therefore cannot bypass the boundary.
 
-The orchestration source exists, but ownership transitions are unavailable.
-Released protocol crates do not yet decode canonical NameState fields, and the
-wallet has no separately persisted bounded `HnsName` key-role scan; imported
-names are watch-only and node-supplied owner/resource hints cannot authorize a
-seller action. Name transfer/finalize transaction construction, the concrete
-node evidence adapter, live Denuo V2 publication, restart-at-every-state/reorg
-qualification, and an installed browser approval UI are also unavailable.
-Fixed-price Shakedex is therefore release-gated. Reverse Dutch is deferred.
+A published coherent canonical V2 protocol dependency, canonical NameState and
+resource decoding, a separately persisted bounded `HnsName` key-role scan,
+signed name transfer/finalize and fulfillment/recovery construction, concrete
+node evidence, live Denuo V2 publication and discovery, trusted browser
+approval, and restart/reorg/regtest qualification are required before any gate
+can change. Imported names remain watch-only, and node-supplied owner/resource
+hints cannot authorize seller actions. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 

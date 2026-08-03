@@ -2,9 +2,9 @@
 
 `hns-wallet-rs` is the independent Rust wallet boundary for the Handshake DANE
 browser products. It owns encrypted local wallet state, a Handshake-first
-wallet, the Handshake Provider API core, fixed-price Shakedex orchestration,
-chain-neutral market settlement, and deliberately narrow Bitcoin and Ethereum
-modules.
+wallet, the Handshake Provider API core, a release-gated fixed-price Shakedex
+persistence boundary, chain-neutral market settlement, and deliberately narrow
+Bitcoin and Ethereum modules.
 
 The workspace does not combine the browser, node, or canonical protocol
 repositories. It consumes released protocol crates and exposes a private,
@@ -17,7 +17,9 @@ or settlement, and the Bitcoin module cannot issue its value permit, until the
 adapter-qualification and persistence gates recorded in
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
 [`docs/QUALIFICATION.md`](docs/QUALIFICATION.md) are complete. Test success is
-never a mainnet authorization signal.
+never a mainnet authorization signal. Shakedex creation, discovery, and state
+transitions are likewise fail-closed behind canonical V2, Denuo V2, and value
+runtime release gates.
 
 ## Crates
 
@@ -26,7 +28,7 @@ never a mainnet authorization signal.
 - `hns-wallet-chain-api`: modular chain and settlement capability traits.
 - `hns-wallet-hns`: Handshake account/name workflows and node backend.
 - `hns-wallet-provider`: hostile-page request, permission, and approval core.
-- `hns-wallet-shakedex`: persisted fixed-price seller/buyer state machines.
+- `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery schemas.
 - `hns-wallet-market`: price-bound reservations and atomic-swap recovery.
 - `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, separated swap keys, and Bitcoin HTLC adapter.
 - `hns-wallet-ethereum`: Helios policy and native-ETH-only HTLC adapter.
