@@ -65,6 +65,7 @@ zeroize = { version = "1.8.1", features = ["derive"] }
 # to one immutable revision; no mutable branch, tag, or sibling checkout is
 # allowed. This source adoption does not imply downstream release qualification.
 hns-covenants = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
+hns-marketplace-protocol = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
 hns-primitives = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
 hns-script = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }
 hns-swap = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4b989aabc132e7e79b8fd57a10f2465073faf588" }

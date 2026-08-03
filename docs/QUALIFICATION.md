@@ -10,7 +10,7 @@ current commit has no recorded result for that gate.
 | Encrypted store/schema v3 | pending consolidated gate | source includes migration checkpoint, encrypted typed CRUD/CAS/batches and restart-safe workflow rows | n/a | no device secure-store test | no DB benchmark/audit | qualification pending |
 | HNS wallet/names | focused `canonical_hns_v3_name_action` PASS on NVMe: 4 passed, 0 failed, 19 filtered; prior `canonical_hns_v2`: 6 passed, 0 failed, 9 filtered; prior account-scoped persistence regression: 1 passed, 0 failed, 15 filtered; consolidated gate pending | source includes authenticated loopback RPC configuration, strict HTTP/JSON parsing, atomic coin/name-role snapshot restoration, complete bounded account-prefix entity reloads, encrypted monotonic scan state, canonical current/proof summaries and exact owner inclusion, legacy-row revalidation, ephemeral ownership/finalize authority, versioned action context, exact persisted input evidence, canonical TRANSFER/FINALIZE construction, typed reservations, single-use approval, ordered coin/name signing, canonical local policy/minimum-fee checks, exact signed-byte fee-quote persistence, and durable rebroadcast/name-action state | source includes epoch-bound checkpoint rewind, ordered spender evidence, split current/proof revalidation, exact cross-scan binding rejection, authority reacquisition, persistent reservations across reversible confirmations, reapproval state, and one-reconciliation fee-quote recovery; no multi-process restart/reorg execution | concrete adapter source pinned to node RPC v1 commit `e5f95c05`; canonical protocol crates pinned coherently to immutable `hns-rs` `4b989aa`; no multi-process regtest or product name-action run | no resource measurement/audit | wallet-owned P2PKH TRANSFER/direct-FINALIZE source implemented; HNS value-runtime and fee-policy qualification gates remain false; provider/product and real-network qualification pending |
 | Provider core | focused `canonical_provider_account_join` PASS on NVMe: 5 passed, 0 failed, 31 filtered across FFI, host, provider, and service; consolidated gate pending | encrypted grants/tombstones plus exact bounded HNS account bindings implemented; approvals/replays remain process-local | n/a | no concrete HNS runtime or installed-browser E2E | no audit | product integration pending |
-| Fixed-price Shakedex | focused immutable-V2 listing/gate filter PASS on NVMe: 3 passed, 0 failed | CAS journal source | evidence incomplete | no regtest/Denuo E2E | no audit | all workflow/value gates remain unavailable |
+| Fixed-price Shakedex | exact-lock/Denuo/board filter PASS on NVMe: 1 passed, 0 failed, 3 filtered; prior immutable-V2 listing/gate filter: 3 passed, 0 failed | encrypted workflow and board CAS source; focused case passed stale-writer rejection and encrypted reopen/reload | durable replay/tombstone source; chain reorg evidence incomplete | no regtest/live-Denuo E2E | no audit | all workflow/value gates remain unavailable |
 | Market sessions | prior unit baseline only | CAS journal source | evidence incomplete | no pair E2E | no audit | unavailable |
 | Bitcoin Kyoto | targeted allocation filter PASS on NVMe: 10 passed, 0 failed, 8 filtered; consolidated gate pending | source includes encrypted CAS-backed monotonic session/role swap-key allocation, protected seed/allocation records, authenticated re-derivation, BDK-first sync journal, bounded reconciliation chunks, restart resume, and pre-broadcast intent; allocation database reopen covered by the targeted filter; pinned Kyoto header/filter/peer persistence unavailable | source queries exact canonical hash membership within a bounded retained window; no allocation reorg or snapshot-rollback evidence | no regtest/P2P/broadcast run | not measured/no audit | send and settlement hard-disabled |
 | Ethereum | containment tranche pending consolidated gate | offline derivation and dormant typed primitives only; no synchronization/history persistence | no restart/reorg evidence | deterministic contract compiled only in prior baseline; no embedded Helios/local-chain run; permits unavailable; mainnet denied | no contract audit | synchronization/history/send/signing/settlement unavailable |
@@ -68,6 +68,19 @@ filtered: FFI 1, host 1, provider 1, and service 2. No standalone build/check,
 full workspace gate, RocksDB compilation, network test, or benchmark was run.
 This is source-contract evidence only; concrete-runtime, restart, installed
 browser, and product qualification remain pending.
+
+The fixed-price protocol/board tranche ran one narrowly filtered NVMe command:
+`cargo test --locked --offline -p hns-wallet-shakedex
+canonical_shakedex_fixed_price -- --test-threads=1`. It passed 1 test with 0
+failures and 3 filtered. The case covered exact listing identity, network/time/
+locking-coin cryptographic binding, canonical Denuo offer/inventory/request/
+cancellation envelopes, registry substitution rejection, monotonic
+seller/name replay and tombstone policy, relisting replacement, encrypted board
+CAS, stale-writer rejection, and database reopen/unlock/reload. The protocol
+boundary still cannot prove a supplied coin current or unspent, and there was
+no live relay, node, regtest, chain reorg, standalone build/check, RocksDB,
+network, benchmark, or broad test run. All Shakedex product/value gates remain
+false.
 
 ## Prior baseline evidence
 

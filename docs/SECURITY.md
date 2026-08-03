@@ -29,7 +29,12 @@ independently disabled.
   JavaScript, extension local storage, and native-messaging frames never carry
   seed or raw private-key bytes.
 - Denuo/Brontide authenticates a connection, not a listing, price, fill, chain
-  state, or peer claim. Canonical signatures and local chain evidence decide.
+  state, or peer claim. Fixed-price discovery checks the exact registry/message
+  family, canonical signature/content hash, monotonic seller/name sequence,
+  network/genesis, active time window, and exact locking coin locally. The
+  protocol verifier does not establish that caller-supplied coin as current or
+  unspent; only fresh authenticated HNS adapter evidence may do so. Persisted
+  cache bytes never become action authority after restart.
 - Bitcoin production synchronization has one backend: Kyoto direct P2P with
   BIP157/158. There is no trusted indexer fallback.
 - Handshake node evidence crosses one authenticated loopback HTTP/1.1 boundary.

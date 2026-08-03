@@ -13,8 +13,8 @@ disabled independently.
 | Store | schema v3; Argon2id and XChaCha20-Poly1305; encrypted typed entities/workflows/provider records; metadata-bound AEAD; bounded heterogeneous CAS batches; complete bounded binary-prefix entity and opaque-workflow reads; non-consuming authenticated approval reads; atomic unchanged-approval consume plus workflow/reservation CAS; bounded passphrase input, approvals and replays; monotonic permission tombstones; migration checkpoint; Linux file-boundary enforcement | platform key wrapping, supported secure-open policy on non-Linux targets, migration/import tooling for populated schema-v1 entity tables, DB benchmarks and audit |
 | HNS | create/restore, separated keys, BLAKE2b-160 version-0 addresses, authenticated loopback `hns-node-rs` wallet RPC v1 adapter, separate bounded coin and `HnsName` queries under one exact chain/mempool snapshot, complete wallet/account-scoped persisted entity reads and fail-closed opaque-workflow recovery, encrypted monotonic name scan state, restore/history/reorg reconciliation, ordered spender evidence, optional exact time/transaction positions, immutable canonical 0.2 NameState/resource source, exact raw/projected current/proof validation, owner txid/index/value/covenant/inclusion binding, `HnsName` ownership/incoming/outgoing classification, legacy-row revalidation, ephemeral exact-snapshot ownership authority, versioned chain/mempool/owner/lockup/renewal action-context validation, canonical index-zero value-preserving TRANSFER and outgoing-owner direct FINALIZE construction, deterministic encrypted name workflows, typed name/funding reservations, single-use trusted approval, ordered `HnsName`/`HnsCoin` signing, canonical policy-size/minimum-fee construction and independent node-quote comparison, exact signed-byte quote/requote, durable broadcast/mempool/lock/eligibility/finalization/cancellation/conflict/reapproval reconciliation, canonical HTLC construction/spends, settlement evidence and restart supervision | consolidated node/wallet action-context and fee-policy CI; multi-process regtest, restart/reorg, mempool-conflict, adversarial, name-scan, and resource qualification; trusted provider/UI integration; protocol publication and independent review; published canonical settlement profile |
 | Provider | exact 43-name vocabulary, secure origin, opaque authority registry, authority-validated permission/tombstone snapshots, bounded persisted account bindings, generation-CAS-bound single-approval `hns_requestAccounts` join, runtime-downgrade-safe minimized `hns_accounts`, typed capability snapshot, ephemeral approvals/replay/rates, forbidden methods | concrete `HnsWalletRuntime` account selector/dispatch, published engine authority adapter, browser-native transport, complete trusted approval UI, restart/product qualification |
-| Shakedex | encrypted/CAS seller, buyer, and recovery schemas; immutable canonical V2 signed-listing decode with envelope signature and listing-identity binding for structural inspection; all creation, discovery, and transition entrypoints hard-disabled | canonical source qualification/publication, current network/time/locking-coin verification at action boundaries, signed transaction construction, live node/Denuo V2 integration, trusted approval UI, restart/reorg/regtest qualification |
-| Denuo market | chain-neutral reservations/sessions; canonical V2 protocol implemented in `hns-rs` | released protocol dependency, reporter governance, live relay/board integration |
+| Shakedex | encrypted/CAS seller, buyer, and recovery schemas; opaque canonical fixed-price protocol authority bound to exact hash/network/time/supplied locking coin; typed canonical cancellation; all value workflow entrypoints hard-disabled | authenticated current/unspent lock evidence, typed HNS signing/funding/finalize adapter, complete seller/buyer/recovery orchestration, live node/Denuo transport, trusted approval UI, restart/reorg/regtest qualification |
+| Denuo market | pinned canonical name-market envelopes; bounded replay/tombstone-safe encrypted fixed-price board with sequence watermarks and CAS restart validation; chain-neutral reservations/sessions | live relay/outbox supervision, peer policy, reporter governance, product integration and qualification |
 | Bitcoin | BDK BIP84 create/load/receive/send primitives; context-bound atomic-swap allocation keys with crate-local regression vectors; encrypted CAS-backed monotonic session/role allocation and authenticated re-derivation; bounded Kyoto tip discovery and supervisor; encrypted birthday/phase/checkpoint journal; BDK-first restart reconciliation; bounded transaction/output mirrors; exact fee-bound pre-broadcast journal; HTLC funding/spend/evidence units | canonical complete-terms caller and settlement-supervisor integration, pinned Kyoto durable header/filter/peer API, record archival, signed-spend integration, consolidated CI, regtest/restart/reorg/adversarial qualification and benchmarks; value gate remains false |
 | Ethereum | separated offline accounts, typed dormant EIP-1559/HTLC and structural evidence primitives, deterministic contract, immutable false synchronization/value/settlement/mainnet gates, opaque runtime permits plus role/address/exact-fee-bound signing types, zeroizing preimages/intermediates, redacted controlled-broadcast artifact | embedded Helios proof source and privately minted evidence authority, persistence/balance/history/nonce/fee/broadcast runtime, redeem/refund verification, local-chain/restart/reorg qualification, approved address and audit |
 | FFI/service/host | ABI v2; canonical framing; random host/service/wallet sessions; one typed provider binding; authority-scoped private capability snapshot distinct from the public website capability result; bounded typed frames; fail-closed subprocess; caller-side owned clock/entropy, hello/restart and dual-direction sequence state, bounded response correlation, authority/approval/binding/event replay state; Draft 2020-12 private/public/manifest schema bundle and bounded vectors | signed released service artifact and verifier trust store, private Chromium launcher and exact capability projection, generated JNI/Swift bindings, published engine join and compatibility E2E; provider/value/browser capability gates remain false |
@@ -72,12 +72,15 @@ Other exact blockers are:
 `SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`, and
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED` are `false`. Seller creation and
 transition and buyer discovery and transition return an explicit unavailable
-error before validation, decoding, persistence, or mutation. This also blocks
-sessions restored from legacy persisted records. Immutable canonical V2
-fixed-price listing decoding verifies the signed envelope and its exact listing
-identity for structural inspection only. It does not verify current network,
-time window, ownership, or locking coin and is not workflow or value
-authorization.
+error before mutation. This also blocks sessions restored from legacy
+persisted records. Independently usable read/discovery boundaries now require
+the exact listing hash, network, active time window, and supplied canonical
+locking coin; cancellations bind to that exact listing; Denuo registry and
+message family are checked before protocol authority is returned. The boundary
+does not authenticate that coin as current or unspent. The persisted board
+revalidates canonical bytes and monotonic seller/name watermarks after restart.
+These read/cache authorities do not authorize signing, funding, broadcast, or
+a workflow transition.
 
 ## Bitcoin value release gate
 
@@ -130,9 +133,11 @@ gate. On 2026-08-03 the focused NVMe `canonical_hns_v2` invocation passed 6 HNS
 name/adapter tests and 3 Shakedex listing/gate tests; the subsequent exact
 account-scoped persistence regression passed 1 test. The final focused
 `canonical_hns_v3_name_action` invocation passed 4 HNS tests with 0 failures
-and 19 filtered. No standalone build, check, broad workspace test, RocksDB
-compilation, network run, or benchmark was performed. These focused results do
-not replace the consolidated gate and do not enable a value constant. Run
+and 19 filtered. The exact-lock/Denuo/board invocation then passed 1 Shakedex
+test with 0 failures and 3 filtered, including encrypted CAS reopen recovery.
+No standalone build, check, broad workspace test, RocksDB compilation, network
+run, or benchmark was performed. These focused results do not replace the
+consolidated gate and do not enable a value constant. Run
 `scripts/check.sh` once in CI and record the resulting commit ID and artifacts
 in [`QUALIFICATION.md`](QUALIFICATION.md). The new provider/ABI/service/host
 contract tests and machine-readable vectors are source-only and remain unrun.

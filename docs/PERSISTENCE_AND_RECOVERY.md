@@ -41,6 +41,26 @@ Duplicate `(entity kind, record ID)` operations and stale writers fail before a
 partial batch becomes visible. Secret record IDs cannot change kinds; recovery
 seed bytes are additionally immutable once inserted.
 
+The fixed-price Denuo board is one versioned encrypted `DenuoBoardObject` with
+an explicit 4,096-offer/watermark bound and a store-owned CAS revision. It
+retains one canonical latest listing/cancellation record plus network/genesis,
+name hash, seller key, expiry, status, and the exact highest observed sequence
+for each seller/name identity. A higher valid listing replaces that identity's
+older record without consuming another slot. Load re-decodes every object and
+rejects unsorted, duplicate, mismatched, rolled-back, or malformed state. A
+cancellation tombstone advances the watermark, so restart cannot make the
+cancelled listing active or admit the same sequence under another content hash.
+The signed listing target can be re-authenticated from these bytes to process a
+still-active cancellation after restart without recreating locking-coin
+authority. After the listing or cancellation's signed horizon expires, bounded
+inventory filtering hides the object but retains its authenticated watermark,
+so a later listing cannot reset or reuse the seller/name sequence. Relisting
+the same identity replaces its stored object without growing the board. The
+4,096-distinct-identity ceiling fails closed; durable archival and peer
+admission policy remain required for a live relay. The cache does not persist
+an action capability; current locking-coin/network/time authority must be
+reacquired before a listing can drive value behavior.
+
 HNS authorization can authenticate and return a pending approval without
 consuming it. After exact signed-byte fee quoting succeeds, a bounded immediate
 transaction re-authenticates that unchanged approval together with the current

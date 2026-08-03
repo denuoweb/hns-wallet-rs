@@ -1,6 +1,21 @@
 #![doc = "Release-gated fixed-price Shakedex persistence boundary."]
 #![forbid(unsafe_code)]
 
+mod board;
+mod canonical;
+
+pub use board::{
+    BoardOfferStatus, NameMarketBoard, PersistedBoardOffer, StoredNameMarketBoard,
+    load_name_market_board, save_name_market_board,
+};
+pub use canonical::{
+    AuthenticatedFixedPriceListing, DenuoNameMarketRequest, VerifiedFixedPriceListing,
+    VerifiedListingCancellation, authenticate_fixed_price_listing, decode_denuo_cancellation,
+    decode_denuo_inventory, decode_denuo_offer, decode_denuo_request, encode_denuo_cancellation,
+    encode_denuo_inventory, encode_denuo_offer, encode_denuo_request, verify_fixed_price_listing,
+    verify_listing_cancellation,
+};
+
 use hns_swap::{FixedPriceListing, MAX_FIXED_PRICE_LISTING_SIZE};
 use hns_wallet_store::{StoreError, WalletStore};
 use hns_wallet_types::{ObjectHash, TransactionHash, WorkflowId, WorkflowKind};
@@ -9,10 +24,13 @@ use thiserror::Error;
 
 pub const MAX_LISTING_BYTES: usize = MAX_FIXED_PRICE_LISTING_SIZE;
 pub const MAX_NAME_BYTES: usize = 63;
+pub const MAX_NAME_MARKET_BOARD_OFFERS: usize = 4_096;
 
 /// Canonical Shakedex V2 protocol integration has not been release-qualified.
 pub const SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED: bool = false;
-/// Denuo V2 publication and discovery have not been release-qualified.
+/// Live Denuo V2 transport, relay publication, and product discovery have not
+/// been release-qualified. Offline canonical envelope and board operations do
+/// not bypass this product/runtime gate.
 pub const SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED: bool = false;
 /// Shakedex transaction construction and value movement have not been release-qualified.
 pub const SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
@@ -524,6 +542,18 @@ pub enum ShakedexError {
     InvalidName,
     #[error("invalid, oversized, or mismatched Shakedex listing")]
     InvalidListing,
+    #[error("invalid, oversized, or mismatched Shakedex cancellation")]
+    InvalidCancellation,
+    #[error("invalid or unexpected Denuo name-market envelope")]
+    InvalidDenuoEnvelope,
+    #[error("Denuo registry version differs from the requested version")]
+    DenuoRegistryMismatch,
+    #[error("Denuo name-market object was replayed or rolled back")]
+    NameMarketReplay,
+    #[error("Denuo name-market board reached its explicit capacity")]
+    NameMarketBoardCapacity,
+    #[error("persisted Denuo name-market board is corrupt or noncanonical")]
+    CorruptNameMarketBoard,
     #[error("verified evidence does not permit this transition")]
     InvalidTransition,
     #[error("name or transaction evidence is invalid")]
@@ -537,8 +567,12 @@ pub enum ShakedexError {
 }
 
 impl From<StoreError> for ShakedexError {
-    fn from(_: StoreError) -> Self {
-        Self::Persistence
+    fn from(error: StoreError) -> Self {
+        if matches!(error, StoreError::StaleRevision { .. }) {
+            Self::StaleRevision
+        } else {
+            Self::Persistence
+        }
     }
 }
 

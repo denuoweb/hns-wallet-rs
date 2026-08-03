@@ -17,11 +17,11 @@ hostile website
 ```
 
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
-proofs, and signed fixed-price listings remain in `hns-rs`. This workspace
-currently consumes all six
-direct protocol crates from reviewed immutable revision `4b989aa`; its exact
-source and lock coherence are checked before the workspace gate. Denuo wire
-objects remain outside the wallet until their orchestration tranche. Node
+proofs, signed fixed-price listings/cancellations, and Denuo name-market
+envelopes remain in `hns-rs`. This workspace consumes the required protocol
+crates from reviewed immutable revision `4b989aa`; its exact source and lock
+coherence are checked before the workspace gate. The wallet owns only the
+protocol-verification boundary and encrypted replay/tombstone board state. Node
 indexes and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
 remains in `hns-dane-engine`. Browser JavaScript and platform UI remain in the
 browser repositories. This workspace owns keys, encrypted local state, wallet
@@ -36,7 +36,7 @@ semantics, approvals, and recoverable application workflows.
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | HNS key roles, address/coin/name evidence and workflows | canonical encodings |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
-| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state and release-gated canonical listing inspection | proof/listing codecs |
+| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact listing/cancellation protocol verification, canonical Denuo adapter, encrypted sequence/tombstone board | proof/listing/Denuo codecs or caller-asserted chain truth |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |

@@ -8,11 +8,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hns-marketplace-protocol.workspace = true
 hns-swap.workspace = true
+hns-transaction.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+hns-covenants.workspace = true
+hns-primitives.workspace = true
+k256.workspace = true
 
 [lints]
 workspace = true
