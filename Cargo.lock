@@ -942,6 +942,8 @@ dependencies = [
  "hns-wallet-types",
  "k256",
  "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
 ]
 

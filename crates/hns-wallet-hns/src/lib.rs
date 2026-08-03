@@ -3,6 +3,7 @@
 
 mod name_workflow;
 mod node_rpc;
+mod shakedex_funding;
 mod shakedex_key;
 
 pub use name_workflow::{
@@ -12,6 +13,15 @@ pub use name_workflow::{
     VerifiedCurrentShakedexTransfer, VerifiedOutgoingNameTransfer,
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
+pub use shakedex_funding::{
+    HnsShakedexFundingApprovalExpectation, HnsShakedexFundingAuthorization,
+    HnsShakedexFundingPurpose, HnsShakedexFundingReservation, HnsShakedexFundingReservationBatch,
+    HnsShakedexFundingReservationState, HnsShakedexFundingScope, HnsShakedexTransactionObservation,
+    activate_hns_shakedex_funding_reservations, create_hns_shakedex_funding_reservations,
+    delete_hns_shakedex_funding_reservations, retain_active_hns_shakedex_funding_reservations,
+    validate_hns_shakedex_final_fee_quote_evidence, validate_hns_shakedex_funding_reservations,
+    validate_persisted_hns_shakedex_fee_quote_evidence,
+};
 pub use shakedex_key::{
     HnsShakedexKeyAllocation, HnsShakedexKeyAllocationError, HnsShakedexKeyAllocationRequest,
     HnsShakedexSellerTerms, HnsShakedexSigner,
@@ -20,7 +30,7 @@ pub use shakedex_key::{
 use name_workflow::{HnsInputReservationKind, HnsNameWorkflow};
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,6 +111,10 @@ pub const DEFAULT_FEE_TARGET_BLOCKS: u16 = 6;
 /// qualification. Exact node quotes remain evidence only until that gate is
 /// independently enabled.
 pub const HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED: bool = false;
+/// Protected Shakedex source/funding reservation and suffix signing remain
+/// independently unavailable until their canonical wallet adapter and
+/// end-to-end recovery path pass release qualification.
+pub const HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED: bool = false;
 /// Release gate: value operations stay unavailable until the concrete node
 /// adapter and the complete runtime qualification suite pass together.
 pub const HNS_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
@@ -1495,7 +1509,7 @@ struct HnsSendApproval {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct HnsInputReservation {
+pub struct HnsInputReservation {
     wallet_id: WalletId,
     account_id: AccountId,
     outpoint: HnsOutpoint,
@@ -3661,6 +3675,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 });
                 continue;
             }
+            // Shakedex value workflows own these reservations explicitly.
+            // Generic expiry, UTXO disappearance, and settlement cleanup must
+            // never release either their script-controlled source or their
+            // ordinary fee/payment suffix after a restart or reorg.
+            if stored.value.kind.is_protected_shakedex() {
+                continue;
+            }
             let expired = stored
                 .value
                 .expires_at_unix
@@ -4864,6 +4885,7 @@ fn available_unreserved_coins(
             .value
             .expires_at_unix
             .is_some_and(|expiry| expiry <= now_unix)
+            && !stored.value.kind.is_protected_shakedex()
         {
             expired.push(EntityBatchDelete {
                 id: stored.id,
@@ -4965,6 +4987,9 @@ fn reservation_activation_saves(
         if stored.value.workflow_id != workflow_id {
             continue;
         }
+        if stored.value.kind.is_protected_shakedex() {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
         let mut reservation = stored.value;
         reservation.expires_at_unix = None;
         saves.push(EntityBatchSave {
@@ -4986,6 +5011,9 @@ fn reservation_deletes(
     let mut deletes = Vec::new();
     for stored in reservations {
         if stored.value.workflow_id == workflow_id {
+            if stored.value.kind.is_protected_shakedex() {
+                return Err(HnsWalletError::InvalidWorkflow);
+            }
             deletes.push(EntityBatchDelete {
                 id: stored.id,
                 expected_revision: stored.revision,
@@ -6215,6 +6243,30 @@ fn validate_final_fee_quote(
     expected_fee: BaseUnits,
     maximum_fee: BaseUnits,
 ) -> Result<(), HnsWalletError> {
+    validate_final_fee_quote_evidence(
+        raw,
+        input_coins,
+        quote,
+        binding,
+        mempool,
+        expected_fee,
+        maximum_fee,
+    )?;
+    if !HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED {
+        return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+    }
+    Ok(())
+}
+
+fn validate_final_fee_quote_evidence(
+    raw: &[u8],
+    input_coins: &[Coin],
+    quote: &HnsTransactionFeeQuote,
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+    expected_fee: BaseUnits,
+    maximum_fee: BaseUnits,
+) -> Result<(), HnsWalletError> {
     let transaction =
         Transaction::decode(raw).map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
     if transaction
@@ -6246,9 +6298,6 @@ fn validate_final_fee_quote(
         HnsFeeRateSource::MinimumRelay if quote.rate_sample_count == 0 => {}
         HnsFeeRateSource::Mempool if quote.rate_sample_count > 0 => {}
         _ => return Err(HnsWalletError::InvalidFeeQuote),
-    }
-    if !HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED {
-        return Err(HnsWalletError::RuntimeIntegrationUnavailable);
     }
     Ok(())
 }
@@ -6431,16 +6480,29 @@ fn sign_payment_plan(
     sign_ordered_p2pkh_inputs(store, account, transaction, &plan.inputs, &expected_roles)
 }
 
-pub(crate) fn sign_ordered_p2pkh_inputs(
+fn sign_ordered_p2pkh_inputs(
     store: &WalletStore,
     account: &HnsAccountRecord,
-    mut transaction: Transaction,
+    transaction: Transaction,
     inputs: &[TrackedHnsCoin],
     expected_roles: &[KeyRole],
 ) -> Result<Vec<u8>, HnsWalletError> {
-    if transaction.inputs.is_empty()
-        || transaction.inputs.len() != inputs.len()
+    sign_ordered_p2pkh_inputs_from(store, account, transaction, 0, inputs, expected_roles)
+}
+
+fn sign_ordered_p2pkh_inputs_from(
+    store: &WalletStore,
+    account: &HnsAccountRecord,
+    mut transaction: Transaction,
+    input_offset: usize,
+    inputs: &[TrackedHnsCoin],
+    expected_roles: &[KeyRole],
+) -> Result<Vec<u8>, HnsWalletError> {
+    if inputs.is_empty()
+        || input_offset >= transaction.inputs.len()
+        || transaction.inputs.len() - input_offset != inputs.len()
         || inputs.len() != expected_roles.len()
+        || transaction.inputs.len() > MAX_TRANSACTION_INPUTS
         || inputs.len() > MAX_TRANSACTION_INPUTS
     {
         return Err(HnsWalletError::InvalidPreparedArtifact);
@@ -6451,7 +6513,10 @@ pub(crate) fn sign_ordered_p2pkh_inputs(
             SecretKind::RecoverySeed,
         )?
         .ok_or(HnsWalletError::MissingSeed)?;
-    for (index, (coin, expected_role)) in inputs.iter().zip(expected_roles).enumerate() {
+    for (offset, (coin, expected_role)) in inputs.iter().zip(expected_roles).enumerate() {
+        let index = input_offset
+            .checked_add(offset)
+            .ok_or(HnsWalletError::Arithmetic)?;
         let expected_tag = match *expected_role {
             KeyRole::HnsCoin => HNS_COIN_DERIVATION_TAG,
             KeyRole::HnsName => HNS_NAME_DERIVATION_TAG,

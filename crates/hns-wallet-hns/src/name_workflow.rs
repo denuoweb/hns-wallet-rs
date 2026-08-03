@@ -511,12 +511,31 @@ pub(super) struct HnsNameApproval {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(super) enum HnsInputReservationKind {
     Ordinary,
-    Name { name_hash: [u8; 32] },
+    Name {
+        name_hash: [u8; 32],
+    },
+    ShakedexSource {
+        name_hash: [u8; 32],
+        purpose: HnsShakedexFundingPurpose,
+    },
+    ShakedexFunding {
+        name_hash: [u8; 32],
+        purpose: HnsShakedexFundingPurpose,
+    },
 }
 
 impl Default for HnsInputReservationKind {
     fn default() -> Self {
         Self::Ordinary
+    }
+}
+
+impl HnsInputReservationKind {
+    pub(super) const fn is_protected_shakedex(self) -> bool {
+        matches!(
+            self,
+            Self::ShakedexSource { .. } | Self::ShakedexFunding { .. }
+        )
     }
 }
 

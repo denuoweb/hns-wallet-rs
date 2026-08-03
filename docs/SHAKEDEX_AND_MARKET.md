@@ -4,8 +4,10 @@
 
 The crate preserves the encrypted compare-and-swap seller, buyer, and recovery
 schemas and their historical transition ordering for persisted-state
-compatibility. It does not yet expose an executable value workflow. The wallet
-dependency boundary consumes the canonical V2 `hns-swap` and
+compatibility. A separate encrypted aggregate child workflow now coordinates
+post-lock buyer fulfillment and seller recovery, but every authorization and
+submission entrypoint remains release-gated. The wallet dependency boundary
+consumes the canonical V2 `hns-swap` and
 `hns-marketplace-protocol` source from the same immutable revision `4b989aa`.
 It does not reproduce listing hashes, signatures, Shakedex scripts, presigns,
 cancellations, or Denuo envelopes.
@@ -75,13 +77,57 @@ recomputes payment, price, lock-time, and fee terms and rejects substitution;
 proof and listing signing also require the current-lock authority directly.
 
 Signed fulfillment and recovery results can be retained as encrypted buyer or
-seller workflow plan state under the compare-and-swap journal. A persisted plan
-binds its canonical terms and transaction bytes so a restart can reject a
+seller structural-plan state under the compare-and-swap journal. A persisted
+plan binds its canonical terms and transaction bytes so a restart can reject a
 changed or stale plan instead of silently rebuilding different bytes.
-Script-controlled FINALIZE remains memory-only. Persisting or revalidating a
-plan is not chain authorization: current lock/TRANSFER authority must be
-reacquired after restart and again before irreversible use, while the funding
-suffix remains caller input until the wallet selects and reserves it.
+Script-controlled FINALIZE remains memory-only.
+
+The new `ShakedexValue` aggregate is a distinct child of one canonical buyer or
+seller plan. Its deterministic ID binds the parent and action. One encrypted
+CAS record retains the complete structural plan and commitment, exact lock
+source and ordered funding coins, recipient, value, fee and fee maximum,
+confirmation policy, expiry, prepared bytes, signed bytes, final fee quote,
+submission fence, and chain observations. Loading the row re-decodes and
+revalidates those relationships; persisted fee-quote bindings remain
+authenticated historical evidence and do not claim that a snapshot is still
+current.
+
+Preparation atomically saves that child with protected `ShakedexSource` and
+`ShakedexFunding` reservations. The source reservation ID is store-global and
+derived from the exact lock outpoint rather than a wallet/account namespace,
+preventing the same script-controlled coin from being reserved by another
+workflow or wallet view in the same `WalletStore`. Funding rows bind the exact
+ordered, currently tracked ordinary HNS coins. Generic HNS cleanup and ordinary
+activation/deletion paths reject
+both protected kinds. Runtime time limits a prepared aggregate and its rows to
+the wallet's existing five-minute prepared-artifact window. A prepared
+cancellation or explicit expiry deletes the complete set in the same CAS;
+product startup integration must invoke that expiry path. Every signed state
+retains the source and funding rows, including confirmation and conflict, until
+an evidence-backed terminal release policy is implemented.
+
+The approval commitment contains the exact prepared aggregate and its current
+revision. Runtime-owned time governs preparation, approval expiry,
+authorization, and submission timestamps. Authorization reacquires the same
+current/unspent lock and exact chain/mempool binding, checks the protected
+reservations and current cached funding coins, preserves input zero and its
+script witness byte-for-byte, and signs only the ordinary P2PKH suffix. The
+unchanged approval is consumed only in the transaction that persists those
+signed bytes and their exact final-byte fee quote while activating all
+reservations. Restart validation recomputes canonical structure, funding
+witnesses, input/output fee algebra, fee maximum, and the persisted quote.
+
+Submission reacquires current lock authority and re-quotes only the persisted
+signed bytes. Before the node call, one workflow/entity CAS records
+`RequiresRebroadcast`, advances the monotonic attempt count, saves the refreshed
+quote, and reauthenticates every active protected reservation. The node must
+return the expected transaction ID. Reconciliation obtains transaction and
+all-input spender evidence from one runtime-owned chain snapshot and derives
+`Mempool`, `Confirming`, `Confirmed`, `Conflicted`, or
+`RequiresRebroadcast`; a disappeared confirmation rolls back to the same-byte
+rebroadcast path. Reconciliation also recovers an `Authorized` row when its
+persisted bytes were broadcast outside the recorded submit path. There is no
+submission polling loop and no caller-authored clock or chain status input.
 
 The encrypted `DenuoBoardObject` namespace now has a versioned, bounded board
 reducer and CAS load/save boundary. It persists canonical listing and
@@ -105,20 +151,28 @@ Three compile-time gates are immutable and `false`:
 `SellerSession::apply`, `BuyerSession::discover`, and `BuyerSession::apply`
 check these gates before validation or mutation. Existing sessions restored
 from legacy persisted records therefore cannot bypass the boundary.
+Aggregate authorization and submission also require
+`HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`,
+`HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` and
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED`; all three remain `false`.
 The Denuo gate governs live transport, relay publication, and product
 discovery. Offline canonical envelope parsing and encrypted cache reduction do
 not enable those runtime paths or advertise the feature. Typed transaction
-planning and encrypted plan CAS likewise do not enable a value workflow.
+planning, encrypted plan CAS, and the durable aggregate do not bypass any
+release gate.
 
 The wallet now has coherent canonical V2 source plus exact NameState/resource/
 owner-output validation. Wallet-owned P2PKH TRANSFER/direct FINALIZE remains a
 separate authority and is not reused by Shakedex. Canonical planning, protected
 seller-key allocation, purpose-bound signing, current/unspent lock acquisition,
-active-chain NameState/renewal evidence, and parent-MTP authority are present.
-Ordinary-coin selection and reservation, exact fee approval, irreversible
-persistence, broadcast/reorg supervision, live Denuo transport, trusted browser
-approval, and restart/reorg/regtest qualification are still required before
-any gate can change. Reverse Dutch is deferred.
+active-chain NameState/renewal evidence, parent-MTP authority, exact protected
+reservations, final-byte approval and fee evidence, persist-before-broadcast,
+and chain-state reconciliation are present in source for buyer fulfillment and
+seller recovery. The fixed release gates remain `false`. Product-owned coin
+selection, durable script-controlled FINALIZE, evidence-backed release of
+reservations from signed workflows, live Denuo/provider/trusted-UI integration,
+and complete regtest/restart/reorg/product qualification are still required
+before any gate can change. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 

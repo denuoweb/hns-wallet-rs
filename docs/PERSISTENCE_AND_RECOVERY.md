@@ -77,19 +77,71 @@ admission policy remain required for a live relay. The cache does not persist
 an action capability; current locking-coin/network/time authority must be
 reacquired before a listing can drive value behavior.
 
-Dormant Shakedex transaction plans use the encrypted seller or buyer workflow
+Dormant Shakedex structural plans use the encrypted seller or buyer workflow
 journal and its exact expected revision. Fulfillment plans retain the canonical
-seller-controlled prefix and caller-supplied buyer suffix; recovery plans bind
-the exact lock descriptor and explicit recovery recipient. Script-controlled
-FINALIZE construction is typed but remains memory-only until a durable plan is
-added. Exact retries may revalidate the same persisted plan, while a stale
-revision or changed canonical plan fails instead of replacing previously
-prepared bytes. This CAS state is crash-recovery and audit data only. On every
-resume, the product must reacquire the HNS runtime's non-serializable current/
-unspent lock or TRANSFER authority, active-chain NameState and renewal evidence,
-authoritative parent MTP, wallet funding and reservations, signing approval,
-fee evidence, and broadcast/reorg state. Persisted Coin, MTP, or NameState
-bytes never restore those authorities.
+seller-controlled prefix and ordered buyer suffix; recovery plans bind the
+exact lock descriptor and explicit recovery recipient. Exact retries may
+revalidate the same persisted plan, while a stale revision or changed canonical
+plan fails instead of replacing previously prepared bytes.
+
+Post-lock buyer fulfillment and seller recovery now have a separate encrypted
+`ShakedexValue` child workflow. Its deterministic ID binds the parent workflow
+and action. One row retains the full canonical structural plan and commitment,
+exact source and ordered funding-coin evidence, recipient, value, fee and fee
+maximum, finality threshold, expiry, prepared bytes, approval identity, signed
+bytes, exact final-byte quote, monotonic attempt count/latest submission
+timestamps, and runtime-derived chain observations. Deserialization revalidates
+the structural transaction,
+signed suffix, fee algebra, quote, identity, and state invariants before the row
+can be resumed.
+
+The initial workflow CAS also writes one protected source reservation and every
+protected funding reservation. The source row uses a store-global record ID
+derived only from the exact lock outpoint, so a second wallet/account namespace
+in the same `WalletStore` cannot reserve the same script-controlled coin.
+Funding rows bind the workflow to the exact ordered ordinary HNS coins
+recovered from the runtime cache. Missing,
+extra, retyped, mixed-state, cross-account, or stale-revision rows fail closed.
+Generic reservation cleanup cannot delete these protected kinds. Prepared
+cancellation or explicit expiry atomically deletes the complete set;
+runtime-owned time caps that prepared lifetime at five minutes, and product
+startup must invoke the explicit expiry path. Authorization atomically changes
+the complete set from expiring prepared rows to active rows.
+Active rows remain attached through rebroadcast, mempool, confirmation,
+confirmation rollback, and conflict. Durable evidence-backed release for a
+signed terminal workflow is not implemented yet.
+
+The approval request is a domain-separated encoding of the complete prepared
+aggregate and its exact workflow revision. Runtime-owned time determines its
+creation and expiry. The HNS runtime authenticates the unchanged approval,
+reacquires the exact current/unspent lock and chain/mempool snapshot, matches
+each canonical funding coin to one current tracked ordinary coin, preserves the
+script-authorized first input byte-for-byte, and signs only suffix inputs
+`1..`. After exact signed-byte fee quoting succeeds, one immediate SQLite
+transaction consumes that same approval, saves the signed aggregate and quote,
+and activates all reservations. A stale workflow or reservation revision,
+changed/expired approval, stale runtime snapshot, signing failure, or quote
+failure leaves the approval and prepared state unconsumed.
+
+Before submission, the runtime reacquires current lock authority, re-quotes
+only the persisted signed bytes, and atomically records the refreshed quote,
+`RequiresRebroadcast`, attempt timestamp/count, and no-op CAS rewrites of every
+active reservation. Only then may it call broadcast, and the returned
+transaction ID must equal the persisted one. An ambiguous exit therefore
+resumes from the same signed bytes. Reconciliation obtains the exact
+transaction and all-input spender evidence under one runtime-owned
+chain/mempool snapshot; it derives mempool, confirming, confirmed, conflicted,
+or rebroadcast state and rolls a disappeared confirmation back to
+`RequiresRebroadcast`. It can also recover directly from `Authorized` when the
+persisted bytes reached the node outside the recorded submit path. It never
+restores ephemeral current-lock authority or treats persisted snapshot bindings
+as current authority.
+
+Script-controlled FINALIZE construction remains typed but memory-only until a
+durable child workflow is added. All Shakedex value authorization and
+submission entrypoints remain unreachable while the fixed Shakedex and HNS
+Shakedex-funding/value/fee release gates are `false`; live Denuo/provider/UI
+integration and restart/reorg/regtest qualification are also pending.
 
 HNS authorization can authenticate and return a pending approval without
 consuming it. After exact signed-byte fee quoting succeeds, a bounded immediate
@@ -207,8 +259,9 @@ The product runtime must:
 9. expire price rounds, intents, fill grants, persisted workflow approvals, and replay rows only
    after their authenticated metadata verifies;
 10. restore swap sessions and independently verify every recorded funding,
-   redemption, refund, and Shakedex plan against newly acquired chain
-   authority;
+   redemption, refund, Shakedex structural plan, and Shakedex value child
+   workflow against newly acquired chain authority and its exact protected
+   reservation set;
 11. extract an on-chain preimage only from the exact verified spend/event;
 12. determine refund eligibility from validated local chain time; and
 13. surface user actions without automatically moving value.
@@ -220,7 +273,8 @@ HSD-compatible tip median time, and process-instance/generation pair remain
 exact across all three scans, gap expansion, and all point
 reads in one reconciliation;
 they are intentionally reacquired after process restart rather than persisted
-as timeless authority. Exact final-signed fee quotes are wired and persisted;
+as timeless authority. Exact final-signed fee quotes are wired and persisted
+for HNS value and the release-gated Shakedex aggregate;
 canonical fee-policy integration is implemented in source, but its explicit
 qualification gate remains false. The complete multi-chain product supervisor
 and current qualification evidence are not integrated, so HNS value operations

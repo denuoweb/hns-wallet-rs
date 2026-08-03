@@ -5,6 +5,7 @@ mod board;
 mod canonical;
 mod plans;
 mod transactions;
+mod value_workflow;
 
 pub use board::{
     BoardOfferStatus, NameMarketBoard, PersistedBoardOffer, StoredNameMarketBoard,
@@ -31,6 +32,16 @@ pub use transactions::{
     prepare_current_script_finalize, prepare_current_seller_recovery, prepare_script_finalize,
     prepare_seller_recovery, verify_signed_buyer_fulfillment, verify_signed_script_finalize,
     verify_signed_seller_recovery,
+};
+pub use value_workflow::{
+    MAX_SHAKEDEX_VALUE_WORKFLOWS, ShakedexChainObservation, ShakedexValueAction,
+    ShakedexValueStage, ShakedexValueWorkflow, StoredShakedexValueWorkflow,
+    authorize_shakedex_value_workflow, cancel_prepared_shakedex_value_workflow,
+    expire_prepared_shakedex_value_workflow, list_shakedex_value_workflows,
+    load_shakedex_value_workflow, rebroadcast_shakedex_value_workflow,
+    reconcile_shakedex_value_workflow, register_shakedex_value_approval,
+    save_prepared_shakedex_value_workflow, shakedex_value_workflow_id,
+    submit_shakedex_value_workflow, validate_shakedex_value_workflow_reservations,
 };
 
 use hns_swap::{FixedPriceListing, MAX_FIXED_PRICE_LISTING_SIZE};
@@ -577,10 +588,18 @@ pub enum ShakedexError {
     InvalidEvidence,
     #[error("persisted state invariant failed")]
     Invariant,
+    #[error("persisted workflow encoding failed")]
+    Encoding,
+    #[error("an exact unexpired value approval is required")]
+    ApprovalRequired,
+    #[error("exact Handshake fee evidence is invalid")]
+    InvalidFeeEvidence,
     #[error("persisted workflow revision is stale")]
     StaleRevision,
     #[error("wallet persistence failed")]
     Persistence,
+    #[error("Handshake value-runtime evidence or authority failed")]
+    HnsIntegration,
 }
 
 impl From<StoreError> for ShakedexError {
@@ -589,6 +608,29 @@ impl From<StoreError> for ShakedexError {
             Self::StaleRevision
         } else {
             Self::Persistence
+        }
+    }
+}
+
+impl From<hns_wallet_hns::HnsWalletError> for ShakedexError {
+    fn from(error: hns_wallet_hns::HnsWalletError) -> Self {
+        use hns_wallet_hns::HnsWalletError;
+
+        match error {
+            HnsWalletError::ApprovalRequired => Self::ApprovalRequired,
+            HnsWalletError::FeeQuoteInputUnavailable
+            | HnsWalletError::InvalidFeeQuoteTransaction
+            | HnsWalletError::InvalidFeeQuote
+            | HnsWalletError::FeeLimit => Self::InvalidFeeEvidence,
+            HnsWalletError::StaleNodeSnapshot
+            | HnsWalletError::InvalidEvidence
+            | HnsWalletError::InvalidPreparedArtifact
+            | HnsWalletError::InvalidWorkflow => Self::InvalidEvidence,
+            HnsWalletError::Store => Self::Persistence,
+            HnsWalletError::RuntimeIntegrationUnavailable | HnsWalletError::MainnetDisabled => {
+                Self::ValueRuntimeUnavailable
+            }
+            _ => Self::HnsIntegration,
         }
     }
 }

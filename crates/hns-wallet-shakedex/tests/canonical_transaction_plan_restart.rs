@@ -15,16 +15,24 @@ use hns_swap::{
     FixedPriceListing, NetworkBinding, SHAKEDEX_RECOVERY_SIGHASH, SwapProof, lock_script_hash,
 };
 use hns_transaction::{Address, Coin, Input, Outpoint, Output, Transaction, Witness};
+use hns_wallet_hns::{
+    HnsOutpoint, HnsShakedexFundingPurpose, HnsShakedexFundingReservation, TrackedHnsCoin,
+    WalletCoin,
+};
 use hns_wallet_shakedex::{
     BuyerLockPlan, BuyerLockPlanState, SellerLockPlan, SellerLockPlanState, ShakedexError,
-    SuppliedShakedexLock, VerifiedShakedexTransfer, list_buyer_lock_plans, list_seller_lock_plans,
-    load_buyer_lock_plan, load_seller_lock_plan, prepare_buyer_fulfillment,
-    prepare_script_finalize, prepare_seller_recovery, save_buyer_lock_plan, save_seller_lock_plan,
-    verify_fixed_price_listing, verify_signed_buyer_fulfillment, verify_signed_script_finalize,
-    verify_signed_seller_recovery,
+    ShakedexValueAction, ShakedexValueStage, ShakedexValueWorkflow, SuppliedShakedexLock,
+    VerifiedShakedexTransfer, list_buyer_lock_plans, list_seller_lock_plans, load_buyer_lock_plan,
+    load_seller_lock_plan, prepare_buyer_fulfillment, prepare_script_finalize,
+    prepare_seller_recovery, save_buyer_lock_plan, save_seller_lock_plan,
+    shakedex_value_workflow_id, verify_fixed_price_listing, verify_signed_buyer_fulfillment,
+    verify_signed_script_finalize, verify_signed_seller_recovery,
 };
 use hns_wallet_store::WalletStore;
-use hns_wallet_types::{AccountId, ObjectHash, WalletId, WorkflowId};
+use hns_wallet_types::{
+    AccountId, BaseUnits, DerivationReference, KeyRole, ObjectHash, TransactionHash, WalletId,
+    WorkflowId,
+};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::ecdsa::{Signature, SigningKey};
 
@@ -202,7 +210,7 @@ fn test_store() -> (TestWalletDirectory, PathBuf, WalletStore) {
 }
 
 #[test]
-fn canonical_shakedex_transaction_plan_restart_cas() {
+fn hns_shakedex_transaction_plan_restart_cas() {
     let (listing, locking_coin, seller_key) = listing_fixture();
     let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
     let listing_bytes = listing.encode().expect("listing bytes");
@@ -463,6 +471,72 @@ fn canonical_shakedex_transaction_plan_restart_cas() {
         &locking_coin,
     )
     .expect("buyer offer plan");
+    let value_workflow_id =
+        shakedex_value_workflow_id(buyer_workflow, ShakedexValueAction::BuyerFulfillment);
+    let tracked_buyer_coin = TrackedHnsCoin {
+        coin: WalletCoin {
+            outpoint: HnsOutpoint {
+                transaction: TransactionHash::new(
+                    buyer_coin.outpoint.transaction_hash.into_bytes(),
+                ),
+                output_index: buyer_coin.outpoint.index,
+            },
+            value: BaseUnits::new(u128::from(buyer_coin.value.get())),
+            confirmation_count: 10,
+            confirmed_height: Some(buyer_coin.height.get()),
+            coinbase: buyer_coin.coinbase,
+            covenant: buyer_coin.covenant.encode().expect("buyer covenant"),
+            name_locked: false,
+        },
+        derivation: DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: 7,
+            change: 0,
+            index: 1,
+        },
+        address_program: buyer_coin.address.hash.clone(),
+    };
+    let funding_reservation: HnsShakedexFundingReservation =
+        serde_json::from_value(serde_json::json!({
+            "wallet_id": wallet_id,
+            "account_id": account_id,
+            "workflow_id": value_workflow_id,
+            "purpose": HnsShakedexFundingPurpose::BuyerFulfillment,
+            "name_hash": hash_name(b"market-name").expect("name hash").into_bytes(),
+            "source_outpoint": HnsOutpoint {
+                transaction: TransactionHash::new(
+                    locking_coin.outpoint.transaction_hash.into_bytes(),
+                ),
+                output_index: locking_coin.outpoint.index,
+            },
+            "funding_inputs": [tracked_buyer_coin],
+            "expires_at_unix": verified_listing.expires_at_unix(),
+        }))
+        .expect("persisted funding reservation evidence");
+    let value_workflow = ShakedexValueWorkflow::prepared_buyer_fulfillment(
+        buyer_offer.clone(),
+        &prepared_fulfillment,
+        funding_reservation,
+        BaseUnits::new(2_000),
+        2,
+        verified_listing.expires_at_unix(),
+    )
+    .expect("aggregate buyer fulfillment workflow");
+    assert_eq!(value_workflow.workflow_id(), value_workflow_id);
+    assert_ne!(value_workflow.workflow_id(), buyer_workflow);
+    assert_eq!(value_workflow.parent_workflow_id(), buyer_workflow);
+    assert_eq!(value_workflow.stage(), ShakedexValueStage::Prepared);
+    assert_eq!(
+        value_workflow.recipient().expect("recipient"),
+        buyer_recipient
+    );
+    let restarted_value: ShakedexValueWorkflow =
+        serde_json::from_slice(&serde_json::to_vec(&value_workflow).expect("aggregate encoding"))
+            .expect("aggregate restart decode");
+    restarted_value
+        .validate()
+        .expect("aggregate restart validation");
+    assert_eq!(restarted_value, value_workflow);
     let buyer_fulfillment = buyer_offer
         .with_fulfillment(&verified_fulfillment, &[buyer_coin.clone()])
         .expect("buyer fulfillment plan");

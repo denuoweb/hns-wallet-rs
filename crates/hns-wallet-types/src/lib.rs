@@ -582,6 +582,7 @@ pub enum WorkflowKind {
     ShakedexBuyer,
     ShakedexSellerPlan,
     ShakedexBuyerPlan,
+    ShakedexValue,
     MarketIntent,
     FillReservation,
     AtomicSwap,

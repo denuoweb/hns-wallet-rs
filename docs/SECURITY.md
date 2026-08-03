@@ -127,6 +127,17 @@ recipient. Direct FINALIZE takes its destination only from that authenticated
 TRANSFER covenant and is signed by the outgoing owner's `HnsName` key;
 incoming-recipient classification never authorizes signing.
 
+Shakedex buyer fulfillment and seller recovery approvals bind the complete
+prepared aggregate and its current CAS revision: canonical parent plan, exact
+lock source, ordered funding coins, recipient, value, exact fee and maximum,
+confirmation policy, expiry, and prepared bytes. The runtime owns the clock,
+reacquires current lock authority, and signs only ordinary suffix inputs while
+preserving the script-authorized first input. It consumes the unchanged
+approval only in the transaction that persists the verified signed bytes and
+their exact final-byte fee quote and activates every protected reservation.
+All related Shakedex and HNS Shakedex-funding/value/fee release gates remain
+`false`, so this source boundary cannot currently authorize value.
+
 ## Provider defenses
 
 The provider core enforces secure exact origins (with loopback HTTP allowed for
@@ -211,37 +222,59 @@ ordered eligibility reasons, lockup, renewal window/hash, and absence of an
 owner spender. Persisted action context is audit/recovery evidence only.
 
 Shakedex fulfillment, explicit-recipient recovery, and script-controlled
-FINALIZE adapters enforce canonical transaction shape. Encrypted workflow CAS
-persists signed fulfillment and recovery plans; script-controlled FINALIZE
-remains memory-only. Persisted plan CAS prevents a restart or stale writer from
-silently substituting different planned bytes; it does not make the plan safe
-to submit. Seller keys are allocated through a deletion-protected encrypted
-namespace with an account-global CAS high-water, immutable workflow/name/terms
-binding, seed commitment, and no persisted scalar. The recovered signer is
-non-cloneable, non-serializable, redacted, and has no arbitrary-digest method.
-The allocation transaction advances WalletAccount and protected high-water
-together, while a durable scan-required/scanning gate prevents a second
-writer to the same wallet database from allocating before mnemonic restoration
-commits. The signer
-recomputes the canonical payment, price, deadline, and fee commitment from
-every proof before signing, and proof/listing signing accepts the current-lock
-capability instead of a caller-supplied Coin. A protected recovery signature
-additionally requires a current-lock preparation and the exact current-lock
-capability at the authorization call; freshness before irreversible use remains
-the enclosing runtime's responsibility.
-Ordinary funding inputs require exact P2PKH witness layout and
-`SIGHASH_ALL`; output suffixes must remain bounded ordinary P2PKH outputs.
+FINALIZE adapters enforce canonical transaction shape. Encrypted parent-plan
+CAS prevents a restart or stale writer from silently substituting different
+structural bytes. Seller keys are allocated through a deletion-protected
+encrypted namespace with an account-global CAS high-water, immutable workflow/
+name/terms binding, seed commitment, and no persisted scalar. The recovered
+signer is non-cloneable, non-serializable, redacted, and has no arbitrary-
+digest method. The allocation transaction advances WalletAccount and protected
+high-water together, while a durable scan-required/scanning gate prevents a
+second writer to the same wallet database from allocating before mnemonic
+restoration commits. The signer recomputes the canonical payment, price,
+deadline, and fee commitment from every proof before signing, and proof/listing
+signing accepts current-lock authority rather than a caller-supplied Coin.
+
+The buyer-fulfillment and seller-recovery value child persists one inseparable
+funds-safety record: its structural commitment, exact source/funding coins and
+reservation binding, prepared/signed bytes, approval, quote, submission fence,
+and chain observation. Its `ShakedexSource` reservation is keyed store-globally
+by the lock outpoint, so another wallet/account view in the same `WalletStore`
+cannot reserve the same script-controlled input; account funding rows bind the
+exact ordered ordinary coins. Generic cleanup cannot release either protected
+kind. Prepared expiry
+is capped by runtime time to the five-minute prepared-artifact window, and
+explicit expiry or cancellation releases the complete set atomically. Product
+startup expiry integration remains required. Every signed state—including
+confirmed and conflicted—retains the rows. Evidence-backed terminal release for
+signed workflows is deliberately pending, preventing a reversible confirmation
+from silently freeing inputs.
+
+The HNS runtime requires an exact current account/cache match and current lock
+with confirmed and mempool unspentness. Prepared funding witnesses must be
+empty; authorization preserves input zero byte-for-byte, signs inputs `1..`
+with exact P2PKH `SIGHASH_ALL` witnesses, and revalidates the canonical signed
+transaction. Persisted quote validation recomputes ordered input/output fee
+algebra after restart but does not treat the quote's old snapshot as current.
+Submission reacquires current lock authority, re-quotes the persisted bytes,
+and durably records `RequiresRebroadcast` with the active reservation CAS
+before the node call. Runtime-owned same-snapshot transaction and all-input
+spender evidence drives mempool/confirmation/conflict transitions; a reorg can
+move a formerly confirmed transaction back to same-byte rebroadcast. Caller-
+supplied clocks, status flags, and replacement bytes do not drive these
+transitions.
+
 Script-controlled FINALIZE additionally binds its TRANSFER coin to output zero
-of a fully verified fulfillment or recovery parent that spends the exact lock.
-The HNS current-lock and current-TRANSFER authorities replace supplied Coin,
-parent MTP, NameState, and renewal facts with one fresh chain/mempool-bound
-capability and require both confirmed and mempool unspentness. Current
-TRANSFER authority also requires its preserved owner program to equal the
-descriptor seller-key script hash. Wall time and
-funding inputs/outputs remain untrusted structural inputs until the enclosing
-workflow validates them. Wallet coin selection, reservations, funding signing,
-fee approval, broadcast ordering, conflict/reorg supervision, and live Denuo
-transport remain unavailable, and no Shakedex release gate is enabled.
+of a fully verified fulfillment or recovery parent that spends the exact lock,
+but its durable value child has not been implemented. Product coin selection,
+live Denuo/provider/trusted-UI integration, evidence-backed signed-workflow
+reservation release, and complete restart/reorg/regtest qualification remain
+pending. `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
+`SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`,
+`SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`,
+`HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`,
+`HNS_VALUE_RUNTIME_RELEASE_QUALIFIED`, and
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remain `false`.
 
 Ethereum has no embedded Helios proof producer in this revision. Its exact
 synchronization, value-runtime, settlement-runtime, and mainnet gates are

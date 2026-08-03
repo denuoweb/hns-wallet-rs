@@ -42,13 +42,13 @@ impl NetworkEvidence {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AddressEvidence {
+pub(crate) struct AddressEvidence {
     version: u8,
     hash: Vec<u8>,
 }
 
 impl AddressEvidence {
-    fn from_address(address: &Address) -> Result<Self, ShakedexError> {
+    pub(crate) fn from_address(address: &Address) -> Result<Self, ShakedexError> {
         address
             .validate()
             .map_err(|_| ShakedexError::InvalidEvidence)?;
@@ -58,14 +58,14 @@ impl AddressEvidence {
         })
     }
 
-    fn to_address(&self) -> Result<Address, ShakedexError> {
+    pub(crate) fn to_address(&self) -> Result<Address, ShakedexError> {
         Address::new(self.version, self.hash.clone()).map_err(|_| ShakedexError::InvalidEvidence)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CoinEvidence {
+pub(crate) struct CoinEvidence {
     transaction: TransactionHash,
     output_index: u32,
     value_base_units: u64,
@@ -76,7 +76,7 @@ struct CoinEvidence {
 }
 
 impl CoinEvidence {
-    fn from_coin(coin: &Coin) -> Result<Self, ShakedexError> {
+    pub(crate) fn from_coin(coin: &Coin) -> Result<Self, ShakedexError> {
         if coin.outpoint.is_null() || coin.value.get() == 0 {
             return Err(ShakedexError::InvalidEvidence);
         }
@@ -95,7 +95,7 @@ impl CoinEvidence {
         })
     }
 
-    fn to_coin(&self) -> Result<Coin, ShakedexError> {
+    pub(crate) fn to_coin(&self) -> Result<Coin, ShakedexError> {
         if self.value_base_units == 0 {
             return Err(ShakedexError::InvalidEvidence);
         }
@@ -247,6 +247,10 @@ impl SellerLockPlan {
 
     pub const fn name_hash(&self) -> ObjectHash {
         self.name_hash
+    }
+
+    pub(crate) fn locking_coin(&self) -> Result<Coin, ShakedexError> {
+        self.locking_coin.to_coin()
     }
 
     pub fn recovery_transaction(&self) -> Option<TransactionHash> {
@@ -487,6 +491,14 @@ impl BuyerLockPlan {
 
     pub const fn workflow_id(&self) -> WorkflowId {
         self.workflow_id
+    }
+
+    pub(crate) const fn name_hash(&self) -> ObjectHash {
+        self.name_hash
+    }
+
+    pub(crate) fn locking_coin(&self) -> Result<Coin, ShakedexError> {
+        self.locking_coin.to_coin()
     }
 
     pub const fn listing_hash(&self) -> ObjectHash {

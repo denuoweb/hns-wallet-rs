@@ -99,6 +99,14 @@ impl PreparedBuyerFulfillment {
         self.fee_base_units
     }
 
+    pub(crate) const fn expected_recipient(&self) -> &Address {
+        &self.expected_recipient
+    }
+
+    pub(crate) const fn supplied_lock(&self) -> &SuppliedShakedexLock {
+        &self.supplied_lock
+    }
+
     pub fn verify_signed(
         &self,
         signed_transaction: &[u8],
@@ -266,6 +274,27 @@ pub fn verify_signed_buyer_fulfillment(
     })
 }
 
+pub(crate) fn verify_prepared_buyer_funding(
+    listing: &AuthenticatedFixedPriceListing,
+    supplied_lock: &SuppliedShakedexLock,
+    expected_recipient: &Address,
+    buyer_input_coins: &[Coin],
+    expected_fee_base_units: u64,
+    prepared_transaction: &[u8],
+) -> Result<(), ShakedexError> {
+    let transaction = decode_canonical_transaction(prepared_transaction)?;
+    verify_fulfillment_structure(
+        listing,
+        supplied_lock,
+        expected_recipient,
+        buyer_input_coins,
+        expected_fee_base_units,
+        &transaction,
+        false,
+    )?;
+    require_script_authorized_funding_shape(&transaction)
+}
+
 /// Recovery transaction with the exact seller digest still awaiting its
 /// purpose-bound `HnsShakedex` signature.
 pub struct PreparedSellerRecovery {
@@ -395,6 +424,18 @@ impl SellerAuthorizedRecovery {
 
     pub fn funding_input_coins(&self) -> &[Coin] {
         &self.funding_input_coins
+    }
+
+    pub(crate) const fn recovery_recipient(&self) -> &Address {
+        &self.recovery_recipient
+    }
+
+    pub(crate) const fn supplied_lock(&self) -> &SuppliedShakedexLock {
+        &self.supplied_lock
+    }
+
+    pub const fn fee_base_units(&self) -> u64 {
+        self.fee_base_units
     }
 
     pub fn verify_signed(
@@ -566,6 +607,45 @@ pub fn verify_signed_seller_recovery(
         recipient: expected_recipient.clone(),
         fee_base_units: expected_fee_base_units,
     })
+}
+
+pub(crate) fn verify_prepared_seller_recovery_funding(
+    supplied_lock: &SuppliedShakedexLock,
+    expected_recipient: &Address,
+    funding_input_coins: &[Coin],
+    expected_fee_base_units: u64,
+    prepared_transaction: &[u8],
+) -> Result<(), ShakedexError> {
+    let transaction = decode_canonical_transaction(prepared_transaction)?;
+    verify_recovery_structure(
+        supplied_lock,
+        expected_recipient,
+        funding_input_coins,
+        expected_fee_base_units,
+        &transaction,
+        false,
+    )?;
+    supplied_lock
+        .descriptor()
+        .verify_recovery(
+            &transaction,
+            supplied_lock.locking_coin(),
+            expected_recipient,
+        )
+        .map_err(|_| ShakedexError::InvalidEvidence)?;
+    require_script_authorized_funding_shape(&transaction)
+}
+
+fn require_script_authorized_funding_shape(transaction: &Transaction) -> Result<(), ShakedexError> {
+    if transaction.inputs.len() < 2
+        || transaction.inputs[0].witness.items.is_empty()
+        || transaction.inputs[1..]
+            .iter()
+            .any(|input| !input.witness.items.is_empty())
+    {
+        return Err(ShakedexError::InvalidEvidence);
+    }
+    Ok(())
 }
 
 /// Script-authorized FINALIZE awaiting only ordinary fee-input signatures.
