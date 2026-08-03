@@ -842,6 +842,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-wallet-host"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "hns-wallet-ffi",
+ "hns-wallet-types",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hns-wallet-market"
 version = "0.1.0"
 dependencies = [

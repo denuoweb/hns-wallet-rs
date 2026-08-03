@@ -31,6 +31,40 @@ All service IDs use fixed-length, unpadded base64url JSON strings, reject the
 all-zero sentinel and noncanonical trailing bits, and redact `Debug`/`Display`.
 Persisted wallet IDs retain their existing serialization.
 
+## Host-side state machine
+
+`hns-wallet-host` is the trusted caller-side state boundary for this protocol.
+It owns its clock and entropy sources, mints the host session, opaque authority
+handles, request IDs, and provider nonces, and never accepts caller-supplied
+authorization time. A test caller may inject deterministic clock and entropy
+implementations, but the production constructor uses the operating system.
+
+No request is emitted before an exact hello is accepted. Host request sequence
+and service sequence are separate; responses and events share the one service
+sequence because the service emits both from the same counter. Pending request
+IDs are bounded and response kinds must match their originating operation.
+Authority register/replace/revoke responses update only the exact pending
+handle and revision. Provider results, capability snapshots, and approvals must
+match the current private binding. Methods with mandatory approval cannot return
+a direct provider result, and permission/session mutations must advance exactly
+as their method requires. Negotiated service capabilities constrain every
+advertised method. Approval decisions reuse the stored owner, revision, binding,
+and expiry rather than accepting those values from the UI; accepted approval
+IDs cannot be reused within the host session. Exhausting the bounded approval-ID
+lifetime set requires an explicit new host session rather than silent reuse.
+Only detached, stale, or host-clock-expired authority facts can be discarded
+without a correlated service revoke, and discarded handles are never reissued.
+Event replay cursors are scoped to authority revision, wallet session, and
+permission generation. Permission-change events invalidate every same-origin,
+same-namespace binding, module-change events invalidate capability snapshots,
+and reset the host's global event-cursor domain to match the service sequence
+reset. Wallet-lock events invalidate all provider state. A restart or any
+protocol/sequence/correlation failure clears all
+service-derived authority, binding, approval, and replay state.
+
+This crate is a reusable state machine, not a Chromium launcher, mobile FFI
+binding, engine-authority adapter, secure approval UI, or availability gate.
+
 ## Authority control
 
 Authority registration is accepted only over the private host/service pipe.
@@ -72,8 +106,9 @@ snapshot with exactly `providerSchemaVersion: 1`, `approvalSchemaVersion: 2`,
 `walletSessionId`, `permissionGeneration`, and `methods`. Its session and
 generation must equal the accompanying binding, schema versions are exact, and
 method strings must belong to the exact shared 43-name wallet-types list; short
-unknown strings are rejected as well as oversized ones. When provider dispatch is
-absent, `methods` is empty.
+unknown strings are rejected as well as oversized ones. The advertised subset
+also rejects `hns_requestAccounts` until its atomic permission/account join
+exists. When provider dispatch is absent, `methods` is empty.
 
 The website method `wallet_getCapabilities` instead returns only
 `providerApiVersion: 1` and `methods`. Its outer private result binding is
@@ -94,4 +129,26 @@ after generated JNI/C bindings exist. Filesystem paths, process commands, raw
 signing, recovery output, private keys, database keys, preimages, and arbitrary
 contract calls are absent from the protocol.
 
-Contract tests added with this tranche are source-only and were not executed.
+## Machine-readable contracts
+
+`../abi/contracts-v2.schema.json` is one JSON Schema Draft 2020-12 bundle with
+five named roots: private wallet-service frames v2, private provider capability
+snapshots v1, public approval projections v2, public provider event projections
+v1, and signed artifact manifests v2. `../abi/golden-vectors-v2.json` provides
+bounded valid and invalid structural fixtures covering every service request
+and response class, every wallet request/response class, all twelve approval
+summaries, all thirteen public events, fresh generation zero, a retained
+nonzero tombstone, private-field leaks, kind mismatches, and rollback metadata.
+
+The frame fixtures describe the JSON payload after the four-byte length prefix;
+the prefix and encoded byte ceilings remain codec/transport invariants. JSON
+Schema also cannot express equality between sibling binding/session fields,
+clock-relative expiry, canonical set order, or stateful anti-rollback. Runtime
+validators must continue to enforce those rules. Manifest structure and a
+well-shaped signature do not establish publisher authenticity: trusted keys,
+signature verification, durable rollback state, artifact hashing, and the
+release gate are not implemented here, so artifact/runtime availability stays
+false.
+
+Host and contract tests added with this tranche are source-only and were not
+executed.

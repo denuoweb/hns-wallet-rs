@@ -8,7 +8,9 @@ Bitcoin and Ethereum modules.
 
 The workspace does not combine the browser, node, or canonical protocol
 repositories. It consumes released protocol crates and exposes a private,
-length-prefixed wallet-service ABI for separately released browser adapters.
+length-prefixed wallet-service ABI, a fail-closed host-side protocol state
+machine, and machine-readable contracts for separately released browser
+adapters.
 
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
@@ -37,6 +39,8 @@ can prove ownership from the committed bytes.
   release-gated Helios/HTLC policy.
 - `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.
 - `hns-wallet-service`: private session/authority registry and subprocess composition boundary.
+- `hns-wallet-host`: caller-side negotiation, correlation, authority, approval,
+  binding, and event-replay state for trusted browser/mobile adapters.
 - `hns-wallet-testkit`: deterministic, non-mainnet fixtures.
 
 Run `scripts/check.sh` once for the complete local qualification gate.
@@ -52,6 +56,7 @@ Run `scripts/check.sh` once for the complete local qualification gate.
 - [Ethereum model and contract](docs/ETHEREUM.md)
 - [Shakedex and market state](docs/SHAKEDEX_AND_MARKET.md)
 - [Wallet service ABI v2](docs/ABI.md)
+- [ABI schemas and bounded vectors](abi/)
 - [Qualification matrix](docs/QUALIFICATION.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Future work and excluded features](FUTURE_WORK.md)

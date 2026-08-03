@@ -1,0 +1,18 @@
+[package]
+name = "hns-wallet-host"
+description = "Fail-closed ABI-v2 host state machine for wallet browser and mobile adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+hns-wallet-ffi.workspace = true
+hns-wallet-types.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

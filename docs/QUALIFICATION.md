@@ -14,7 +14,7 @@ current commit has no recorded result for that gate.
 | Market sessions | prior unit baseline only | CAS journal source | evidence incomplete | no pair E2E | no audit | unavailable |
 | Bitcoin Kyoto | current supervisor tranche pending consolidated gate | source includes BDK-first sync journal, bounded reconciliation chunks, restart resume, and pre-broadcast intent; pinned Kyoto header/filter/peer persistence unavailable | source queries exact canonical hash membership within a bounded retained window; no current execution evidence | no regtest/P2P/broadcast run | not measured/no audit | send and settlement hard-disabled |
 | Ethereum | containment tranche pending consolidated gate | offline derivation and dormant typed primitives only; no synchronization/history persistence | no restart/reorg evidence | deterministic contract compiled only in prior baseline; no embedded Helios/local-chain run; permits unavailable; mainnet denied | no contract audit | synchronization/history/send/signing/settlement unavailable |
-| ABI | prior unit baseline only | session field only | n/a | no platform ABI E2E | no audit | product integration pending |
+| ABI/host | host/contract tranche pending consolidated gate | source includes exact hello/restart and directional sequencing, bounded response correlation, authority/approval/private-binding/event replay state, and machine-readable private/public/manifest contracts plus bounded vectors | restart reset is implemented in source; no process-restart execution evidence | no platform ABI E2E, signed artifact verifier, launcher, or generated mobile binding | no resource measurement/audit | product integration pending; all browser/provider/value gates remain false |
 | Browser products | separate repositories | platform integration pending | n/a | no installed/signed E2E | no review | unavailable |
 
 ## Single qualification command
@@ -24,7 +24,7 @@ all-target check, warning-denied Clippy, tests, warning-denied docs,
 sibling/forbidden-backend dependency checks, deterministic Solidity artifact
 comparison, and an npm high-severity audit.
 
-This production-hardening tranche was not built or tested locally, by explicit
+This production-hardening and host-contract tranche was not built or tested locally, by explicit
 instruction to avoid redundant build/test sessions. Its next evidence event is
 one consolidated CI invocation of `scripts/check.sh`; do not run separate
 build, check, test, and pre-push copies of the same gate. Record its commit ID,

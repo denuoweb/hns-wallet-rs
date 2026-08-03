@@ -16,6 +16,14 @@ marketplace settlement are independently disabled.
 - Service, wallet, and host sessions are random identities. Restart and
   authority revisions plus directional channel/event sequences are checked
   exactly. Wallet lock state and permission generation are service-owned.
+- The reusable host state machine owns its authorization clock and operating-
+  system entropy, mints all private host/request/authority identifiers and
+  provider nonces, correlates a bounded pending set, and treats responses and
+  events as one exact service-direction sequence. UI callers cannot choose
+  authority revisions, approval ownership, provider bindings, or expiry time.
+  Mandatory approval response classes, non-reusable approval IDs, negotiated
+  method capabilities, and exact permission/session transitions are enforced
+  again at this caller-side boundary.
 - The wallet database and keys live in a native/mobile wallet process. Website
   JavaScript, extension local storage, and native-messaging frames never carry
   seed or raw private-key bytes.
@@ -108,8 +116,25 @@ once. Revocation stores an authenticated tombstone so delete/regrant cannot
 reset the generation. Service restart intentionally drops authorities,
 approvals, replay/rate state, request IDs, and event cursors while permissions
 survive.
+Host restart/reset independently drops every service-derived handle revision,
+pending request and approval, private binding, and event cursor. A response
+kind mismatch, stale session, sequence gap/replay, unknown request ID, or stale
+binding fails closed instead of advancing partial host state. Trusted-clock
+rollback likewise poisons the private session and requires explicit restart.
+Detached, stale, or expired host facts may be discarded, but their random
+handles remain reserved for the lifetime of the host process.
+Permission-change events clear every same-origin and same-namespace derived
+binding and reset the global event-cursor domain exactly as the service does;
+wallet-lock events clear provider state globally before further use.
 It explicitly rejects seed/key extraction, raw signing, PSBT signing, generic
 Ethereum transactions/calls, chain switching, and arbitrary native-host access.
+
+The signed-artifact manifest schema is structural only. It contains no trusted
+public key and cannot authorize itself. A product verifier must own its trust
+roots, verify the artifact and canonical signed payload, persist a per-release-
+line rollback high-water mark, and bind that evidence to process launch. No such
+verifier is wired here, so a schema-valid manifest does not make the wallet
+available.
 
 ## Atomic-swap limits
 

@@ -5,8 +5,8 @@ Handshake protocol library, full node, DANE trust engine, or browser products.
 
 ```text
 hostile website
-  -> browser engine authority retained by native host
-  -> private host registry: opaque random authority handle
+  -> browser engine authority retained by platform adapter
+  -> hns-wallet-host: owned clock/entropy, opaque handle, request correlation
   -> hns-wallet-ffi v2: length/session/restart/sequence validation
   -> hns-wallet-service: handle/revision/event/approval lifecycle
   -> hns-wallet-provider: origin permission, replay, rate, approval policy
@@ -38,12 +38,20 @@ semantics, approvals, and recoverable application workflows.
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events | raw keys/native commands or engine authority objects |
 | `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition | browser engine policy or availability claims |
+| `hns-wallet-host` | host-owned negotiation, identifiers/nonces, bounded request correlation, authority revisions, approval ownership, private provider bindings, and event replay cursors | platform process launch, engine policy, page injection, artifact trust, or availability claims |
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
 
 Every maintained repository keeps its own lockfile, tests, and release. There
 are no sibling-checkout dependencies. A newly added `hns-rs` protocol crate
 must be released or referenced by an immutable commit before a wallet release
 can consume it.
+
+The machine-readable contract bundle under `abi/` describes strict private
+ABI-v2 JSON payloads, the private capability snapshot, public approval/event
+projections, and signed-artifact manifest structure. It is an interface source,
+not an executable runtime, generated platform binding, trusted signing key, or
+artifact verifier. The browser and mobile repositories still own their outer
+transport wrappers and independently qualified platform integration.
 
 ## Evidence authority
 

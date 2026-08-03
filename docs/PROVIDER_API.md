@@ -75,6 +75,15 @@ channel may register the logical origin, namespace, runtime session/generation,
 policy/navigation generations, decision fingerprint, and expiry. Pages never
 supply those values as authentication and never receive the opaque handle.
 Wallet lock/session and permission generation are owned by the wallet service.
+The reusable host state machine mints the opaque handle and per-request nonce,
+tracks the exact authority revision and current private binding, and correlates
+each bounded request with only its allowed response class. Approval decisions
+reuse host-retained ownership and expiry, and service events share one exact
+incoming channel sequence with responses. None of that private state is a
+website request field. Mandatory-approval methods cannot complete on their
+initial request, approval IDs cannot be reused within a host session, and
+permission or wallet-lock transitions must advance the exact generation or
+session dimension before a result is accepted.
 
 Permission records and encrypted tombstone generations survive service
 restart. Their persistence scope is the exact selected namespace plus logical
@@ -135,4 +144,5 @@ origins, unauthorized capabilities, replays, request flooding, stale context,
 stale approval, locked wallet, and unavailable module/backend are distinct
 errors. Errors minimize account and policy disclosure.
 
-The new provider/ABI/service contract tests are source-only and were not run.
+The new provider/ABI/service/host contract tests and machine-readable vectors
+are source-only and were not run.

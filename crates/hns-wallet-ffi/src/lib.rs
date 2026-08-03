@@ -335,6 +335,7 @@ impl ProviderCapabilitySnapshot {
             if method.is_empty()
                 || method.len() > MAX_METHOD_BYTES
                 || !method.is_ascii()
+                || method == "hns_requestAccounts"
                 || !PROVIDER_METHOD_WIRE_NAMES.contains(&method.as_str())
             {
                 return Err(AbiError::InvalidEnvelope);
@@ -1595,6 +1596,15 @@ mod tests {
             validate_service_response(&ServiceResponse::ProviderCapabilities {
                 binding,
                 capabilities: unknown_method,
+            }),
+            Err(AbiError::InvalidEnvelope)
+        );
+        let mut unavailable_method = capabilities.clone();
+        unavailable_method.methods = BTreeSet::from(["hns_requestAccounts".to_owned()]);
+        assert_eq!(
+            validate_service_response(&ServiceResponse::ProviderCapabilities {
+                binding,
+                capabilities: unavailable_method,
             }),
             Err(AbiError::InvalidEnvelope)
         );
