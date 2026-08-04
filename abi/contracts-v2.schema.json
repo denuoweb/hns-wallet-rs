@@ -7,7 +7,7 @@
   "oneOf": [
     { "$ref": "#/$defs/privateWalletServiceFrameV2" },
     { "$ref": "#/$defs/privateProviderCapabilitySnapshotV1" },
-    { "$ref": "#/$defs/publicApprovalProjectionV2" },
+    { "$ref": "#/$defs/publicApprovalProjectionV3" },
     { "$ref": "#/$defs/publicProviderEventProjectionV1" },
     { "$ref": "#/$defs/signedArtifactManifestV2" }
   ],
@@ -105,7 +105,7 @@
       "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$",
       "not": { "enum": ["example", "invalid", "local", "localhost", "test"] }
     },
-    "hnsNameDisclosureV2": {
+    "hnsNameDisclosureV3": {
       "type": "object",
       "additionalProperties": false,
       "required": ["name", "nameHash"],
@@ -113,14 +113,14 @@
         "name": { "$ref": "#/$defs/canonicalHnsName" },
         "nameHash": { "$ref": "#/$defs/lowerHexDigest32" }
       },
-      "$comment": "The ABI validator uses the exact pinned hns-covenants rules and requires nameHash == SHA3-256(name)."
+      "$comment": "The approval-schema-v3 validator uses the exact pinned hns-covenants rules and requires nameHash == SHA3-256(name)."
     },
-    "hnsNameDisclosuresV2": {
+    "hnsNameDisclosuresV3": {
       "type": "array",
       "maxItems": 64,
       "uniqueItems": true,
-      "items": { "$ref": "#/$defs/hnsNameDisclosureV2" },
-      "$comment": "Wire producers sort by (name, nameHash); the ABI validator also rejects duplicate names or hashes and the 16384-byte approval-frame ceiling remains authoritative."
+      "items": { "$ref": "#/$defs/hnsNameDisclosureV3" },
+      "$comment": "Wire producers sort by (name, nameHash); the approval-schema-v3 validator also rejects duplicate names or hashes and the 16384-byte approval-frame ceiling remains authoritative."
     },
     "token128": {
       "type": "string",
@@ -360,7 +360,7 @@
       ],
       "properties": {
         "providerSchemaVersion": { "const": 1 },
-        "approvalSchemaVersion": { "const": 2 },
+        "approvalSchemaVersion": { "const": 3 },
         "walletSessionId": { "$ref": "#/$defs/wireId32" },
         "permissionGeneration": { "$ref": "#/$defs/uint64" },
         "methods": { "$ref": "#/$defs/providerMethods" }
@@ -681,7 +681,7 @@
           "properties": {
             "kind": { "const": "permissions" },
             "capabilities": { "$ref": "#/$defs/nonemptyPermissionCapabilities" },
-            "hnsNames": { "$ref": "#/$defs/hnsNameDisclosuresV2" }
+            "hnsNames": { "$ref": "#/$defs/hnsNameDisclosuresV3" }
           },
           "allOf": [
             {
@@ -1495,7 +1495,7 @@
         }
       ]
     },
-    "publicApprovalSummary": {
+    "publicApprovalSummaryV3": {
       "oneOf": [
         {
           "type": "object",
@@ -1504,7 +1504,7 @@
           "properties": {
             "kind": { "const": "permissions" },
             "capabilities": { "$ref": "#/$defs/nonemptyPermissionCapabilities" },
-            "hnsNames": { "$ref": "#/$defs/hnsNameDisclosuresV2" }
+            "hnsNames": { "$ref": "#/$defs/hnsNameDisclosuresV3" }
           },
           "allOf": [
             {
@@ -1664,20 +1664,20 @@
         }
       ]
     },
-    "publicApprovalProjectionV2": {
-      "$anchor": "publicApprovalProjectionV2",
-      "title": "Public approval projection v2",
+    "publicApprovalProjectionV3": {
+      "$anchor": "publicApprovalProjectionV3",
+      "title": "Public approval projection v3",
       "description": "Browser-owned, display-complete projection of the private approval. It deliberately excludes provider bindings, host/service sessions, authority handles, request nonces, secret material, and arbitrary display lines.",
       "type": "object",
       "additionalProperties": false,
       "required": ["schemaVersion", "approvalId", "method", "origin", "expiresAtUnixMs", "summary"],
       "properties": {
-        "schemaVersion": { "const": 2 },
+        "schemaVersion": { "const": 3 },
         "approvalId": { "$ref": "#/$defs/wireId16" },
         "method": { "$ref": "#/$defs/approvalMethod" },
         "origin": { "$ref": "#/$defs/publicOrigin" },
         "expiresAtUnixMs": { "$ref": "#/$defs/positiveSafeUint" },
-        "summary": { "$ref": "#/$defs/publicApprovalSummary" }
+        "summary": { "$ref": "#/$defs/publicApprovalSummaryV3" }
       },
       "allOf": [
         {
@@ -1915,7 +1915,7 @@
             "walletAbiVersion": { "const": 2 },
             "serviceProtocolVersion": { "const": 2 },
             "providerSchemaVersion": { "const": 1 },
-            "approvalSchemaVersion": { "const": 2 },
+            "approvalSchemaVersion": { "const": 3 },
             "maximumFrameBytes": { "const": 1048576 },
             "capabilities": {
               "type": "array",

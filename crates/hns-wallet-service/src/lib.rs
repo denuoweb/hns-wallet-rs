@@ -4418,7 +4418,7 @@ mod tests {
         assert_eq!(binding.wallet_session_id, service.wallet_session_id);
         assert_eq!(binding.permission_generation, 0);
         assert_eq!(snapshot.provider_schema_version, 1);
-        assert_eq!(snapshot.approval_schema_version, 2);
+        assert_eq!(snapshot.approval_schema_version, 3);
         assert_eq!(snapshot.permission_generation, 0);
         assert!(!snapshot.methods.contains("hns_requestAccounts"));
         assert_eq!(

@@ -129,7 +129,7 @@ list used by both provider parsing and private ABI snapshot validation; even a
 short, bounded unknown name is rejected. The website method `wallet_getCapabilities`
 returns only `{providerApiVersion:1,methods:[...]}`. Native bootstrap separately
 uses the authority-scoped private ABI capability request whose snapshot is
-`{providerSchemaVersion:1,approvalSchemaVersion:2,walletSessionId,
+`{providerSchemaVersion:1,approvalSchemaVersion:3,walletSessionId,
 permissionGeneration,methods}`. The native adapter retains its result binding;
 it must never project that private envelope to website code. Chromium must
 project exactly `{abiVersion,available,walletSession,permissionGeneration,
@@ -181,19 +181,20 @@ returned.
 Read capabilities are additive only after a persisted exact Accounts grant.
 `wallet_requestPermissions` cannot replace or select that account. Approving
 Names first performs one live synchronization and places the exact sorted
-canonical name/lowercase-hash pairs in required ABI-v2 `hnsNames`. Pending
-state freezes that account, display list, and binary hash set. Approval performs
-one new synchronization and fails stale if the permission, account, or current
-set differs; it persists exactly the displayed hashes and never adds a
-post-decision name. Empty authorizes no names. The consent list is limited to
-64 and the unchanged 16 KiB approval-frame ceiling also fails closed without
-truncation. A nonempty persisted set remains invalid without HNS namespace,
-Accounts, Names, and a nonempty account binding.
+canonical name/lowercase-hash pairs in required approval-schema-v3 `hnsNames`.
+Pending state freezes that account, display list, and binary hash set. Approval
+performs one new synchronization and fails stale if the permission, account,
+or current set differs; it persists exactly the displayed hashes and never
+adds a post-decision name. Empty authorizes no names. The consent list is
+limited to 64 and the unchanged 16 KiB approval-frame ceiling also fails closed
+without truncation. A nonempty persisted set remains invalid without HNS
+namespace, Accounts, Names, and a nonempty account binding.
 
 Non-Names permission prompts and `hns_requestAccounts` carry `hnsNames: []`.
-This v2 shape is unpublished; browser/mobile consumers must adopt, preserve,
-and render it before the read composition is product-available. Strict older
-consumers reject the new field, while updated consumers reject its omission.
+This approval-v3 shape is unpublished; browser/mobile consumers must negotiate,
+adopt, preserve, and render it before the read composition is product-available.
+Strict approval-v2 consumers reject the new field, while v3 consumers reject
+its omission.
 
 Balance, transaction, receive-address, and name-list calls accept only null or
 an empty object. `hns_getName` accepts exactly one 64-character lowercase-hex

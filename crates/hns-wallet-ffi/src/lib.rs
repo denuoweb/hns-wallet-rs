@@ -34,7 +34,7 @@ pub const MAX_HNS_NAME_DISCLOSURES: usize = 64;
 pub const MAX_HNS_NAME_BYTES: usize = 63;
 pub const MAX_FAILURE_MESSAGE_BYTES: usize = 1_024;
 pub const PROVIDER_SCHEMA_VERSION: u16 = 1;
-pub const APPROVAL_SCHEMA_VERSION: u16 = 2;
+pub const APPROVAL_SCHEMA_VERSION: u16 = 3;
 pub const MAX_PROVIDER_METHODS: usize = PROVIDER_METHOD_WIRE_NAMES.len();
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -502,6 +502,7 @@ impl HnsNameDisclosure {
 pub enum ApprovalSummary {
     Permissions {
         capabilities: BTreeSet<PermissionCapability>,
+        #[serde(rename = "hnsNames")]
         hns_names: Vec<HnsNameDisclosure>,
     },
     ModuleEnablement {

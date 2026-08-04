@@ -92,13 +92,13 @@ applicable, price round and refund time. An incomplete or kind-mismatched
 summary fails closed. Recovery-phrase display is not a provider/service
 operation.
 
-Every ABI-v2 `Permissions` summary has a required `hnsNames` list. It is empty
-unless Names is requested and always empty for `hns_requestAccounts`. A Names
-summary contains at most 64 entries sorted by `(name,nameHash)` with unique
-canonical names and hashes. Validation uses the pinned `hns-covenants` rules
-and requires each lowercase hash to equal SHA3-256(name). The 16,384-byte
-approval-frame limit remains authoritative and prompts fail rather than
-truncate.
+Every approval-schema-v3 `Permissions` summary carried by private ABI v2 has a
+required `hnsNames` list. It is empty unless Names is requested and always
+empty for `hns_requestAccounts`. A Names summary contains at most 64 entries
+sorted by `(name,nameHash)` with unique canonical names and hashes. Validation
+uses the pinned `hns-covenants` rules and requires each lowercase hash to equal
+SHA3-256(name). The 16,384-byte approval-frame limit remains authoritative and
+prompts fail rather than truncate.
 
 Events are typed frames bound to host/service/restart sessions, the exact
 provider binding, a monotonic service channel sequence, and a per-authority
@@ -110,7 +110,7 @@ the binding generation. Bounded collection and string limits are checked.
 Capabilities are a closed enum. Unsupported operations return the typed
 `unsupportedCapability` failure and are never inferred from compiled source.
 The authority-scoped private `providerCapabilities` request returns a typed
-snapshot with exactly `providerSchemaVersion: 1`, `approvalSchemaVersion: 2`,
+snapshot with exactly `providerSchemaVersion: 1`, `approvalSchemaVersion: 3`,
 `walletSessionId`, `permissionGeneration`, and `methods`. Its session and
 generation must equal the accompanying binding, schema versions are exact, and
 method strings must belong to the exact shared 43-name wallet-types list; short
@@ -159,7 +159,7 @@ absent from the protocol.
 
 `../abi/contracts-v2.schema.json` is one JSON Schema Draft 2020-12 bundle with
 five named roots: private wallet-service frames v2, private provider capability
-snapshots v1, public approval projections v2, public provider event projections
+snapshots v1, public approval projections v3, public provider event projections
 v1, and signed artifact manifests v2. `../abi/golden-vectors-v2.json` provides
 bounded valid and invalid structural fixtures covering every service request
 and response class, every wallet request/response class, all twelve approval
@@ -168,10 +168,13 @@ nonzero tombstone, private-field leaks, kind mismatches, and rollback metadata.
 Runtime-invalid vectors additionally cover name ordering and SHA3 name/hash
 equality, which JSON Schema cannot express.
 
-Approval schema v2 is unpublished, so this required field is updated
-coherently across wallet FFI, service, host, private/public schemas, and
-vectors without creating a second v2. Browser/mobile consumers must adopt and
-render it exactly before Names becomes available; strict old and new shapes
+Approval schema v3 deliberately replaces the unpublished v2 projection because
+`hnsNames` is newly required. Private ABI framing and sessions remain v2: an
+exact provider-capability snapshot negotiates approval schema v3 before the
+host can issue any provider request, so mismatched peers fail before an
+approval is decoded. Wallet FFI, service, host, private/public schemas, and
+vectors use the one exact v3 shape. Browser/mobile consumers must negotiate,
+adopt, and render it before Names becomes available; strict v2 and v3 shapes
 reject one another rather than silently dropping disclosure.
 
 The frame fixtures describe the JSON payload after the four-byte length prefix;

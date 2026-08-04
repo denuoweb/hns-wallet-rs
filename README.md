@@ -26,14 +26,16 @@ real HNS backend and encrypted wallet state. It authenticates the selected
 account around each bounded reconciliation, retains one exact chain/mempool
 binding internally, performs no node I/O while a `SharedWalletStore` closure is
 active, and commits only across exact account/entity revision fences. The
-ABI-v2 Names prompt carries the exact sorted canonical name/lowercase-hash set
-it may grant. The service freezes that bounded set before prompting,
-re-synchronizes at approval, rejects any account or set change, and persists
-only the unchanged displayed hashes. This unreleased v2 shape is incompatible
-with consumers that omit or do not understand `hnsNames`; browser and mobile
-adapters must adopt and render it exactly before Names is available. The
-checked-in executable still has no account-selection or backend inputs, so it
-remains the control-only runtime. Wallet creation/restoration, browser
+approval-schema-v3 Names prompt carried by private ABI v2 contains the exact
+sorted canonical name/lowercase-hash set it may grant. The service freezes that
+bounded set before prompting, re-synchronizes at approval, rejects any account
+or set change, and persists only the unchanged displayed hashes. This
+unreleased approval-v3 shape is
+incompatible with consumers that omit or do not understand `hnsNames`; browser
+and mobile adapters must negotiate, adopt, and render it exactly before Names
+is available. The checked-in executable still has no account-selection or
+backend inputs, so it remains the control-only runtime. Wallet
+creation/restoration, browser
 integration, and every value path remain unavailable there.
 
 Current safety status: the production-hardening source boundary is implemented,

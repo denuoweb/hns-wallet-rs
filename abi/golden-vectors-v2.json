@@ -3,7 +3,7 @@
   "contractBundle": "contracts-v2.schema.json",
   "maximumEncodedBytes": 262144,
   "runtimeAvailabilityClaimed": false,
-  "description": "Bounded structural vectors for private ABI v2, private capability snapshot v1, public approval v2, public event v1, and signed artifact manifest v2. Values under valid are contract examples, not evidence that a runtime, release, signer, or trust root exists.",
+  "description": "Bounded structural vectors for private ABI v2, private capability snapshot v1, public approval v3, public event v1, and signed artifact manifest v2. Values under valid are contract examples, not evidence that a runtime, release, signer, or trust root exists.",
   "valid": {
     "privateFrames": [
       {
@@ -241,7 +241,7 @@
           },
           "capabilities": {
             "providerSchemaVersion": 1,
-            "approvalSchemaVersion": 2,
+            "approvalSchemaVersion": 3,
             "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
             "permissionGeneration": 0,
             "methods": ["hns_requestAccounts", "hns_accounts"]
@@ -355,7 +355,7 @@
         "schemaPointer": "#/$defs/privateProviderCapabilitySnapshotV1",
         "value": {
           "providerSchemaVersion": 1,
-          "approvalSchemaVersion": 2,
+          "approvalSchemaVersion": 3,
           "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
           "permissionGeneration": 0,
           "methods": []
@@ -366,7 +366,7 @@
         "schemaPointer": "#/$defs/privateProviderCapabilitySnapshotV1",
         "value": {
           "providerSchemaVersion": 1,
-          "approvalSchemaVersion": 2,
+          "approvalSchemaVersion": 3,
           "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
           "permissionGeneration": 8,
           "methods": []
@@ -376,73 +376,73 @@
     "publicApprovals": [
       {
         "name": "permissions",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] } }
       },
       {
         "name": "hnsAccountJoin",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
       },
       {
         "name": "hnsNamePermission",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
       },
       {
         "name": "moduleEnablement",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_enableModule", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "moduleEnablement", "module": "bitcoin", "action": "enable" } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_enableModule", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "moduleEnablement", "module": "bitcoin", "action": "enable" } }
       },
       {
         "name": "send",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_send", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "send", "amount": { "asset": "HNS", "baseUnits": "1000" }, "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "chain": "handshake", "finality": "proof_of_work_confirmations", "warnings": ["feeEstimateMayChange"] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_send", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "send", "amount": { "asset": "HNS", "baseUnits": "1000" }, "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "chain": "handshake", "finality": "proof_of_work_confirmations", "warnings": ["feeEstimateMayChange"] } }
       },
       {
         "name": "nameTransfer",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_transferName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameTransfer", "name": "example", "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["nameTransferIsIrreversible"] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_transferName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameTransfer", "name": "example", "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["nameTransferIsIrreversible"] } }
       },
       {
         "name": "nameFinalize",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_finalizeName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameFinalize", "name": "example", "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["nameTransferIsIrreversible"] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_finalizeName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameFinalize", "name": "example", "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["nameTransferIsIrreversible"] } }
       },
       {
         "name": "typedSignature",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_signTypedMessage", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "typedSignature", "messageType": "HandshakeLogin", "messageDigest": "0123456789abcdef" } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_signTypedMessage", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "typedSignature", "messageType": "HandshakeLogin", "messageDigest": "0123456789abcdef" } }
       },
       {
         "name": "nameMarketOffer",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "nameMarket_createFixedPriceOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameMarketOffer", "action": "create", "name": "example", "listingId": null, "price": { "asset": "HNS", "baseUnits": "5000" }, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": [] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "nameMarket_createFixedPriceOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameMarketOffer", "action": "create", "name": "example", "listingId": null, "price": { "asset": "HNS", "baseUnits": "5000" }, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": [] } }
       },
       {
         "name": "nameMarketPurchase",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "nameMarket_acceptOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameMarketPurchase", "name": "example", "listingId": "listing-1", "payment": { "asset": "HNS", "baseUnits": "5000" }, "recipient": "hs1qseller", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "nameMarket_acceptOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameMarketPurchase", "name": "example", "listingId": "listing-1", "payment": { "asset": "HNS", "baseUnits": "5000" }, "recipient": "hs1qseller", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
       },
       {
         "name": "marketIntent",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_publishMarketIntent", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "marketIntent", "action": "publish", "marketIntentId": null, "offered": { "asset": "HNS", "baseUnits": "1000" }, "requestedAsset": "BTC", "priceRound": "HNS-BTC-100", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_publishMarketIntent", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "marketIntent", "action": "publish", "marketIntentId": null, "offered": { "asset": "HNS", "baseUnits": "1000" }, "requestedAsset": "BTC", "priceRound": "HNS-BTC-100", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
       },
       {
         "name": "fillAcceptance",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_acceptFill", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "fillAcceptance", "marketIntentId": "intent-1", "fillId": "fill-1", "offered": { "asset": "HNS", "baseUnits": "1000" }, "expected": { "asset": "BTC", "baseUnits": "20" }, "priceRound": "HNS-BTC-100", "refundTimeoutUnixMs": 300000, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["refundRequiresManualAction", "settlementCanBeDelayed"] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_acceptFill", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "fillAcceptance", "marketIntentId": "intent-1", "fillId": "fill-1", "offered": { "asset": "HNS", "baseUnits": "1000" }, "expected": { "asset": "BTC", "baseUnits": "20" }, "priceRound": "HNS-BTC-100", "refundTimeoutUnixMs": 300000, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["refundRequiresManualAction", "settlementCanBeDelayed"] } }
       },
       {
         "name": "swapRedeem",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_redeem", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "swapRedeem", "swapSessionId": "swap-1", "amount": { "asset": "BTC", "baseUnits": "20" }, "recipient": "bc1qrecipient", "maximumFee": { "asset": "BTC", "baseUnits": "1" }, "finality": "proof_of_work_confirmations", "warnings": ["settlementCanBeDelayed"] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_redeem", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "swapRedeem", "swapSessionId": "swap-1", "amount": { "asset": "BTC", "baseUnits": "20" }, "recipient": "bc1qrecipient", "maximumFee": { "asset": "BTC", "baseUnits": "1" }, "finality": "proof_of_work_confirmations", "warnings": ["settlementCanBeDelayed"] } }
       },
       {
         "name": "swapRefund",
-        "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-        "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_refund", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "swapRefund", "swapSessionId": "swap-1", "amount": { "asset": "ETH", "baseUnits": "20" }, "recipient": "0x0123456789abcdef", "maximumFee": { "asset": "ETH", "baseUnits": "1" }, "refundAvailableAtUnixMs": 300000, "warnings": ["refundRequiresManualAction"] } }
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_refund", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "swapRefund", "swapSessionId": "swap-1", "amount": { "asset": "ETH", "baseUnits": "20" }, "recipient": "0x0123456789abcdef", "maximumFee": { "asset": "ETH", "baseUnits": "1" }, "refundAvailableAtUnixMs": 300000, "warnings": ["refundRequiresManualAction"] } }
       }
     ],
     "publicEvents": [
@@ -473,7 +473,7 @@
             "walletAbiVersion": 2,
             "serviceProtocolVersion": 2,
             "providerSchemaVersion": 1,
-            "approvalSchemaVersion": 2,
+            "approvalSchemaVersion": 3,
             "maximumFrameBytes": 1048576,
             "capabilities": []
           },
@@ -513,15 +513,15 @@
   "runtimeInvalid": [
     {
       "name": "publicApprovalUnsortedHnsNames",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-      "reason": "JSON Schema cannot express canonical array order; ABI-v2 validators reject disclosures not sorted by (name, nameHash)",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "beta", "nameHash": "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f" }, { "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "JSON Schema cannot express canonical array order; approval-schema-v3 validators reject disclosures not sorted by (name, nameHash)",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "beta", "nameHash": "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f" }, { "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
     },
     {
       "name": "publicApprovalMismatchedHnsNameHash",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-      "reason": "JSON Schema cannot recompute SHA3-256; the pinned hns-covenants ABI validator rejects a structurally valid but mismatched pair",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f" }] } }
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "JSON Schema cannot recompute SHA3-256; the pinned hns-covenants approval-schema-v3 validator rejects a structurally valid but mismatched pair",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f" }] } }
     }
   ],
   "invalid": [
@@ -547,61 +547,61 @@
       "name": "privateSnapshotUnknownMethod",
       "schemaPointer": "#/$defs/privateProviderCapabilitySnapshotV1",
       "reason": "the method vocabulary is closed and availability is negotiated",
-      "value": { "providerSchemaVersion": 1, "approvalSchemaVersion": 2, "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "permissionGeneration": 0, "methods": ["eth_sendTransaction"] }
+      "value": { "providerSchemaVersion": 1, "approvalSchemaVersion": 3, "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "permissionGeneration": 0, "methods": ["eth_sendTransaction"] }
     },
     {
       "name": "publicApprovalLeaksPrivateBinding",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
       "reason": "private authority/session bindings never enter the public approval shape",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] }, "binding": { "permissionGeneration": 0 } }
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] }, "binding": { "permissionGeneration": 0 } }
     },
     {
       "name": "publicApprovalMissingHnsNames",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
-      "reason": "approval-schema-v2 permission summaries require an explicit minimized HNS name disclosure list",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"] } }
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "approval-schema-v3 permission summaries require an explicit minimized HNS name disclosure list",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"] } }
     },
     {
       "name": "publicApprovalNonNamesDisclosure",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
       "reason": "a permission prompt cannot disclose HNS names unless Names authority is requested",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
     },
     {
       "name": "publicApprovalMalformedHnsNameHash",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
       "reason": "HNS disclosure hashes are exact lowercase 32-byte hexadecimal digests",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878F8A927B4566AC951FC815B18DFAD8D0302D61D11D80CBE15B7A3A056AF" }] } }
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878F8A927B4566AC951FC815B18DFAD8D0302D61D11D80CBE15B7A3A056AF" }] } }
     },
     {
       "name": "publicApprovalDuplicateHnsDisclosure",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
       "reason": "the disclosed concrete HNS authority set cannot contain duplicate entries",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }, { "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }, { "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
     },
     {
       "name": "publicApprovalAccountJoinLeaksNames",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
       "reason": "hns_requestAccounts never carries a name disclosure",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
     },
     {
       "name": "publicApprovalGenericAccountsAuthority",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
       "reason": "Accounts authority can be created only by the exact hns_requestAccounts join",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
     },
     {
       "name": "publicApprovalInexactHnsAccountJoin",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
       "reason": "hns_requestAccounts requires exactly the Accounts capability",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] } }
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] } }
     },
     {
       "name": "publicApprovalKindMethodMismatch",
-      "schemaPointer": "#/$defs/publicApprovalProjectionV2",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
       "reason": "approval method and display-complete summary kind must agree",
-      "value": { "schemaVersion": 2, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_transferName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_transferName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
     },
     {
       "name": "publicEventGenerationZeroConnect",
@@ -633,7 +633,7 @@
       "reason": "the signed release sequence is positive and statefully monotonic",
       "value": {
         "manifestSchemaVersion": 2,
-        "target": { "artifactKind": "walletService", "targetTriple": "x86_64-unknown-linux-gnu", "executableFormat": "elf", "walletAbiVersion": 2, "serviceProtocolVersion": 2, "providerSchemaVersion": 1, "approvalSchemaVersion": 2, "maximumFrameBytes": 1048576, "capabilities": [] },
+        "target": { "artifactKind": "walletService", "targetTriple": "x86_64-unknown-linux-gnu", "executableFormat": "elf", "walletAbiVersion": 2, "serviceProtocolVersion": 2, "providerSchemaVersion": 1, "approvalSchemaVersion": 3, "maximumFrameBytes": 1048576, "capabilities": [] },
         "source": { "repository": "https://github.com/handshake-rs/hns-wallet-rs", "commitId": "1111111111111111111111111111111111111111", "treeId": "2222222222222222222222222222222222222222", "sourceArchiveSha256": "3333333333333333333333333333333333333333333333333333333333333333", "dirty": false },
         "release": { "releaseId": "wallet-service-0.1.0-linux-x86_64", "version": "0.1.0", "artifact": "hns-wallet-service", "artifactSha256": "4444444444444444444444444444444444444444444444444444444444444444", "artifactSizeBytes": 1048576, "publishedAtUnixMs": 200000 },
         "antiRollback": { "releaseLine": "wallet-service-stable", "sequence": 0, "previousManifestSha256": null, "notBeforeUnixMs": 200000, "expiresAtUnixMs": null },
