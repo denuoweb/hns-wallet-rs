@@ -19,8 +19,9 @@ pub use shakedex_funding::{
     HnsShakedexFundingReservationState, HnsShakedexFundingScope, HnsShakedexTransactionObservation,
     activate_hns_shakedex_funding_reservations, create_hns_shakedex_funding_reservations,
     delete_hns_shakedex_funding_reservations, retain_active_hns_shakedex_funding_reservations,
-    validate_hns_shakedex_final_fee_quote_evidence, validate_hns_shakedex_funding_reservations,
-    validate_persisted_hns_shakedex_fee_quote_evidence,
+    validate_hns_shakedex_final_fee_quote_evidence,
+    validate_hns_shakedex_finalize_final_fee_quote_evidence,
+    validate_hns_shakedex_funding_reservations, validate_persisted_hns_shakedex_fee_quote_evidence,
 };
 pub use shakedex_key::{
     HnsShakedexKeyAllocation, HnsShakedexKeyAllocationError, HnsShakedexKeyAllocationRequest,

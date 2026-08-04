@@ -672,6 +672,38 @@ impl PreparedScriptFinalize {
         &self.funding_input_coins
     }
 
+    pub(crate) const fn supplied_lock(&self) -> &SuppliedShakedexLock {
+        &self.supplied_lock
+    }
+
+    pub(crate) const fn parent_transaction(&self) -> TransactionHash {
+        self.parent_transaction
+    }
+
+    pub(crate) fn parent_transaction_bytes(&self) -> &[u8] {
+        &self.parent_transaction_bytes
+    }
+
+    pub(crate) const fn parent_recipient(&self) -> &Address {
+        &self.parent_recipient
+    }
+
+    pub(crate) const fn transfer_coin(&self) -> &Coin {
+        &self.transfer_coin
+    }
+
+    pub(crate) const fn current_name_state(&self) -> &NameState {
+        &self.current_state
+    }
+
+    pub(crate) const fn renewal_block(&self) -> BlockHash {
+        self.renewal_block
+    }
+
+    pub(crate) const fn expected_recipient(&self) -> &Address {
+        &self.expected_recipient
+    }
+
     pub const fn fee_base_units(&self) -> u64 {
         self.fee_base_units
     }
@@ -851,6 +883,36 @@ pub fn verify_signed_script_finalize(
         expected_fee_base_units,
         signed_transaction,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_prepared_script_finalize(
+    supplied_lock: &SuppliedShakedexLock,
+    verified_parent: VerifiedShakedexTransfer<'_>,
+    transfer_coin: &Coin,
+    supplied_current_state: &NameState,
+    supplied_renewal_block: BlockHash,
+    expected_recipient: &Address,
+    funding_input_coins: &[Coin],
+    expected_fee_base_units: u64,
+    prepared_transaction: &[u8],
+) -> Result<(), ShakedexError> {
+    let transaction = decode_canonical_transaction(prepared_transaction)?;
+    verify_script_finalize_structure(
+        supplied_lock,
+        verified_parent.transaction(),
+        verified_parent.transaction_bytes(),
+        verified_parent.recipient(),
+        transfer_coin,
+        supplied_current_state,
+        supplied_renewal_block,
+        expected_recipient,
+        funding_input_coins,
+        expected_fee_base_units,
+        &transaction,
+        false,
+    )?;
+    require_script_authorized_funding_shape(&transaction)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -34,14 +34,14 @@ pub use transactions::{
     verify_signed_seller_recovery,
 };
 pub use value_workflow::{
-    MAX_SHAKEDEX_VALUE_WORKFLOWS, ShakedexChainObservation,
-    ShakedexReservationReleaseEvidence, ShakedexReservationReleaseReason, ShakedexValueAction,
+    MAX_SHAKEDEX_VALUE_WORKFLOWS, ShakedexChainObservation, ShakedexReservationReleaseEvidence,
+    ShakedexReservationReleaseReason, ShakedexScriptFinalizeParent, ShakedexValueAction,
     ShakedexValueStage, ShakedexValueWorkflow, StoredShakedexValueWorkflow,
-    authorize_shakedex_value_workflow, cancel_prepared_shakedex_value_workflow,
-    expire_prepared_shakedex_value_workflow, list_shakedex_value_workflows,
-    load_shakedex_value_workflow, rebroadcast_shakedex_value_workflow,
-    reconcile_shakedex_value_workflow, register_shakedex_value_approval,
-    release_terminal_shakedex_value_workflow_reservations,
+    authorize_shakedex_script_finalize_workflow, authorize_shakedex_value_workflow,
+    cancel_prepared_shakedex_value_workflow, expire_prepared_shakedex_value_workflow,
+    list_shakedex_value_workflows, load_shakedex_value_workflow,
+    rebroadcast_shakedex_value_workflow, reconcile_shakedex_value_workflow,
+    register_shakedex_value_approval, release_terminal_shakedex_value_workflow_reservations,
     save_prepared_shakedex_value_workflow, shakedex_value_workflow_id,
     submit_shakedex_value_workflow, validate_shakedex_value_workflow_reservations,
 };

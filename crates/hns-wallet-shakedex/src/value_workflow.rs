@@ -1,3 +1,5 @@
+use hns_covenants::NameState;
+use hns_primitives::{BlockHash, NameHash};
 use hns_transaction::{Address, Coin, Transaction};
 use hns_wallet_hns::{
     DEFAULT_FEE_TARGET_BLOCKS, HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED,
@@ -7,10 +9,12 @@ use hns_wallet_hns::{
     HnsShakedexFundingScope, HnsTransactionFeeQuote, HnsWalletRuntime, MempoolSnapshotBinding,
     OutpointSpendEvidence, PREPARED_ARTIFACT_LIFETIME_SECONDS, SnapshotBinding,
     TransactionEvidence, TransactionInclusion, VerifiedCurrentShakedexLock,
-    activate_hns_shakedex_funding_reservations, create_hns_shakedex_funding_reservations,
-    delete_hns_shakedex_funding_reservations, retain_active_hns_shakedex_funding_reservations,
-    validate_hns_shakedex_final_fee_quote_evidence, validate_hns_shakedex_funding_reservations,
-    validate_persisted_hns_shakedex_fee_quote_evidence,
+    VerifiedCurrentShakedexTransfer, activate_hns_shakedex_funding_reservations,
+    create_hns_shakedex_funding_reservations, delete_hns_shakedex_funding_reservations,
+    retain_active_hns_shakedex_funding_reservations,
+    validate_hns_shakedex_final_fee_quote_evidence,
+    validate_hns_shakedex_finalize_final_fee_quote_evidence,
+    validate_hns_shakedex_funding_reservations, validate_persisted_hns_shakedex_fee_quote_evidence,
 };
 use hns_wallet_store::{EntityKind, StoredWorkflow, WalletStore};
 use hns_wallet_types::{
@@ -20,14 +24,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::plans::{AddressEvidence, CoinEvidence};
-use crate::transactions::{verify_prepared_buyer_funding, verify_prepared_seller_recovery_funding};
+use crate::transactions::{
+    verify_prepared_buyer_funding, verify_prepared_script_finalize,
+    verify_prepared_seller_recovery_funding,
+};
 use crate::{
-    BuyerLockPlan, BuyerLockPlanState, PreparedBuyerFulfillment,
+    BuyerLockPlan, BuyerLockPlanState, PreparedBuyerFulfillment, PreparedScriptFinalize,
     SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, SellerAuthorizedRecovery, SellerLockPlan,
-    SellerLockPlanState, ShakedexError, SuppliedShakedexLock, verify_signed_buyer_fulfillment,
-    verify_signed_seller_recovery,
+    SellerLockPlanState, ShakedexError, SuppliedShakedexLock, VerifiedShakedexTransfer,
+    verify_signed_buyer_fulfillment, verify_signed_script_finalize, verify_signed_seller_recovery,
 };
 
+// Schema v1 gains `StructuralPlan::ScriptFinalize` as an additive tagged
+// variant: this reader continues to decode every legacy v1 row. An older
+// binary cannot decode the new variant, so downgrading a wallet after writing
+// one is unsupported and remains unqualified.
 const SHAKEDEX_VALUE_WORKFLOW_SCHEMA_VERSION: u16 = 1;
 pub const MAX_SHAKEDEX_VALUE_WORKFLOWS: usize = 10_000;
 
@@ -36,6 +47,7 @@ pub const MAX_SHAKEDEX_VALUE_WORKFLOWS: usize = 10_000;
 pub enum ShakedexValueAction {
     BuyerFulfillment,
     SellerRecovery,
+    SellerScriptFinalize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -64,8 +76,462 @@ pub enum ShakedexReservationReleaseReason {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
 enum StructuralPlan {
-    Buyer { plan: BuyerLockPlan },
-    Seller { plan: SellerLockPlan },
+    Buyer {
+        plan: BuyerLockPlan,
+    },
+    Seller {
+        plan: SellerLockPlan,
+    },
+    ScriptFinalize {
+        parent: ShakedexScriptFinalizeParent,
+        transfer: CurrentShakedexTransferEvidence,
+    },
+}
+
+/// A script-FINALIZE can only descend from a fully signed, structurally
+/// verified Shakedex TRANSFER. Keeping the exact parent action in this enum
+/// prevents a buyer fulfillment and seller recovery with similar bytes from
+/// being retyped after persistence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "parent_action")]
+pub enum ShakedexScriptFinalizeParent {
+    BuyerFulfillment { plan: BuyerLockPlan },
+    SellerRecovery { plan: SellerLockPlan },
+}
+
+/// Historical evidence captured from the ephemeral current-TRANSFER
+/// authority. It is structural identity, never restored signing authority:
+/// signing and submission must reacquire `VerifiedCurrentShakedexTransfer`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentShakedexTransferEvidence {
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+    transfer_transaction: Vec<u8>,
+    transfer_coin: CoinEvidence,
+    owner_inclusion: TransactionInclusion,
+    current_name_state: Vec<u8>,
+    renewal_block_height: u64,
+    renewal_block_hash: [u8; 32],
+}
+
+impl ShakedexScriptFinalizeParent {
+    fn validate(&self) -> Result<(), ShakedexError> {
+        match self {
+            Self::BuyerFulfillment { plan } => {
+                plan.validate()?;
+                if plan.state() != BuyerLockPlanState::FulfillmentPrepared {
+                    return Err(ShakedexError::InvalidTransition);
+                }
+                let supplied_lock = plan.supplied_lock()?;
+                let recipient = plan
+                    .fulfillment_recipient()?
+                    .ok_or(ShakedexError::InvalidEvidence)?;
+                let funding = plan
+                    .fulfillment_funding_input_coins()?
+                    .ok_or(ShakedexError::InvalidEvidence)?;
+                let fee = plan
+                    .fulfillment_fee_base_units()
+                    .ok_or(ShakedexError::InvalidEvidence)?;
+                let raw = plan
+                    .fulfillment_transaction_bytes()
+                    .ok_or(ShakedexError::InvalidEvidence)?;
+                let verified = verify_signed_buyer_fulfillment(
+                    &plan.authenticated_listing()?,
+                    &supplied_lock,
+                    &recipient,
+                    &funding,
+                    fee,
+                    raw,
+                )?;
+                if plan.fulfillment_transaction() != Some(verified.transaction()) {
+                    return Err(ShakedexError::InvalidEvidence);
+                }
+            }
+            Self::SellerRecovery { plan } => {
+                plan.validate()?;
+                if plan.state() != SellerLockPlanState::RecoveryPrepared {
+                    return Err(ShakedexError::InvalidTransition);
+                }
+                let supplied_lock = plan.supplied_lock()?;
+                let recipient = plan
+                    .recovery_recipient()?
+                    .ok_or(ShakedexError::InvalidEvidence)?;
+                let funding = plan
+                    .recovery_funding_input_coins()?
+                    .ok_or(ShakedexError::InvalidEvidence)?;
+                let fee = plan
+                    .recovery_fee_base_units()
+                    .ok_or(ShakedexError::InvalidEvidence)?;
+                let raw = plan
+                    .recovery_transaction_bytes()
+                    .ok_or(ShakedexError::InvalidEvidence)?;
+                let verified =
+                    verify_signed_seller_recovery(&supplied_lock, &recipient, &funding, fee, raw)?;
+                if plan.recovery_transaction() != Some(verified.transaction()) {
+                    return Err(ShakedexError::InvalidEvidence);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const fn workflow_id(&self) -> WorkflowId {
+        match self {
+            Self::BuyerFulfillment { plan } => plan.workflow_id(),
+            Self::SellerRecovery { plan } => plan.workflow_id(),
+        }
+    }
+
+    const fn wallet_id(&self) -> hns_wallet_types::WalletId {
+        match self {
+            Self::BuyerFulfillment { plan } => plan.wallet_id(),
+            Self::SellerRecovery { plan } => plan.wallet_id(),
+        }
+    }
+
+    const fn account_id(&self) -> hns_wallet_types::AccountId {
+        match self {
+            Self::BuyerFulfillment { plan } => plan.account_id(),
+            Self::SellerRecovery { plan } => plan.account_id(),
+        }
+    }
+
+    const fn name_hash(&self) -> ObjectHash {
+        match self {
+            Self::BuyerFulfillment { plan } => plan.name_hash(),
+            Self::SellerRecovery { plan } => plan.name_hash(),
+        }
+    }
+
+    fn supplied_lock(&self) -> Result<SuppliedShakedexLock, ShakedexError> {
+        match self {
+            Self::BuyerFulfillment { plan } => plan.supplied_lock(),
+            Self::SellerRecovery { plan } => plan.supplied_lock(),
+        }
+    }
+
+    fn transaction(&self) -> Result<TransactionHash, ShakedexError> {
+        match self {
+            Self::BuyerFulfillment { plan } => plan
+                .fulfillment_transaction()
+                .ok_or(ShakedexError::InvalidEvidence),
+            Self::SellerRecovery { plan } => plan
+                .recovery_transaction()
+                .ok_or(ShakedexError::InvalidEvidence),
+        }
+    }
+
+    fn transaction_bytes(&self) -> Result<&[u8], ShakedexError> {
+        match self {
+            Self::BuyerFulfillment { plan } => plan
+                .fulfillment_transaction_bytes()
+                .ok_or(ShakedexError::InvalidEvidence),
+            Self::SellerRecovery { plan } => plan
+                .recovery_transaction_bytes()
+                .ok_or(ShakedexError::InvalidEvidence),
+        }
+    }
+
+    fn recipient(&self) -> Result<Address, ShakedexError> {
+        match self {
+            Self::BuyerFulfillment { plan } => plan
+                .fulfillment_recipient()?
+                .ok_or(ShakedexError::InvalidEvidence),
+            Self::SellerRecovery { plan } => plan
+                .recovery_recipient()?
+                .ok_or(ShakedexError::InvalidEvidence),
+        }
+    }
+}
+
+impl CurrentShakedexTransferEvidence {
+    fn from_current(
+        parent: &ShakedexScriptFinalizeParent,
+        current: &VerifiedCurrentShakedexTransfer,
+    ) -> Result<Self, ShakedexError> {
+        parent.validate()?;
+        let evidence = Self {
+            binding: current.binding(),
+            mempool: current.mempool_binding(),
+            transfer_transaction: current
+                .transfer_transaction()
+                .encode()
+                .map_err(|_| ShakedexError::InvalidEvidence)?,
+            transfer_coin: CoinEvidence::from_coin(current.transfer_coin())?,
+            owner_inclusion: current.owner_inclusion(),
+            current_name_state: current
+                .current_name_state()
+                .encode()
+                .map_err(|_| ShakedexError::InvalidEvidence)?,
+            renewal_block_height: current.renewal_block_height(),
+            renewal_block_hash: current.renewal_block_hash(),
+        };
+        evidence.validate(parent)?;
+        evidence.validate_current(parent, current)?;
+        Ok(evidence)
+    }
+
+    fn transfer_coin(&self) -> Result<Coin, ShakedexError> {
+        self.transfer_coin.to_coin()
+    }
+
+    fn current_name_state(&self, name_hash: ObjectHash) -> Result<NameState, ShakedexError> {
+        let state = NameState::decode(
+            NameHash::new(name_hash.into_bytes()),
+            &self.current_name_state,
+        )
+        .map_err(|_| ShakedexError::InvalidEvidence)?;
+        if state.encode().map_err(|_| ShakedexError::InvalidEvidence)? != self.current_name_state {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        Ok(state)
+    }
+
+    const fn renewal_block(&self) -> BlockHash {
+        BlockHash::new(self.renewal_block_hash)
+    }
+
+    fn validate(&self, parent: &ShakedexScriptFinalizeParent) -> Result<(), ShakedexError> {
+        parent.validate()?;
+        let transaction = canonical_transaction(&self.transfer_transaction)?;
+        let transaction_hash = canonical_transaction_hash(&transaction)?;
+        let coin = self.transfer_coin()?;
+        let state = self.current_name_state(parent.name_hash())?;
+        let supplied_lock = parent.supplied_lock()?;
+        let output = transaction
+            .outputs
+            .first()
+            .ok_or(ShakedexError::InvalidEvidence)?;
+        let confirmed_height = u32::try_from(self.owner_inclusion.height)
+            .map_err(|_| ShakedexError::InvalidEvidence)?;
+        if self.transfer_transaction.as_slice() != parent.transaction_bytes()?
+            || transaction_hash != parent.transaction()?
+            || coin.outpoint.transaction_hash.as_bytes() != transaction_hash.as_bytes()
+            || coin.outpoint.index != 0
+            || coin.height.get() != confirmed_height
+            || coin.coinbase
+            || coin.value != output.value
+            || coin.address != output.address
+            || coin.covenant != output.covenant
+            || self.owner_inclusion.height > self.binding.tip.height
+            || self
+                .owner_inclusion
+                .block_hash
+                .iter()
+                .all(|byte| *byte == 0)
+            || self.binding.tip.block_hash.iter().all(|byte| *byte == 0)
+            || self.binding.tip.tree_root.iter().all(|byte| *byte == 0)
+            || self.binding.tip.median_time_past == 0
+            || self.mempool.instance_nonce.iter().all(|byte| *byte == 0)
+            || self.renewal_block_height == 0
+            || self.renewal_block_height > self.binding.tip.height
+            || self.renewal_block_hash.iter().all(|byte| *byte == 0)
+            || state.owner != coin.outpoint
+            || state.name.as_slice() != supplied_lock.descriptor().name.as_slice()
+            || state.name_hash.as_bytes() != parent.name_hash().as_bytes()
+            || state.value != coin.value
+            || u64::from(state.transfer.get()) != self.owner_inclusion.height
+            || transaction
+                .inputs
+                .first()
+                .is_none_or(|input| input.previous_output != supplied_lock.locking_coin().outpoint)
+        {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        Ok(())
+    }
+
+    fn validate_current(
+        &self,
+        parent: &ShakedexScriptFinalizeParent,
+        current: &VerifiedCurrentShakedexTransfer,
+    ) -> Result<(), ShakedexError> {
+        let supplied_lock = parent.supplied_lock()?;
+        if current.descriptor() != supplied_lock.descriptor()
+            || current.binding() != self.binding
+            || current.mempool_binding() != self.mempool
+            || current
+                .transfer_transaction()
+                .encode()
+                .map_err(|_| ShakedexError::InvalidEvidence)?
+                != self.transfer_transaction
+            || current.transfer_coin() != &self.transfer_coin()?
+            || current.owner_inclusion() != self.owner_inclusion
+            || current.current_name_state() != &self.current_name_state(parent.name_hash())?
+            || current.renewal_block_height() != self.renewal_block_height
+            || current.renewal_block_hash() != self.renewal_block_hash
+        {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_prepared_script_finalize_for_parent(
+    parent: &ShakedexScriptFinalizeParent,
+    transfer_coin: &Coin,
+    current_state: &NameState,
+    renewal_block: BlockHash,
+    recipient: &Address,
+    funding: &[Coin],
+    fee: u64,
+    prepared: &[u8],
+) -> Result<(), ShakedexError> {
+    match parent {
+        ShakedexScriptFinalizeParent::BuyerFulfillment { plan } => {
+            let supplied_lock = plan.supplied_lock()?;
+            let parent_recipient = plan
+                .fulfillment_recipient()?
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_funding = plan
+                .fulfillment_funding_input_coins()?
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_fee = plan
+                .fulfillment_fee_base_units()
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_raw = plan
+                .fulfillment_transaction_bytes()
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let verified_parent = verify_signed_buyer_fulfillment(
+                &plan.authenticated_listing()?,
+                &supplied_lock,
+                &parent_recipient,
+                &parent_funding,
+                parent_fee,
+                parent_raw,
+            )?;
+            verify_prepared_script_finalize(
+                &supplied_lock,
+                VerifiedShakedexTransfer::Fulfillment(&verified_parent),
+                transfer_coin,
+                current_state,
+                renewal_block,
+                recipient,
+                funding,
+                fee,
+                prepared,
+            )
+        }
+        ShakedexScriptFinalizeParent::SellerRecovery { plan } => {
+            let supplied_lock = plan.supplied_lock()?;
+            let parent_recipient = plan
+                .recovery_recipient()?
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_funding = plan
+                .recovery_funding_input_coins()?
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_fee = plan
+                .recovery_fee_base_units()
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_raw = plan
+                .recovery_transaction_bytes()
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let verified_parent = verify_signed_seller_recovery(
+                &supplied_lock,
+                &parent_recipient,
+                &parent_funding,
+                parent_fee,
+                parent_raw,
+            )?;
+            verify_prepared_script_finalize(
+                &supplied_lock,
+                VerifiedShakedexTransfer::Recovery(&verified_parent),
+                transfer_coin,
+                current_state,
+                renewal_block,
+                recipient,
+                funding,
+                fee,
+                prepared,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_signed_script_finalize_for_parent(
+    parent: &ShakedexScriptFinalizeParent,
+    transfer_coin: &Coin,
+    current_state: &NameState,
+    renewal_block: BlockHash,
+    recipient: &Address,
+    funding: &[Coin],
+    fee: u64,
+    signed: &[u8],
+) -> Result<TransactionHash, ShakedexError> {
+    match parent {
+        ShakedexScriptFinalizeParent::BuyerFulfillment { plan } => {
+            let supplied_lock = plan.supplied_lock()?;
+            let parent_recipient = plan
+                .fulfillment_recipient()?
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_funding = plan
+                .fulfillment_funding_input_coins()?
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_fee = plan
+                .fulfillment_fee_base_units()
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_raw = plan
+                .fulfillment_transaction_bytes()
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let verified_parent = verify_signed_buyer_fulfillment(
+                &plan.authenticated_listing()?,
+                &supplied_lock,
+                &parent_recipient,
+                &parent_funding,
+                parent_fee,
+                parent_raw,
+            )?;
+            verify_signed_script_finalize(
+                &supplied_lock,
+                VerifiedShakedexTransfer::Fulfillment(&verified_parent),
+                transfer_coin,
+                current_state,
+                renewal_block,
+                recipient,
+                funding,
+                fee,
+                signed,
+            )
+            .map(|verified| verified.transaction())
+        }
+        ShakedexScriptFinalizeParent::SellerRecovery { plan } => {
+            let supplied_lock = plan.supplied_lock()?;
+            let parent_recipient = plan
+                .recovery_recipient()?
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_funding = plan
+                .recovery_funding_input_coins()?
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_fee = plan
+                .recovery_fee_base_units()
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let parent_raw = plan
+                .recovery_transaction_bytes()
+                .ok_or(ShakedexError::InvalidEvidence)?;
+            let verified_parent = verify_signed_seller_recovery(
+                &supplied_lock,
+                &parent_recipient,
+                &parent_funding,
+                parent_fee,
+                parent_raw,
+            )?;
+            verify_signed_script_finalize(
+                &supplied_lock,
+                VerifiedShakedexTransfer::Recovery(&verified_parent),
+                transfer_coin,
+                current_state,
+                renewal_block,
+                recipient,
+                funding,
+                fee,
+                signed,
+            )
+            .map(|verified| verified.transaction())
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -240,6 +706,65 @@ impl ShakedexValueWorkflow {
         )
     }
 
+    /// Persist a script-controlled FINALIZE only from the distinct ephemeral
+    /// current-TRANSFER authority and a fully signed canonical Shakedex parent
+    /// action. The historical snapshot is retained as immutable evidence, but
+    /// it is never treated as authority after restart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepared_seller_script_finalize(
+        parent: ShakedexScriptFinalizeParent,
+        current_transfer: &VerifiedCurrentShakedexTransfer,
+        prepared: &PreparedScriptFinalize,
+        funding_reservation: HnsShakedexFundingReservation,
+        maximum_fee: BaseUnits,
+        minimum_confirmations: u32,
+        expires_at_unix: u64,
+    ) -> Result<Self, ShakedexError> {
+        parent.validate()?;
+        let supplied_lock = parent.supplied_lock()?;
+        let parent_recipient = parent.recipient()?;
+        let renewal_block = BlockHash::new(current_transfer.renewal_block_hash());
+        if prepared.supplied_lock().descriptor() != supplied_lock.descriptor()
+            || prepared.supplied_lock().locking_coin() != supplied_lock.locking_coin()
+            || prepared.parent_transaction() != parent.transaction()?
+            || prepared.parent_transaction_bytes() != parent.transaction_bytes()?
+            || prepared.parent_recipient() != &parent_recipient
+            || prepared.transfer_coin() != current_transfer.transfer_coin()
+            || prepared.current_name_state() != current_transfer.current_name_state()
+            || prepared.renewal_block() != renewal_block
+            || prepared.expected_recipient() != &parent_recipient
+        {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        let transfer = CurrentShakedexTransferEvidence::from_current(&parent, current_transfer)?;
+        verify_prepared_script_finalize_for_parent(
+            &parent,
+            current_transfer.transfer_coin(),
+            current_transfer.current_name_state(),
+            renewal_block,
+            prepared.expected_recipient(),
+            prepared.funding_input_coins(),
+            prepared.fee_base_units(),
+            prepared.transaction_bytes(),
+        )?;
+        let value_base_units =
+            BaseUnits::new(u128::from(current_transfer.transfer_coin().value.get()));
+        Self::prepared(
+            ShakedexValueAction::SellerScriptFinalize,
+            StructuralPlan::ScriptFinalize { parent, transfer },
+            funding_reservation,
+            current_transfer.transfer_coin(),
+            prepared.funding_input_coins(),
+            prepared.expected_recipient(),
+            value_base_units,
+            prepared.fee_base_units(),
+            maximum_fee,
+            minimum_confirmations,
+            prepared.transaction_bytes(),
+            expires_at_unix,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepared(
         action: ShakedexValueAction,
@@ -258,6 +783,7 @@ impl ShakedexValueWorkflow {
         let parent_workflow_id = match &structural_plan {
             StructuralPlan::Buyer { plan } => plan.workflow_id(),
             StructuralPlan::Seller { plan } => plan.workflow_id(),
+            StructuralPlan::ScriptFinalize { parent, .. } => parent.workflow_id(),
         };
         let workflow_id = shakedex_value_workflow_id(parent_workflow_id, action);
         let structural_plan_commitment = structural_plan_commitment(&structural_plan)?;
@@ -303,6 +829,7 @@ impl ShakedexValueWorkflow {
         match &self.structural_plan {
             StructuralPlan::Buyer { plan } => plan.workflow_id(),
             StructuralPlan::Seller { plan } => plan.workflow_id(),
+            StructuralPlan::ScriptFinalize { parent, .. } => parent.workflow_id(),
         }
     }
 
@@ -400,6 +927,9 @@ impl ShakedexValueWorkflow {
         match &self.structural_plan {
             StructuralPlan::Buyer { plan } => (plan.wallet_id(), plan.account_id()),
             StructuralPlan::Seller { plan } => (plan.wallet_id(), plan.account_id()),
+            StructuralPlan::ScriptFinalize { parent, .. } => {
+                (parent.wallet_id(), parent.account_id())
+            }
         }
     }
 
@@ -407,6 +937,7 @@ impl ShakedexValueWorkflow {
         match &self.structural_plan {
             StructuralPlan::Buyer { plan } => plan.name_hash(),
             StructuralPlan::Seller { plan } => plan.name_hash(),
+            StructuralPlan::ScriptFinalize { parent, .. } => parent.name_hash(),
         }
     }
 
@@ -414,6 +945,7 @@ impl ShakedexValueWorkflow {
         match &self.structural_plan {
             StructuralPlan::Buyer { plan } => plan.supplied_lock(),
             StructuralPlan::Seller { plan } => plan.supplied_lock(),
+            StructuralPlan::ScriptFinalize { parent, .. } => parent.supplied_lock(),
         }
     }
 
@@ -637,12 +1169,8 @@ impl ShakedexValueWorkflow {
         }
         let transaction = self.transaction().ok_or(ShakedexError::InvalidTransition)?;
         validate_transaction_evidence(self, &transaction_evidence)?;
-        let competing_spenders = validate_spend_evidence(
-            self,
-            &spend_evidence,
-            transaction,
-            &transaction_evidence,
-        )?;
+        let competing_spenders =
+            validate_spend_evidence(self, &spend_evidence, transaction, &transaction_evidence)?;
         let reason = terminal_release_reason(
             transaction,
             self.minimum_confirmations,
@@ -650,11 +1178,7 @@ impl ShakedexValueWorkflow {
             &spend_evidence,
             &competing_spenders,
         )?;
-        let mut next = self.reconcile(
-            &transaction_evidence,
-            &spend_evidence,
-            observed_at_unix,
-        )?;
+        let mut next = self.reconcile(&transaction_evidence, &spend_evidence, observed_at_unix)?;
         if !matches!(
             (reason, next.stage),
             (
@@ -683,6 +1207,9 @@ impl ShakedexValueWorkflow {
         &self,
         current_lock: &VerifiedCurrentShakedexLock,
     ) -> Result<(), ShakedexError> {
+        if self.action == ShakedexValueAction::SellerScriptFinalize {
+            return Err(ShakedexError::InvalidTransition);
+        }
         let supplied = self.supplied_lock()?;
         if current_lock.descriptor() != supplied.descriptor()
             || current_lock.locking_coin() != supplied.locking_coin()
@@ -690,6 +1217,38 @@ impl ShakedexValueWorkflow {
             return Err(ShakedexError::InvalidEvidence);
         }
         Ok(())
+    }
+
+    pub fn validate_current_transfer(
+        &self,
+        current_transfer: &VerifiedCurrentShakedexTransfer,
+    ) -> Result<(), ShakedexError> {
+        let StructuralPlan::ScriptFinalize { parent, transfer } = &self.structural_plan else {
+            return Err(ShakedexError::InvalidTransition);
+        };
+        if self.action != ShakedexValueAction::SellerScriptFinalize {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        transfer.validate_current(parent, current_transfer)
+    }
+
+    fn script_finalize_transfer_identity(
+        &self,
+    ) -> Result<
+        (
+            &ShakedexScriptFinalizeParent,
+            &CurrentShakedexTransferEvidence,
+        ),
+        ShakedexError,
+    > {
+        match &self.structural_plan {
+            StructuralPlan::ScriptFinalize { parent, transfer }
+                if self.action == ShakedexValueAction::SellerScriptFinalize =>
+            {
+                Ok((parent, transfer))
+            }
+            _ => Err(ShakedexError::InvalidTransition),
+        }
     }
 
     pub fn validate(&self) -> Result<(), ShakedexError> {
@@ -715,6 +1274,9 @@ impl ShakedexValueWorkflow {
         let expected_purpose = match self.action {
             ShakedexValueAction::BuyerFulfillment => HnsShakedexFundingPurpose::BuyerFulfillment,
             ShakedexValueAction::SellerRecovery => HnsShakedexFundingPurpose::SellerRecovery,
+            ShakedexValueAction::SellerScriptFinalize => {
+                HnsShakedexFundingPurpose::SellerScriptFinalize
+            }
         };
         let source_outpoint = hns_wallet_hns::HnsOutpoint {
             transaction: TransactionHash::new(plan_source.outpoint.transaction_hash.into_bytes()),
@@ -1035,6 +1597,17 @@ impl ShakedexValueWorkflow {
                     BaseUnits::new(u128::from(source.value.get())),
                 ))
             }
+            StructuralPlan::ScriptFinalize { parent, transfer } => {
+                parent.validate()?;
+                transfer.validate(parent)?;
+                let source = transfer.transfer_coin()?;
+                Ok((
+                    parent.workflow_id(),
+                    ShakedexValueAction::SellerScriptFinalize,
+                    source.clone(),
+                    BaseUnits::new(u128::from(source.value.get())),
+                ))
+            }
         }
     }
 
@@ -1059,6 +1632,20 @@ impl ShakedexValueWorkflow {
                 fee,
                 &self.prepared_transaction,
             ),
+            StructuralPlan::ScriptFinalize { parent, transfer } => {
+                let source = transfer.transfer_coin()?;
+                let state = transfer.current_name_state(parent.name_hash())?;
+                verify_prepared_script_finalize_for_parent(
+                    parent,
+                    &source,
+                    &state,
+                    transfer.renewal_block(),
+                    &recipient,
+                    &funding,
+                    fee,
+                    &self.prepared_transaction,
+                )
+            }
         }
     }
 
@@ -1086,6 +1673,20 @@ impl ShakedexValueWorkflow {
                 signed,
             )
             .map(|verified| verified.transaction()),
+            StructuralPlan::ScriptFinalize { parent, transfer } => {
+                let source = transfer.transfer_coin()?;
+                let state = transfer.current_name_state(parent.name_hash())?;
+                verify_signed_script_finalize_for_parent(
+                    parent,
+                    &source,
+                    &state,
+                    transfer.renewal_block(),
+                    &recipient,
+                    &funding,
+                    fee,
+                    signed,
+                )
+            }
         }
     }
 
@@ -1157,6 +1758,7 @@ pub fn shakedex_value_workflow_id(
     hasher.update([match action {
         ShakedexValueAction::BuyerFulfillment => 0,
         ShakedexValueAction::SellerRecovery => 1,
+        ShakedexValueAction::SellerScriptFinalize => 2,
     }]);
     let digest: [u8; 32] = hasher.finalize().into();
     let mut id = [0_u8; 16];
@@ -1191,18 +1793,32 @@ pub fn save_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     if scope.wallet_id() != wallet_id || scope.account_id() != account_id {
         return Err(ShakedexError::InvalidEvidence);
     }
-    let supplied_lock = workflow.supplied_lock()?;
-    let current_lock = runtime.verify_current_shakedex_lock(
-        &supplied_lock.descriptor().name,
-        supplied_lock.descriptor().seller_public_key,
-    )?;
-    workflow.validate_current_lock(&current_lock)?;
-    if runtime.validate_current_shakedex_funding_reservation(
-        &current_lock,
-        workflow.funding_reservation(),
-    )? != *scope
-    {
-        return Err(ShakedexError::InvalidEvidence);
+    match workflow.action {
+        ShakedexValueAction::SellerScriptFinalize => {
+            let current_transfer = reacquire_current_script_finalize_transfer(runtime, workflow)?;
+            if runtime.validate_current_shakedex_finalize_funding_reservation(
+                &current_transfer,
+                workflow.funding_reservation(),
+            )? != *scope
+            {
+                return Err(ShakedexError::InvalidEvidence);
+            }
+        }
+        ShakedexValueAction::BuyerFulfillment | ShakedexValueAction::SellerRecovery => {
+            let supplied_lock = workflow.supplied_lock()?;
+            let current_lock = runtime.verify_current_shakedex_lock(
+                &supplied_lock.descriptor().name,
+                supplied_lock.descriptor().seller_public_key,
+            )?;
+            workflow.validate_current_lock(&current_lock)?;
+            if runtime.validate_current_shakedex_funding_reservation(
+                &current_lock,
+                workflow.funding_reservation(),
+            )? != *scope
+            {
+                return Err(ShakedexError::InvalidEvidence);
+            }
+        }
     }
     if let Some(current) = load_shakedex_value_workflow(store, workflow.workflow_id)? {
         if current.workflow != *workflow {
@@ -1279,6 +1895,9 @@ pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     approval_id: ApprovalId,
     origin: &str,
 ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+    if stored.workflow.action == ShakedexValueAction::SellerScriptFinalize {
+        return Err(ShakedexError::InvalidTransition);
+    }
     require_value_runtime_release_qualified()?;
     let authorized_at_unix = runtime.shakedex_now_unix()?;
     validate_runtime_scope(runtime, scope)?;
@@ -1337,6 +1956,133 @@ pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     )?;
     validate_hns_shakedex_final_fee_quote_evidence(
         current_lock,
+        stored.workflow.funding_reservation(),
+        &signed_transaction,
+        &quote,
+        stored.workflow.fee_base_units,
+        stored.workflow.maximum_fee,
+    )?;
+    require_exact_stored_value_workflow(store, stored)?;
+    let commit_now = runtime.shakedex_now_unix()?;
+    if commit_now < authorized_at_unix
+        || commit_now >= stored.workflow.expires_at_unix
+        || commit_now >= pending_approval.expires_at_unix
+    {
+        return Err(ShakedexError::ApprovalRequired);
+    }
+    let next = stored
+        .workflow
+        .authorize(approval_id, signed_transaction, quote, commit_now)?;
+    let batch = activate_hns_shakedex_funding_reservations(
+        store,
+        scope,
+        next.funding_reservation(),
+        commit_now,
+    )?;
+    let revision = store
+        .consume_approval_and_save_workflow_with_entity_batch(
+            &pending_approval,
+            commit_now,
+            next.workflow_id,
+            WorkflowKind::ShakedexValue,
+            stored.revision,
+            &next,
+            true,
+            EntityKind::InputReservation,
+            batch.saves(),
+            batch.deletes(),
+        )?
+        .ok_or(ShakedexError::ApprovalRequired)?;
+    validate_hns_shakedex_funding_reservations(
+        store,
+        scope,
+        next.funding_reservation(),
+        HnsShakedexFundingReservationState::Active,
+    )?;
+    Ok(StoredShakedexValueWorkflow {
+        revision,
+        workflow: next,
+    })
+}
+
+/// Authorize the exact script-FINALIZE funding suffix through current
+/// TRANSFER authority. This intentionally does not accept the lock authority
+/// used by buyer fulfillment and seller recovery.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_shakedex_script_finalize_workflow<B: HnsBackend, C: HnsClock>(
+    store: &mut WalletStore,
+    runtime: &HnsWalletRuntime<B, C>,
+    scope: &HnsShakedexFundingScope,
+    stored: &StoredShakedexValueWorkflow,
+    current_transfer: &VerifiedCurrentShakedexTransfer,
+    approval_id: ApprovalId,
+    origin: &str,
+) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+    if stored.workflow.action != ShakedexValueAction::SellerScriptFinalize {
+        return Err(ShakedexError::InvalidTransition);
+    }
+    require_value_runtime_release_qualified()?;
+    let authorized_at_unix = runtime.shakedex_now_unix()?;
+    validate_runtime_scope(runtime, scope)?;
+    stored.workflow.validate()?;
+    require_exact_stored_value_workflow(store, stored)?;
+    stored
+        .workflow
+        .validate_current_transfer(current_transfer)?;
+    if stored.workflow.stage != ShakedexValueStage::Prepared
+        || authorized_at_unix >= stored.workflow.expires_at_unix
+    {
+        return Err(ShakedexError::InvalidTransition);
+    }
+    let (wallet_id, account_id) = stored.workflow.wallet_and_account();
+    if scope.wallet_id() != wallet_id || scope.account_id() != account_id {
+        return Err(ShakedexError::InvalidEvidence);
+    }
+    validate_hns_shakedex_funding_reservations(
+        store,
+        scope,
+        stored.workflow.funding_reservation(),
+        HnsShakedexFundingReservationState::Prepared,
+    )?;
+    let approval = store
+        .get_pending_approval(approval_id, authorized_at_unix)?
+        .ok_or(ShakedexError::ApprovalRequired)?;
+    let commitment = stored.workflow.approval_commitment(stored.revision)?;
+    if approval.origin != origin || approval.request_json.as_slice() != commitment {
+        return Err(ShakedexError::ApprovalRequired);
+    }
+    let expectation = HnsShakedexFundingApprovalExpectation::new(
+        approval_id,
+        origin.to_owned(),
+        commitment,
+        approval.expires_at_unix,
+    )?;
+    // The runtime reacquires and byte-compares this exact transfer immediately
+    // before invoking any ordinary-wallet signing key.
+    let authorization = runtime.authorize_shakedex_finalize_funding_suffix(
+        current_transfer,
+        stored.workflow.funding_reservation(),
+        &stored.workflow.prepared_transaction,
+        &expectation,
+    )?;
+    let (signed_transaction, pending_approval) = authorization.into_parts();
+    if pending_approval.id != approval.id
+        || pending_approval.origin != approval.origin
+        || pending_approval.request_json.as_slice() != approval.request_json.as_slice()
+        || pending_approval.expires_at_unix != approval.expires_at_unix
+    {
+        return Err(ShakedexError::ApprovalRequired);
+    }
+    let input_coins = stored.workflow.all_input_coins()?;
+    let quote = runtime.backend().quote_transaction_fee(
+        &signed_transaction,
+        &input_coins,
+        DEFAULT_FEE_TARGET_BLOCKS,
+        current_transfer.binding(),
+        current_transfer.mempool_binding(),
+    )?;
+    validate_hns_shakedex_finalize_final_fee_quote_evidence(
+        current_transfer,
         stored.workflow.funding_reservation(),
         &signed_transaction,
         &quote,
@@ -1487,43 +2233,78 @@ fn submit_value_workflow<B: HnsBackend, C: HnsClock>(
     stored.workflow.validate()?;
     validate_runtime_scope(runtime, scope)?;
     require_exact_stored_value_workflow(store, stored)?;
-    let supplied_lock = stored.workflow.supplied_lock()?;
-    let current_lock = runtime.verify_current_shakedex_lock(
-        &supplied_lock.descriptor().name,
-        supplied_lock.descriptor().seller_public_key,
-    )?;
-    stored.workflow.validate_current_lock(&current_lock)?;
     validate_shakedex_value_workflow_reservations(store, scope, stored)?;
     let signed = stored
         .workflow
         .signed_transaction()
         .ok_or(ShakedexError::InvalidTransition)?;
     let input_coins = stored.workflow.all_input_coins()?;
-    let refreshed_quote = runtime.backend().quote_transaction_fee(
-        signed,
-        &input_coins,
-        DEFAULT_FEE_TARGET_BLOCKS,
-        current_lock.binding(),
-        current_lock.mempool_binding(),
-    )?;
-    validate_hns_shakedex_final_fee_quote_evidence(
-        &current_lock,
-        stored.workflow.funding_reservation(),
-        signed,
-        &refreshed_quote,
-        stored.workflow.fee_base_units,
-        stored.workflow.maximum_fee,
-    )?;
-    let fence_lock = runtime.verify_current_shakedex_lock(
-        &supplied_lock.descriptor().name,
-        supplied_lock.descriptor().seller_public_key,
-    )?;
-    stored.workflow.validate_current_lock(&fence_lock)?;
-    if fence_lock.binding() != refreshed_quote.binding
-        || fence_lock.mempool_binding() != refreshed_quote.mempool
-    {
-        return Err(ShakedexError::InvalidEvidence);
-    }
+    let refreshed_quote = match stored.workflow.action {
+        ShakedexValueAction::SellerScriptFinalize => {
+            let current_transfer =
+                reacquire_current_script_finalize_transfer(runtime, &stored.workflow)?;
+            let quote = runtime.backend().quote_transaction_fee(
+                signed,
+                &input_coins,
+                DEFAULT_FEE_TARGET_BLOCKS,
+                current_transfer.binding(),
+                current_transfer.mempool_binding(),
+            )?;
+            validate_hns_shakedex_finalize_final_fee_quote_evidence(
+                &current_transfer,
+                stored.workflow.funding_reservation(),
+                signed,
+                &quote,
+                stored.workflow.fee_base_units,
+                stored.workflow.maximum_fee,
+            )?;
+            // A second acquisition immediately before the durable broadcast
+            // fence prevents a reorged/replaced TRANSFER from inheriting the
+            // historical approval or fee quote.
+            let fence_transfer =
+                reacquire_current_script_finalize_transfer(runtime, &stored.workflow)?;
+            if fence_transfer.binding() != quote.binding
+                || fence_transfer.mempool_binding() != quote.mempool
+            {
+                return Err(ShakedexError::InvalidEvidence);
+            }
+            quote
+        }
+        ShakedexValueAction::BuyerFulfillment | ShakedexValueAction::SellerRecovery => {
+            let supplied_lock = stored.workflow.supplied_lock()?;
+            let current_lock = runtime.verify_current_shakedex_lock(
+                &supplied_lock.descriptor().name,
+                supplied_lock.descriptor().seller_public_key,
+            )?;
+            stored.workflow.validate_current_lock(&current_lock)?;
+            let quote = runtime.backend().quote_transaction_fee(
+                signed,
+                &input_coins,
+                DEFAULT_FEE_TARGET_BLOCKS,
+                current_lock.binding(),
+                current_lock.mempool_binding(),
+            )?;
+            validate_hns_shakedex_final_fee_quote_evidence(
+                &current_lock,
+                stored.workflow.funding_reservation(),
+                signed,
+                &quote,
+                stored.workflow.fee_base_units,
+                stored.workflow.maximum_fee,
+            )?;
+            let fence_lock = runtime.verify_current_shakedex_lock(
+                &supplied_lock.descriptor().name,
+                supplied_lock.descriptor().seller_public_key,
+            )?;
+            stored.workflow.validate_current_lock(&fence_lock)?;
+            if fence_lock.binding() != quote.binding
+                || fence_lock.mempool_binding() != quote.mempool
+            {
+                return Err(ShakedexError::InvalidEvidence);
+            }
+            quote
+        }
+    };
     let submission_started_at_unix = runtime.shakedex_now_unix()?;
     let fenced = stored
         .workflow
@@ -1588,10 +2369,7 @@ fn require_value_runtime_release_qualified() -> Result<(), ShakedexError> {
 /// spender, has reached the workflow's already-approved finality threshold.
 /// This recovery operation is intentionally available while value entrypoints
 /// remain gated: it cannot sign or broadcast new bytes.
-pub fn release_terminal_shakedex_value_workflow_reservations<
-    B: HnsBackend,
-    C: HnsClock,
->(
+pub fn release_terminal_shakedex_value_workflow_reservations<B: HnsBackend, C: HnsClock>(
     store: &mut WalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
@@ -1686,8 +2464,7 @@ pub fn reconcile_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
 ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
     validate_runtime_scope(runtime, scope)?;
     require_exact_stored_value_workflow(store, stored)?;
-    let reservations_released =
-        stored.workflow.stage == ShakedexValueStage::ReservationsReleased;
+    let reservations_released = stored.workflow.stage == ShakedexValueStage::ReservationsReleased;
     validate_hns_shakedex_funding_reservations(
         store,
         scope,
@@ -1820,9 +2597,7 @@ pub fn validate_shakedex_value_workflow_reservations(
         ShakedexValueStage::Prepared => HnsShakedexFundingReservationState::Prepared,
         ShakedexValueStage::Expired
         | ShakedexValueStage::Cancelled
-        | ShakedexValueStage::ReservationsReleased => {
-            HnsShakedexFundingReservationState::Released
-        }
+        | ShakedexValueStage::ReservationsReleased => HnsShakedexFundingReservationState::Released,
         ShakedexValueStage::Authorized
         | ShakedexValueStage::RequiresRebroadcast
         | ShakedexValueStage::Broadcast
@@ -1848,6 +2623,18 @@ fn validate_runtime_scope<B: HnsBackend, C: HnsClock>(
         return Err(ShakedexError::InvalidEvidence);
     }
     Ok(())
+}
+
+fn reacquire_current_script_finalize_transfer<B: HnsBackend, C: HnsClock>(
+    runtime: &HnsWalletRuntime<B, C>,
+    workflow: &ShakedexValueWorkflow,
+) -> Result<VerifiedCurrentShakedexTransfer, ShakedexError> {
+    let (parent, _) = workflow.script_finalize_transfer_identity()?;
+    let supplied_lock = parent.supplied_lock()?;
+    let current = runtime
+        .verify_current_shakedex_transfer(supplied_lock.descriptor(), parent.transaction()?)?;
+    workflow.validate_current_transfer(&current)?;
+    Ok(current)
 }
 
 fn require_exact_stored_value_workflow(
@@ -2052,6 +2839,13 @@ fn canonical_transaction(raw: &[u8]) -> Result<Transaction, ShakedexError> {
     Ok(transaction)
 }
 
+fn canonical_transaction_hash(transaction: &Transaction) -> Result<TransactionHash, ShakedexError> {
+    transaction
+        .transaction_hash()
+        .map(|hash| TransactionHash::new(hash.into_bytes()))
+        .map_err(|_| ShakedexError::InvalidEvidence)
+}
+
 fn require_only_funding_witness_changes(
     prepared_raw: &[u8],
     signed_raw: &[u8],
@@ -2235,19 +3029,20 @@ fn terminal_release_reason(
         let inclusion = transaction_evidence
             .inclusion
             .ok_or(ShakedexError::InvalidEvidence)?;
-        let every_input_spent_by_exact_transaction = spend_evidence
-            .entries
-            .iter()
-            .enumerate()
-            .all(|(position, entry)| {
-                entry.spending.is_some_and(|spending| {
-                    spending.transaction == expected_transaction
-                        && usize::try_from(spending.input_position)
-                            .is_ok_and(|candidate| candidate == position)
-                        && spending.height == inclusion.height
-                        && spending.block_hash == inclusion.block_hash
-                })
-            });
+        let every_input_spent_by_exact_transaction =
+            spend_evidence
+                .entries
+                .iter()
+                .enumerate()
+                .all(|(position, entry)| {
+                    entry.spending.is_some_and(|spending| {
+                        spending.transaction == expected_transaction
+                            && usize::try_from(spending.input_position)
+                                .is_ok_and(|candidate| candidate == position)
+                            && spending.height == inclusion.height
+                            && spending.block_hash == inclusion.block_hash
+                    })
+                });
         if every_input_spent_by_exact_transaction {
             return Ok(ShakedexReservationReleaseReason::ExactTransactionConfirmed);
         }
@@ -2264,7 +3059,9 @@ fn terminal_release_reason(
     let final_competitor = spend_evidence.entries.iter().any(|entry| {
         entry.spending.is_some_and(|spending| {
             spending.transaction != expected_transaction
-                && competing_spenders.binary_search(&spending.transaction).is_ok()
+                && competing_spenders
+                    .binary_search(&spending.transaction)
+                    .is_ok()
                 && tip_height
                     .checked_sub(spending.height)
                     .and_then(|depth| depth.checked_add(1))
@@ -2303,9 +3100,121 @@ fn audit_terminal_release_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_wallet_hns::{
-        ChainTip, HnsOutpoint, OutpointSpendEntry, SpendingTransactionEvidence, TransactionStatus,
+    use blake2::Blake2bVar;
+    use blake2::digest::VariableOutput;
+    use hns_covenants::{Covenant, FinalizeCovenant, hash_name};
+    use hns_primitives::{Dollarydoos, Height, TransactionHash as CanonicalTransactionHash};
+    use hns_script::{
+        OP_BLAKE160, OP_CHECKSIG, OP_DUP, OP_EQUALVERIFY, SIGHASH_ALL, signature_hash,
     };
+    use hns_swap::{FixedPriceListing, NetworkBinding, SwapProof, lock_script_hash};
+    use hns_transaction::{Input, Outpoint, Output, Witness};
+    use hns_wallet_hns::{
+        ChainTip, HnsOutpoint, OutpointSpendEntry, SpendingTransactionEvidence, TrackedHnsCoin,
+        TransactionStatus, WalletCoin,
+    };
+    #[cfg(unix)]
+    use hns_wallet_hns::{
+        HnsNameAction, HnsNetwork, HnsRuntimeConfig, HnsWalletError, SystemClock,
+    };
+    use hns_wallet_types::{AccountId, DerivationReference, KeyRole, WalletId};
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use k256::ecdsa::{Signature, SigningKey};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const PRODUCTION_NEXT_ACTIVE_TIME: u64 = 1_800_000_200;
+    const PRODUCTION_NEXT_FEE: u64 = 1_000;
+
+    #[cfg(unix)]
+    struct ProductionNextUnusedBackend;
+
+    #[cfg(unix)]
+    impl HnsBackend for ProductionNextUnusedBackend {
+        fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn get_block_hash(
+            &self,
+            _height: u64,
+            _binding: SnapshotBinding,
+        ) -> Result<hns_wallet_hns::BlockHashEvidence, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn get_confirmed_wallet_page(
+            &self,
+            _request: hns_wallet_hns::ConfirmedWalletPageRequest<'_>,
+        ) -> Result<hns_wallet_hns::ConfirmedWalletPage, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn get_mempool_wallet_page(
+            &self,
+            _request: hns_wallet_hns::MempoolWalletPageRequest<'_>,
+        ) -> Result<hns_wallet_hns::MempoolWalletPage, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn get_transaction_evidence(
+            &self,
+            _txid: TransactionHash,
+            _binding: SnapshotBinding,
+            _expected_mempool: Option<MempoolSnapshotBinding>,
+        ) -> Result<TransactionEvidence, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn get_outpoint_spend_evidence(
+            &self,
+            _outpoints: &[HnsOutpoint],
+            _binding: SnapshotBinding,
+        ) -> Result<OutpointSpendEvidence, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn broadcast_transaction(&self, _raw: &[u8]) -> Result<TransactionHash, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn quote_transaction_fee(
+            &self,
+            _raw: &[u8],
+            _input_coins: &[Coin],
+            _target_blocks: u16,
+            _binding: SnapshotBinding,
+            _expected_mempool: MempoolSnapshotBinding,
+        ) -> Result<HnsTransactionFeeQuote, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn estimate_fee_rate(&self, _target_blocks: u16) -> Result<BaseUnits, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn get_name_evidence(
+            &self,
+            _name_hash: [u8; 32],
+            _binding: SnapshotBinding,
+        ) -> Result<hns_wallet_hns::NameEvidence, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
+        fn get_name_action_context(
+            &self,
+            _action: HnsNameAction,
+            _name_hash: [u8; 32],
+            _binding: SnapshotBinding,
+            _expected_mempool: MempoolSnapshotBinding,
+        ) -> Result<hns_wallet_hns::NameActionContextEvidence, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+    }
 
     fn binding(epoch: u64, height: u64, hash: u8) -> SnapshotBinding {
         SnapshotBinding {
@@ -2319,14 +3228,681 @@ mod tests {
         }
     }
 
+    fn production_next_public_key_hash(key: &SigningKey) -> ([u8; 33], [u8; 20]) {
+        let public_key: [u8; 33] = key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .expect("compressed public key");
+        let mut hasher = Blake2bVar::new(20).expect("Blake2b-160");
+        blake2::digest::Update::update(&mut hasher, &public_key);
+        let mut program = [0_u8; 20];
+        hasher
+            .finalize_variable(&mut program)
+            .expect("Blake2b-160 output");
+        (public_key, program)
+    }
+
+    fn production_next_funding_coin(tag: u8, key: &SigningKey, value: u64) -> Coin {
+        let (_, program) = production_next_public_key_hash(key);
+        Coin {
+            outpoint: Outpoint {
+                transaction_hash: CanonicalTransactionHash::new([tag; 32]),
+                index: u32::from(tag),
+            },
+            value: Dollarydoos::new(value),
+            height: Height::new(150),
+            coinbase: false,
+            address: Address::new(0, program.to_vec()).expect("funding address"),
+            covenant: Covenant::default(),
+        }
+    }
+
+    fn production_next_unsigned_input(coin: &Coin) -> Input {
+        Input {
+            previous_output: coin.outpoint,
+            sequence: u32::MAX,
+            witness: Witness::default(),
+        }
+    }
+
+    fn production_next_ordinary_output(address: Address, value: u64) -> Output {
+        Output {
+            value: Dollarydoos::new(value),
+            address,
+            covenant: Covenant::default(),
+        }
+    }
+
+    fn production_next_sign_p2pkh(
+        transaction: &mut Transaction,
+        index: usize,
+        coin: &Coin,
+        key: &SigningKey,
+    ) {
+        let (public_key, program) = production_next_public_key_hash(key);
+        let mut script = Vec::with_capacity(25);
+        script.extend_from_slice(&[OP_DUP, OP_BLAKE160, 20]);
+        script.extend_from_slice(&program);
+        script.extend_from_slice(&[OP_EQUALVERIFY, OP_CHECKSIG]);
+        let digest = signature_hash(transaction, index, &script, coin.value.get(), SIGHASH_ALL)
+            .expect("P2PKH signature hash");
+        let signature: Signature = key.sign_prehash(&digest).expect("P2PKH signature");
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let mut encoded = signature.to_bytes().to_vec();
+        encoded.push(SIGHASH_ALL as u8);
+        transaction.inputs[index].witness = Witness {
+            items: vec![encoded, public_key.to_vec()],
+        };
+    }
+
+    fn production_next_script_finalize_fixture() -> ShakedexValueWorkflow {
+        let seller_key = SigningKey::from_slice(&[0x31; 32]).expect("seller key");
+        let seller_public_key = production_next_public_key_hash(&seller_key).0;
+        let network = NetworkBinding {
+            magic: 0x5b6e_c393,
+            genesis: BlockHash::new([0x11; 32]),
+        };
+        let mut proof = SwapProof {
+            network,
+            locking_outpoint: Outpoint {
+                transaction_hash: CanonicalTransactionHash::new([0x22; 32]),
+                index: 7,
+            },
+            name: b"market-name".to_vec(),
+            seller_public_key,
+            payment_address: Address::new(0, vec![0x33; 20]).expect("payment address"),
+            price: Dollarydoos::new(12_345_678),
+            lock_time_seconds: 1_800_000_000,
+            signature: None,
+            fee_address: Some(Address::new(0, vec![0x44; 20]).expect("fee address")),
+            fee: Dollarydoos::new(25_000),
+        };
+        let locking_coin = Coin {
+            outpoint: proof.locking_outpoint,
+            value: Dollarydoos::new(900_000),
+            height: Height::new(123),
+            coinbase: false,
+            address: Address::new(0, lock_script_hash(&seller_public_key).to_vec())
+                .expect("lock address"),
+            covenant: FinalizeCovenant::new(
+                proof.name.clone(),
+                Height::new(1),
+                false,
+                Height::new(0),
+                0,
+                BlockHash::new([0x55; 32]),
+            )
+            .expect("FINALIZE covenant")
+            .to_covenant()
+            .expect("canonical covenant"),
+        };
+        proof.sign(&locking_coin, &seller_key).expect("presign");
+        let mut listing = FixedPriceListing {
+            proof,
+            created_at: PRODUCTION_NEXT_ACTIVE_TIME - 100,
+            expires_at: PRODUCTION_NEXT_ACTIVE_TIME + 3_500,
+            sequence: 42,
+            signature: None,
+        };
+        listing.sign(&seller_key).expect("listing signature");
+        let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
+        let listing_bytes = listing.encode().expect("listing bytes");
+        let verified_listing = crate::verify_fixed_price_listing(
+            &listing_bytes,
+            listing_hash,
+            network,
+            PRODUCTION_NEXT_ACTIVE_TIME,
+            &locking_coin,
+        )
+        .expect("verified listing");
+        let supplied_lock =
+            SuppliedShakedexLock::verify(network, locking_coin.clone(), seller_public_key)
+                .expect("supplied lock");
+
+        let buyer_key = SigningKey::from_slice(&[0x41; 32]).expect("buyer key");
+        let (_, buyer_program) = production_next_public_key_hash(&buyer_key);
+        let buyer_recipient = Address::new(0, buyer_program.to_vec()).expect("buyer recipient");
+        let buyer_coin = production_next_funding_coin(0x61, &buyer_key, 13_000_000);
+        let prepared_fulfillment = crate::prepare_buyer_fulfillment(
+            &verified_listing,
+            &supplied_lock,
+            PRODUCTION_NEXT_ACTIVE_TIME,
+            PRODUCTION_NEXT_ACTIVE_TIME,
+            buyer_recipient.clone(),
+            vec![production_next_unsigned_input(&buyer_coin)],
+            vec![buyer_coin.clone()],
+            vec![production_next_ordinary_output(
+                buyer_recipient.clone(),
+                628_322,
+            )],
+            PRODUCTION_NEXT_FEE,
+        )
+        .expect("prepared fulfillment");
+        let mut fulfillment =
+            Transaction::decode(prepared_fulfillment.transaction_bytes()).expect("fulfillment");
+        production_next_sign_p2pkh(&mut fulfillment, 1, &buyer_coin, &buyer_key);
+        let fulfillment_bytes = fulfillment.encode().expect("fulfillment bytes");
+        let verified_fulfillment = prepared_fulfillment
+            .verify_signed(&fulfillment_bytes)
+            .expect("verified fulfillment");
+
+        let wallet_id = WalletId::new([0x71; 16]);
+        let account_id = AccountId::new([0x72; 16]);
+        let parent_workflow_id = WorkflowId::new([0x74; 16]);
+        let parent_plan = BuyerLockPlan::offer_verified(
+            wallet_id,
+            account_id,
+            parent_workflow_id,
+            &verified_listing,
+            &locking_coin,
+        )
+        .expect("buyer plan")
+        .with_fulfillment(&verified_fulfillment, &[buyer_coin])
+        .expect("signed parent plan");
+        let parent = ShakedexScriptFinalizeParent::BuyerFulfillment { plan: parent_plan };
+
+        let transfer_output = fulfillment.outputs[0].clone();
+        let transfer_coin = Coin {
+            outpoint: Outpoint {
+                transaction_hash: fulfillment.transaction_hash().expect("fulfillment txid"),
+                index: 0,
+            },
+            value: transfer_output.value,
+            height: Height::new(200),
+            coinbase: false,
+            address: transfer_output.address,
+            covenant: transfer_output.covenant,
+        };
+        let mut current_state = NameState::null(hash_name(b"market-name").expect("name hash"));
+        current_state.name = b"market-name".to_vec();
+        current_state.height = Height::new(1);
+        current_state.owner = transfer_coin.outpoint;
+        current_state.value = transfer_coin.value;
+        current_state.transfer = transfer_coin.height;
+        current_state.registered = true;
+        let finalize_coin = production_next_funding_coin(0x63, &buyer_key, 100_000);
+        let renewal_block = BlockHash::new([0x66; 32]);
+        let prepared_finalize = crate::prepare_script_finalize(
+            &supplied_lock,
+            VerifiedShakedexTransfer::Fulfillment(&verified_fulfillment),
+            transfer_coin.clone(),
+            current_state.clone(),
+            renewal_block,
+            buyer_recipient.clone(),
+            vec![production_next_unsigned_input(&finalize_coin)],
+            vec![finalize_coin.clone()],
+            vec![production_next_ordinary_output(
+                buyer_recipient.clone(),
+                99_000,
+            )],
+            PRODUCTION_NEXT_FEE,
+        )
+        .expect("prepared script FINALIZE");
+        let transfer = CurrentShakedexTransferEvidence {
+            binding: binding(9, 500, 0x70),
+            mempool: MempoolSnapshotBinding {
+                instance_nonce: [0x71; 32],
+                generation: 4,
+            },
+            transfer_transaction: fulfillment_bytes,
+            transfer_coin: CoinEvidence::from_coin(&transfer_coin).expect("transfer coin"),
+            owner_inclusion: TransactionInclusion {
+                block_hash: [0x72; 32],
+                height: 200,
+                transaction_index: Some(3),
+            },
+            current_name_state: current_state.encode().expect("name state"),
+            renewal_block_height: 100,
+            renewal_block_hash: renewal_block.into_bytes(),
+        };
+        let workflow_id = shakedex_value_workflow_id(
+            parent_workflow_id,
+            ShakedexValueAction::SellerScriptFinalize,
+        );
+        let tracked_finalize_coin = TrackedHnsCoin {
+            coin: WalletCoin {
+                outpoint: HnsOutpoint {
+                    transaction: TransactionHash::new(
+                        finalize_coin.outpoint.transaction_hash.into_bytes(),
+                    ),
+                    output_index: finalize_coin.outpoint.index,
+                },
+                value: BaseUnits::new(u128::from(finalize_coin.value.get())),
+                confirmation_count: 10,
+                confirmed_height: Some(finalize_coin.height.get()),
+                coinbase: false,
+                covenant: finalize_coin.covenant.encode().expect("funding covenant"),
+                name_locked: false,
+            },
+            derivation: DerivationReference {
+                role: KeyRole::HnsCoin,
+                account: 7,
+                change: 0,
+                index: 1,
+            },
+            address_program: finalize_coin.address.hash.clone(),
+        };
+        let expires_at_unix = PRODUCTION_NEXT_ACTIVE_TIME + 200;
+        let reservation: HnsShakedexFundingReservation =
+            serde_json::from_value(serde_json::json!({
+                "wallet_id": wallet_id,
+                "account_id": account_id,
+                "workflow_id": workflow_id,
+                "purpose": HnsShakedexFundingPurpose::SellerScriptFinalize,
+                "name_hash": hash_name(b"market-name").expect("name hash").into_bytes(),
+                "source_outpoint": HnsOutpoint {
+                    transaction: TransactionHash::new(
+                        transfer_coin.outpoint.transaction_hash.into_bytes(),
+                    ),
+                    output_index: transfer_coin.outpoint.index,
+                },
+                "funding_inputs": [tracked_finalize_coin],
+                "expires_at_unix": expires_at_unix,
+            }))
+            .expect("reservation evidence");
+        ShakedexValueWorkflow::prepared(
+            ShakedexValueAction::SellerScriptFinalize,
+            StructuralPlan::ScriptFinalize { parent, transfer },
+            reservation,
+            &transfer_coin,
+            &[finalize_coin],
+            &buyer_recipient,
+            BaseUnits::new(u128::from(transfer_coin.value.get())),
+            PRODUCTION_NEXT_FEE,
+            BaseUnits::new(2_000),
+            3,
+            prepared_finalize.transaction_bytes(),
+            expires_at_unix,
+        )
+        .expect("durable script FINALIZE")
+    }
+
+    fn production_next_refresh_structural_plan_commitment(workflow: &mut ShakedexValueWorkflow) {
+        workflow.structural_plan_commitment =
+            structural_plan_commitment(&workflow.structural_plan).expect("structural commitment");
+    }
+
+    #[cfg(unix)]
+    struct ProductionNextWalletDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for ProductionNextWalletDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn production_next_test_store() -> (
+        ProductionNextWalletDirectory,
+        PathBuf,
+        HnsShakedexFundingScope,
+        WalletStore,
+    ) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hns-wallet-shakedex-finalize-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("test wallet directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private test wallet directory");
+        let database = directory.join("wallet.sqlite3");
+        let store = WalletStore::create(&database, "production-next-finalize-passphrase")
+            .expect("encrypted store");
+        let runtime = HnsWalletRuntime::open(
+            ProductionNextUnusedBackend,
+            store,
+            HnsRuntimeConfig {
+                wallet_id: WalletId::new([0x71; 16]),
+                account_id: AccountId::new([0x72; 16]),
+                account_derivation_index: 7,
+                network: HnsNetwork::Regtest,
+                birthday_height: 1,
+                restore_lookahead: 10,
+                minimum_confirmations: 1,
+                dust_threshold: BaseUnits::new(1),
+                value_operations_enabled: false,
+                settlement_enabled: false,
+            },
+            SystemClock,
+        )
+        .expect("persistence-fixture runtime");
+        let scope = runtime
+            .shakedex_funding_scope()
+            .expect("runtime-owned scope");
+        drop(runtime);
+        let mut store = WalletStore::open(&database).expect("reopen persistence-fixture store");
+        store
+            .unlock("production-next-finalize-passphrase")
+            .expect("unlock persistence-fixture store");
+        (
+            ProductionNextWalletDirectory(directory),
+            database,
+            scope,
+            store,
+        )
+    }
+
+    #[test]
+    fn production_next_script_finalize_restart_preserves_canonical_transfer_identity() {
+        assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+        assert!(!HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED);
+        assert!(!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
+        assert!(!HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
+        let workflow = production_next_script_finalize_fixture();
+        assert_eq!(workflow.action(), ShakedexValueAction::SellerScriptFinalize);
+        assert_eq!(workflow.stage(), ShakedexValueStage::Prepared);
+        assert_eq!(
+            workflow.funding_reservation().purpose(),
+            HnsShakedexFundingPurpose::SellerScriptFinalize
+        );
+        let encoded = serde_json::to_vec(&workflow).expect("workflow encoding");
+        let restarted: ShakedexValueWorkflow =
+            serde_json::from_slice(&encoded).expect("workflow restart decode");
+        restarted.validate().expect("restart reauthentication");
+        assert_eq!(restarted, workflow);
+        let (parent, transfer) = restarted
+            .script_finalize_transfer_identity()
+            .expect("script FINALIZE identity");
+        assert_eq!(parent.transaction().expect("parent txid"), {
+            let transaction = canonical_transaction(&transfer.transfer_transaction)
+                .expect("canonical parent transaction");
+            canonical_transaction_hash(&transaction).expect("canonical parent txid")
+        });
+        assert_eq!(
+            transfer
+                .transfer_coin()
+                .expect("transfer coin")
+                .outpoint
+                .index,
+            0
+        );
+        assert_eq!(transfer.owner_inclusion.height, 200);
+        assert_eq!(transfer.renewal_block_hash, [0x66; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_next_script_finalize_encrypted_lock_drop_reopen() {
+        let workflow = production_next_script_finalize_fixture();
+        let (_directory, database, scope, mut store) = production_next_test_store();
+        let batch = create_hns_shakedex_funding_reservations(
+            &store,
+            &scope,
+            workflow.funding_reservation(),
+            PRODUCTION_NEXT_ACTIVE_TIME,
+        )
+        .expect("source/funding reservation batch");
+        let revision = store
+            .save_workflow_with_entity_batch(
+                workflow.workflow_id(),
+                WorkflowKind::ShakedexValue,
+                0,
+                &workflow,
+                false,
+                PRODUCTION_NEXT_ACTIVE_TIME,
+                EntityKind::InputReservation,
+                batch.saves(),
+                batch.deletes(),
+            )
+            .expect("atomically persist FINALIZE and reservations");
+        assert_eq!(revision, 1);
+        let stored = StoredShakedexValueWorkflow {
+            revision,
+            workflow: workflow.clone(),
+        };
+        validate_shakedex_value_workflow_reservations(&store, &scope, &stored)
+            .expect("prepared source/funding reservation join");
+        store.lock();
+        assert!(store.is_locked());
+        assert!(load_shakedex_value_workflow(&store, workflow.workflow_id()).is_err());
+        drop(store);
+
+        let mut reopened = WalletStore::open(&database).expect("open locked store");
+        assert!(reopened.is_locked());
+        reopened
+            .unlock("production-next-finalize-passphrase")
+            .expect("unlock reopened store");
+        let loaded = load_shakedex_value_workflow(&reopened, workflow.workflow_id())
+            .expect("load FINALIZE")
+            .expect("persisted FINALIZE");
+        assert_eq!(loaded.revision, 1);
+        assert_eq!(loaded.workflow, workflow);
+        loaded.workflow.validate().expect("reopened evidence");
+        assert_eq!(
+            loaded.workflow.funding_reservation().purpose(),
+            HnsShakedexFundingPurpose::SellerScriptFinalize
+        );
+        validate_shakedex_value_workflow_reservations(&reopened, &scope, &loaded)
+            .expect("reopened prepared source/funding reservation join");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_next_script_finalize_stale_cas_and_identity_replacement_fail_closed() {
+        let workflow = production_next_script_finalize_fixture();
+        let (_directory, _database, _scope, mut store) = production_next_test_store();
+        let revision = save_value_workflow(&mut store, 0, &workflow, PRODUCTION_NEXT_ACTIVE_TIME)
+            .expect("persist FINALIZE");
+
+        let mut changed_identity = workflow.clone();
+        let StructuralPlan::ScriptFinalize { transfer, .. } = &mut changed_identity.structural_plan
+        else {
+            panic!("script FINALIZE plan");
+        };
+        transfer.binding.chain_epoch += 1;
+        changed_identity.structural_plan_commitment =
+            structural_plan_commitment(&changed_identity.structural_plan)
+                .expect("changed identity commitment");
+        changed_identity
+            .validate()
+            .expect("individually valid changed snapshot identity");
+        assert!(matches!(
+            save_value_workflow(
+                &mut store,
+                revision,
+                &changed_identity,
+                PRODUCTION_NEXT_ACTIVE_TIME + 1,
+            ),
+            Err(ShakedexError::InvalidEvidence)
+        ));
+
+        let cancelled = workflow
+            .terminate_prepared(ShakedexValueStage::Cancelled)
+            .expect("cancel prepared FINALIZE");
+        assert_eq!(
+            save_value_workflow(
+                &mut store,
+                revision,
+                &cancelled,
+                PRODUCTION_NEXT_ACTIVE_TIME + 2,
+            )
+            .expect("advance FINALIZE"),
+            revision + 1
+        );
+        let expired = workflow
+            .terminate_prepared(ShakedexValueStage::Expired)
+            .expect("expire stale FINALIZE");
+        assert!(matches!(
+            save_value_workflow(
+                &mut store,
+                revision,
+                &expired,
+                PRODUCTION_NEXT_ACTIVE_TIME + 3,
+            ),
+            Err(ShakedexError::StaleRevision)
+        ));
+    }
+
+    #[test]
+    fn production_next_script_finalize_wrong_parent_purpose_transfer_owner_and_renewal_fail() {
+        let workflow = production_next_script_finalize_fixture();
+        let canonical = serde_json::to_value(&workflow).expect("workflow JSON");
+
+        let mut wrong_purpose = canonical.clone();
+        wrong_purpose["funding_reservation"]["purpose"] = serde_json::json!("buyer_fulfillment");
+        let mut wrong_purpose: ShakedexValueWorkflow =
+            serde_json::from_value(wrong_purpose).expect("typed wrong purpose");
+        production_next_refresh_structural_plan_commitment(&mut wrong_purpose);
+        assert!(wrong_purpose.validate().is_err());
+
+        let mut replaced_transfer = canonical.clone();
+        replaced_transfer["structural_plan"]["transfer"]["transfer_transaction"]
+            .as_array_mut()
+            .expect("transfer bytes")[0] = serde_json::json!(0xff);
+        let mut replaced_transfer: ShakedexValueWorkflow =
+            serde_json::from_value(replaced_transfer).expect("typed replacement");
+        production_next_refresh_structural_plan_commitment(&mut replaced_transfer);
+        assert!(replaced_transfer.validate().is_err());
+
+        let mut wrong_owner = canonical.clone();
+        wrong_owner["structural_plan"]["transfer"]["owner_inclusion"]["height"] =
+            serde_json::json!(201);
+        let mut wrong_owner: ShakedexValueWorkflow =
+            serde_json::from_value(wrong_owner).expect("typed wrong owner");
+        production_next_refresh_structural_plan_commitment(&mut wrong_owner);
+        assert!(wrong_owner.validate().is_err());
+
+        let mut wrong_renewal = canonical.clone();
+        wrong_renewal["structural_plan"]["transfer"]["renewal_block_hash"]
+            .as_array_mut()
+            .expect("renewal hash")[0] = serde_json::json!(0x67);
+        let mut wrong_renewal: ShakedexValueWorkflow =
+            serde_json::from_value(wrong_renewal).expect("typed wrong renewal");
+        production_next_refresh_structural_plan_commitment(&mut wrong_renewal);
+        assert!(wrong_renewal.validate().is_err());
+
+        let mut wrong_parent_action = canonical;
+        wrong_parent_action["structural_plan"]["parent"]["parent_action"] =
+            serde_json::json!("seller_recovery");
+        assert!(
+            serde_json::from_value::<ShakedexValueWorkflow>(wrong_parent_action).is_err(),
+            "a buyer parent cannot be retyped as seller recovery"
+        );
+    }
+
+    #[test]
+    fn production_next_script_finalize_reorg_and_finality_negatives_keep_reservations_protected() {
+        let floor = binding(20, 500, 0x80);
+        assert!(!snapshot_binding_not_older(binding(20, 499, 0x81), floor));
+        assert!(!snapshot_binding_not_older(binding(20, 500, 0x82), floor));
+
+        let expected = TransactionHash::new([0x83; 32]);
+        let competitor = TransactionHash::new([0x84; 32]);
+        let transaction_evidence = TransactionEvidence {
+            binding: floor,
+            mempool: MempoolSnapshotBinding {
+                instance_nonce: [0x85; 32],
+                generation: 3,
+            },
+            raw: None,
+            status: TransactionStatus {
+                in_mempool: false,
+                confirmation_count: 0,
+                conflicted: true,
+            },
+            inclusion: None,
+        };
+        let mut spend_evidence = OutpointSpendEvidence {
+            binding: floor,
+            entries: vec![
+                OutpointSpendEntry {
+                    outpoint: HnsOutpoint {
+                        transaction: TransactionHash::new([0x86; 32]),
+                        output_index: 0,
+                    },
+                    spending: Some(SpendingTransactionEvidence {
+                        transaction: competitor,
+                        input_position: 0,
+                        block_hash: [0x87; 32],
+                        height: 499,
+                    }),
+                },
+                OutpointSpendEntry {
+                    outpoint: HnsOutpoint {
+                        transaction: TransactionHash::new([0x88; 32]),
+                        output_index: 1,
+                    },
+                    spending: None,
+                },
+            ],
+        };
+        assert!(matches!(
+            terminal_release_reason(
+                expected,
+                3,
+                &transaction_evidence,
+                &spend_evidence,
+                &[competitor],
+            ),
+            Err(ShakedexError::InvalidTransition)
+        ));
+        spend_evidence.entries[0]
+            .spending
+            .as_mut()
+            .expect("competitor")
+            .height = 498;
+        assert!(matches!(
+            terminal_release_reason(
+                expected,
+                3,
+                &transaction_evidence,
+                &spend_evidence,
+                &[competitor],
+            ),
+            Ok(ShakedexReservationReleaseReason::ConfirmedCompetingSpend)
+        ));
+
+        let exact_inclusion = TransactionInclusion {
+            block_hash: [0x89; 32],
+            height: 498,
+            transaction_index: Some(2),
+        };
+        let exact_evidence = TransactionEvidence {
+            status: TransactionStatus {
+                in_mempool: false,
+                confirmation_count: 3,
+                conflicted: false,
+            },
+            inclusion: Some(exact_inclusion),
+            ..transaction_evidence
+        };
+        spend_evidence.entries[0].spending = Some(SpendingTransactionEvidence {
+            transaction: expected,
+            input_position: 0,
+            block_hash: exact_inclusion.block_hash,
+            height: exact_inclusion.height,
+        });
+        spend_evidence.entries[1].spending = None;
+        assert!(matches!(
+            terminal_release_reason(expected, 3, &exact_evidence, &spend_evidence, &[]),
+            Err(ShakedexError::InvalidEvidence)
+        ));
+        assert!(!valid_stage_transition(
+            ShakedexValueStage::ReservationsReleased,
+            ShakedexValueStage::RequiresRebroadcast,
+        ));
+    }
+
     #[test]
     fn hns_shakedex_value_child_identity_and_reorg_transitions() {
         let parent = WorkflowId::new([0x41; 16]);
         let buyer = shakedex_value_workflow_id(parent, ShakedexValueAction::BuyerFulfillment);
         let seller = shakedex_value_workflow_id(parent, ShakedexValueAction::SellerRecovery);
+        let finalize =
+            shakedex_value_workflow_id(parent, ShakedexValueAction::SellerScriptFinalize);
         assert_ne!(buyer, parent);
         assert_ne!(seller, parent);
+        assert_ne!(finalize, parent);
         assert_ne!(buyer, seller);
+        assert_ne!(buyer, finalize);
+        assert_ne!(seller, finalize);
         assert_eq!(
             buyer,
             shakedex_value_workflow_id(parent, ShakedexValueAction::BuyerFulfillment)
@@ -2461,13 +4037,7 @@ mod tests {
                 .collect(),
         };
         assert!(matches!(
-            terminal_release_reason(
-                expected,
-                3,
-                &transaction_evidence,
-                &spend_evidence,
-                &[],
-            ),
+            terminal_release_reason(expected, 3, &transaction_evidence, &spend_evidence, &[],),
             Ok(ShakedexReservationReleaseReason::ExactTransactionConfirmed)
         ));
 
@@ -2477,13 +4047,7 @@ mod tests {
             .expect("spending evidence")
             .input_position = 0;
         assert!(matches!(
-            terminal_release_reason(
-                expected,
-                3,
-                &transaction_evidence,
-                &spend_evidence,
-                &[],
-            ),
+            terminal_release_reason(expected, 3, &transaction_evidence, &spend_evidence, &[],),
             Err(ShakedexError::InvalidEvidence)
         ));
     }
@@ -2528,13 +4092,7 @@ mod tests {
         };
 
         assert!(matches!(
-            audit_terminal_release_reason(
-                expected,
-                3,
-                &transaction_evidence,
-                &spend_evidence,
-                &[],
-            ),
+            audit_terminal_release_reason(expected, 3, &transaction_evidence, &spend_evidence, &[],),
             Err(ShakedexError::RecoveryRequired)
         ));
     }

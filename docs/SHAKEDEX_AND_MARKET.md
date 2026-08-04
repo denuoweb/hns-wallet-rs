@@ -5,7 +5,8 @@
 The crate preserves the encrypted compare-and-swap seller, buyer, and recovery
 schemas and their historical transition ordering for persisted-state
 compatibility. A separate encrypted aggregate child workflow now coordinates
-post-lock buyer fulfillment and seller recovery, but every authorization and
+post-lock buyer fulfillment, seller recovery, and the seller-script FINALIZE
+that follows either signed TRANSFER parent, but every authorization and
 submission entrypoint remains release-gated. The wallet dependency boundary
 consumes the canonical V2 `hns-swap` and
 `hns-marketplace-protocol` source from the same immutable revision `4b989aa`.
@@ -80,11 +81,18 @@ Signed fulfillment and recovery results can be retained as encrypted buyer or
 seller structural-plan state under the compare-and-swap journal. A persisted
 plan binds its canonical terms and transaction bytes so a restart can reject a
 changed or stale plan instead of silently rebuilding different bytes.
-Script-controlled FINALIZE remains memory-only.
+The script-controlled FINALIZE is now a third tagged structural-plan variant in
+the encrypted value child. It embeds the exact signed buyer-fulfillment or
+seller-recovery parent action, bytes and hash; exact TRANSFER transaction and
+output-zero coin; current NameState and owner inclusion; chain/mempool binding;
+and renewal height/hash. Those fields are immutable evidence, not restored
+authority. A changed parent action, transfer, owner inclusion, state, renewal
+commitment, funding purpose, or CAS identity fails closed.
 
-The new `ShakedexValue` aggregate is a distinct child of one canonical buyer or
-seller plan. Its deterministic ID binds the parent and action. One encrypted
-CAS record retains the complete structural plan and commitment, exact lock
+The `ShakedexValue` aggregate is a distinct child of one canonical buyer or
+seller plan. Its deterministic ID binds the parent and action, including a
+separate discriminator for seller-script FINALIZE. One encrypted CAS record
+retains the complete structural plan and commitment, exact lock or TRANSFER
 source and ordered funding coins, recipient, value, fee and fee maximum,
 confirmation policy, expiry, prepared bytes, signed bytes, final fee quote,
 submission fence, and chain observations. Loading the row re-decodes and
@@ -94,7 +102,8 @@ current.
 
 Preparation atomically saves that child with protected `ShakedexSource` and
 `ShakedexFunding` reservations. The source reservation ID is store-global and
-derived from the exact lock outpoint rather than a wallet/account namespace,
+derived from the exact lock or TRANSFER outpoint rather than a wallet/account
+namespace,
 preventing the same script-controlled coin from being reserved by another
 workflow or wallet view in the same `WalletStore`. Funding rows bind the exact
 ordered, currently tracked ordinary HNS coins. Generic HNS cleanup and ordinary
@@ -115,17 +124,23 @@ rolls the workflow back.
 
 The approval commitment contains the exact prepared aggregate and its current
 revision. Runtime-owned time governs preparation, approval expiry,
-authorization, and submission timestamps. Authorization reacquires the same
-current/unspent lock and exact chain/mempool binding, checks the protected
-reservations and current cached funding coins, preserves input zero and its
-script witness byte-for-byte, and signs only the ordinary P2PKH suffix. The
-unchanged approval is consumed only in the transaction that persists those
+authorization, and submission timestamps. Buyer fulfillment and seller
+recovery use only current-lock authority; seller-script FINALIZE has a distinct
+reservation purpose and APIs that accept only current-TRANSFER authority. The
+runtime reacquires the relevant non-serializable authority and exact
+chain/mempool binding, checks the protected reservations and current cached
+funding coins, preserves input zero and its script witness byte-for-byte, and
+signs only the ordinary P2PKH suffix. A lock-purpose reservation cannot cross
+into the FINALIZE path, and a FINALIZE-purpose reservation cannot cross into a
+lock path. The unchanged approval is consumed only in the transaction that persists those
 signed bytes and their exact final-byte fee quote while activating all
 reservations. Restart validation recomputes canonical structure, funding
 witnesses, input/output fee algebra, fee maximum, and the persisted quote.
 
-Submission reacquires current lock authority and re-quotes only the persisted
-signed bytes. Before the node call, one workflow/entity CAS records
+Submission reacquires current lock or exact current-TRANSFER authority and
+re-quotes only the persisted signed bytes. The FINALIZE path reacquires the
+exact transfer again immediately before the durable broadcast fence. Before
+the node call, one workflow/entity CAS records
 `RequiresRebroadcast`, advances the monotonic attempt count, saves the refreshed
 quote, and reauthenticates every active protected reservation. The node must
 return the expected transaction ID. Reconciliation obtains transaction and
@@ -174,13 +189,14 @@ separate authority and is not reused by Shakedex. Canonical planning, protected
 seller-key allocation, purpose-bound signing, current/unspent lock acquisition,
 active-chain NameState/renewal evidence, parent-MTP authority, exact protected
 reservations, final-byte approval and fee evidence, persist-before-broadcast,
-and chain-state reconciliation are present in source for buyer fulfillment and
-seller recovery. The fixed release gates remain `false`. Product-owned coin
-selection, durable script-controlled FINALIZE, product/startup orchestration,
-live Denuo/provider/trusted-UI integration, and complete
+and chain-state reconciliation are present in source for buyer fulfillment,
+seller recovery, and seller-script FINALIZE. The fixed release gates remain
+`false`. Product-owned coin selection, product/startup orchestration, live
+Denuo/provider/trusted-UI integration, and complete
 regtest/restart/reorg/product qualification are still required before any gate
-can change. The terminal-release source and focused tests have not been
-executed in this tranche. Reverse Dutch is deferred.
+can change. The previously recorded terminal-release tests remain the only
+executed focused evidence; the six new `production_next_` FINALIZE source tests
+were not built or executed in this tranche. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 

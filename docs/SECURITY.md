@@ -145,14 +145,20 @@ recipient. Direct FINALIZE takes its destination only from that authenticated
 TRANSFER covenant and is signed by the outgoing owner's `HnsName` key;
 incoming-recipient classification never authorizes signing.
 
-Shakedex buyer fulfillment and seller recovery approvals bind the complete
-prepared aggregate and its current CAS revision: canonical parent plan, exact
-lock source, ordered funding coins, recipient, value, exact fee and maximum,
-confirmation policy, expiry, and prepared bytes. The runtime owns the clock,
-reacquires current lock authority, and signs only ordinary suffix inputs while
-preserving the script-authorized first input. It consumes the unchanged
-approval only in the transaction that persists the verified signed bytes and
-their exact final-byte fee quote and activates every protected reservation.
+Shakedex buyer fulfillment, seller recovery, and seller-script FINALIZE
+approvals bind the complete prepared aggregate and its current CAS revision:
+canonical parent plan, exact lock or TRANSFER source, ordered funding coins,
+recipient, value, exact fee and maximum, confirmation policy, expiry, and
+prepared bytes. FINALIZE also commits the exact signed parent action/bytes/hash,
+TRANSFER transaction/output-zero coin, NameState, owner inclusion,
+snapshot/mempool binding, and renewal evidence. The runtime owns the clock.
+Lock spends accept only current-lock authority and their two existing purposes;
+FINALIZE uses a new purpose and APIs that accept only current-TRANSFER
+authority. The runtime reacquires that authority before signing and signs only
+ordinary suffix inputs while preserving the script-authorized first input. It
+consumes the unchanged approval only in the transaction that persists the
+verified signed bytes and their exact final-byte fee quote and activates every
+protected reservation.
 All related Shakedex and HNS Shakedex-funding/value/fee release gates remain
 `false`, so this source boundary cannot currently authorize value.
 
@@ -262,12 +268,13 @@ restoration commits. The signer recomputes the canonical payment, price,
 deadline, and fee commitment from every proof before signing, and proof/listing
 signing accepts current-lock authority rather than a caller-supplied Coin.
 
-The buyer-fulfillment and seller-recovery value child persists one inseparable
-funds-safety record: its structural commitment, exact source/funding coins and
-reservation binding, prepared/signed bytes, approval, quote, submission fence,
+The buyer-fulfillment, seller-recovery, and seller-script-FINALIZE value child
+persists one inseparable funds-safety record: its structural commitment, exact
+source/funding coins and reservation binding, prepared/signed bytes, approval,
+quote, submission fence,
 and chain observation. Its `ShakedexSource` reservation is keyed store-globally
-by the lock outpoint, so another wallet/account view in the same `WalletStore`
-cannot reserve the same script-controlled input; account funding rows bind the
+by the lock or TRANSFER outpoint, so another wallet/account view in the same
+`WalletStore` cannot reserve the same script-controlled input; account funding rows bind the
 exact ordered ordinary coins. Generic cleanup cannot release either protected
 kind. Prepared expiry is capped by runtime time to the five-minute prepared-
 artifact window, and explicit expiry or cancellation releases the complete set
@@ -280,15 +287,21 @@ authenticated competing spender at that threshold under the same snapshot.
 The terminal evidence and deletion of the complete reservation set use one CAS
 transaction.
 
-The HNS runtime requires an exact current account/cache match and current lock
-with confirmed and mempool unspentness. Prepared funding witnesses must be
-empty; authorization preserves input zero byte-for-byte, signs inputs `1..`
+The HNS runtime requires an exact current account/cache match and the authority
+appropriate to the source: current lock with confirmed and mempool
+unspentness for fulfillment/recovery, or exact current TRANSFER with canonical
+parent, owner inclusion, NameState, maturity, and renewal evidence for
+FINALIZE. The public types, reservation purposes, bind/validate/authorize
+methods, and final-fee validators keep those lanes distinct. Prepared funding
+witnesses must be empty; authorization preserves input zero byte-for-byte, signs inputs `1..`
 with exact P2PKH `SIGHASH_ALL` witnesses, and revalidates the canonical signed
 transaction. Persisted quote validation recomputes ordered input/output fee
 algebra after restart but does not treat the quote's old snapshot as current.
-Submission reacquires current lock authority, re-quotes the persisted bytes,
-and durably records `RequiresRebroadcast` with the active reservation CAS
-before the node call. Runtime-owned same-snapshot transaction and all-input
+Submission reacquires current lock authority or exact current-TRANSFER
+authority, re-quotes the persisted bytes, and durably records
+`RequiresRebroadcast` with the active reservation CAS before the node call.
+FINALIZE reacquires its transfer a second time immediately before that fence.
+Runtime-owned same-snapshot transaction and all-input
 spender evidence drives mempool/confirmation/conflict transitions; a reorg can
 move a formerly confirmed transaction back to same-byte rebroadcast. Caller-
 supplied clocks, status flags, and replacement bytes do not drive these
@@ -297,11 +310,19 @@ reorg invalidates or changes its persisted terminal reason, the workflow stays
 terminal, reservations are not recreated, and the runtime returns
 `RecoveryRequired` for explicit operator handling.
 
-Script-controlled FINALIZE additionally binds its TRANSFER coin to output zero
-of a fully verified fulfillment or recovery parent that spends the exact lock,
-but its durable value child has not been implemented. Product coin selection,
-live Denuo/provider/trusted-UI integration, terminal-release test execution,
-and complete restart/reorg/regtest qualification remain pending.
+Script-controlled FINALIZE binds its TRANSFER coin to output zero of a fully
+verified fulfillment or recovery parent that spends the exact lock, and that
+identity is now durable in the aggregate. Persisted evidence never restores
+current authority: save, signing, and submission reacquire the exact transfer.
+Post-sign observation, reconciliation, rebroadcast, conflict handling, and
+terminal release use only the runtime-owned generic evidence machinery. Exact-
+transaction release requires matching spender evidence for every exact input
+position; a sufficiently final authenticated competitor on any exact input may
+release the now-unspendable competing transaction. Released rows are never
+recreated, and later finality disagreement remains read-only
+`RecoveryRequired`. Product coin selection, live Denuo/provider/trusted-UI
+integration, execution of the six new focused tests, and complete
+restart/reorg/regtest qualification remain pending.
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`,

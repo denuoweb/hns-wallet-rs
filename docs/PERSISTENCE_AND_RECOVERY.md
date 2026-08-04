@@ -85,10 +85,11 @@ exact lock descriptor and explicit recovery recipient. Exact retries may
 revalidate the same persisted plan, while a stale revision or changed canonical
 plan fails instead of replacing previously prepared bytes.
 
-Post-lock buyer fulfillment and seller recovery now have a separate encrypted
-`ShakedexValue` child workflow. Its deterministic ID binds the parent workflow
-and action. One row retains the full canonical structural plan and commitment,
-exact source and ordered funding-coin evidence, recipient, value, fee and fee
+Post-lock buyer fulfillment, seller recovery, and seller-script FINALIZE now
+share a separate encrypted `ShakedexValue` child workflow. Its deterministic ID
+binds the parent workflow and action. One row retains the full canonical
+structural plan and commitment, exact source and ordered funding-coin evidence,
+recipient, value, fee and fee
 maximum, finality threshold, expiry, prepared bytes, approval identity, signed
 bytes, exact final-byte quote, monotonic attempt count/latest submission
 timestamps, and runtime-derived chain observations. Deserialization revalidates
@@ -96,10 +97,19 @@ the structural transaction,
 signed suffix, fee algebra, quote, identity, and state invariants before the row
 can be resumed.
 
+The additive tagged FINALIZE structural variant stores the exact signed
+buyer-fulfillment or seller-recovery parent action, canonical bytes and hash;
+the TRANSFER transaction and output-zero coin; current NameState and owner
+inclusion; snapshot/mempool binding; and renewal height/hash. These facts are
+immutable restart evidence. They do not serialize or recreate
+`VerifiedCurrentShakedexTransfer`, and CAS cannot replace them with another
+parent, transfer, purpose, owner, state, or renewal commitment.
+
 The initial workflow CAS also writes one protected source reservation and every
 protected funding reservation. The source row uses a store-global record ID
-derived only from the exact lock outpoint, so a second wallet/account namespace
-in the same `WalletStore` cannot reserve the same script-controlled coin.
+derived only from the exact lock or TRANSFER outpoint, so a second
+wallet/account namespace in the same `WalletStore` cannot reserve the same
+script-controlled coin.
 Funding rows bind the workflow to the exact ordered ordinary HNS coins
 recovered from the runtime cache. Missing,
 extra, retyped, mixed-state, cross-account, or stale-revision rows fail closed.
@@ -113,16 +123,23 @@ confirmation rollback, and conflict while the result remains reversible. A
 terminal release obtains the expected transaction and every input spender from
 one runtime-owned snapshot, proves either exact-transaction finality or the
 finality of an authenticated competitor at the workflow's persisted
-confirmation threshold, and
-atomically saves the terminal evidence while deleting the complete protected
+confirmation threshold, and atomically saves the terminal evidence while deleting the complete protected
 reservation set. Reconciliation never recreates those rows or reverses the
 terminal stage; if a later snapshot no longer supports the persisted terminal
 reason, it returns `RecoveryRequired` for explicit operator recovery.
 
+Exact-transaction release requires matching spender evidence for every exact
+input position and inclusion. A sufficiently final authenticated competitor on
+any exact input may release the reservations because the persisted transaction
+can no longer win. Missing exact-input evidence and immature competitors keep
+the rows protected.
+
 The approval request is a domain-separated encoding of the complete prepared
 aggregate and its exact workflow revision. Runtime-owned time determines its
-creation and expiry. The HNS runtime authenticates the unchanged approval,
-reacquires the exact current/unspent lock and chain/mempool snapshot, matches
+creation and expiry. The HNS runtime authenticates the unchanged approval.
+Fulfillment and recovery reacquire the exact current/unspent lock; FINALIZE
+uses a distinct reservation purpose and transfer-only public API, and
+reacquires the exact current TRANSFER and chain/mempool snapshot. It matches
 each canonical funding coin to one current tracked ordinary coin, preserves the
 script-authorized first input byte-for-byte, and signs only suffix inputs
 `1..`. After exact signed-byte fee quoting succeeds, one immediate SQLite
@@ -131,10 +148,12 @@ and activates all reservations. A stale workflow or reservation revision,
 changed/expired approval, stale runtime snapshot, signing failure, or quote
 failure leaves the approval and prepared state unconsumed.
 
-Before submission, the runtime reacquires current lock authority, re-quotes
-only the persisted signed bytes, and atomically records the refreshed quote,
-`RequiresRebroadcast`, attempt timestamp/count, and no-op CAS rewrites of every
-active reservation. Only then may it call broadcast, and the returned
+Before submission, the runtime reacquires current lock or exact
+current-TRANSFER authority, re-quotes only the persisted signed bytes, and
+atomically records the refreshed quote, `RequiresRebroadcast`, attempt
+timestamp/count, and no-op CAS rewrites of every
+active reservation. FINALIZE reacquires its exact transfer again immediately
+before that durable fence. Only then may it call broadcast, and the returned
 transaction ID must equal the persisted one. An ambiguous exit therefore
 resumes from the same signed bytes. Reconciliation obtains the exact
 transaction and all-input spender evidence under one runtime-owned
@@ -142,13 +161,16 @@ chain/mempool snapshot; it derives mempool, confirming, confirmed, conflicted,
 or rebroadcast state and rolls a disappeared confirmation back to
 `RequiresRebroadcast`. It can also recover directly from `Authorized` when the
 persisted bytes reached the node outside the recorded submit path. It never
-restores ephemeral current-lock authority or treats persisted snapshot bindings
-as current authority.
+restores ephemeral current-lock/current-TRANSFER authority or treats persisted
+snapshot bindings as current authority.
 
-Script-controlled FINALIZE construction remains typed but memory-only until a
-durable child workflow is added. All Shakedex value authorization and
-submission entrypoints remain unreachable while the fixed Shakedex and HNS
-Shakedex-funding/value/fee release gates are `false`; live Denuo/provider/UI
+Script-controlled FINALIZE is durable in source, including atomic workflow plus
+source/funding reservation persistence and the shared evidence-backed terminal
+release path. The six new `production_next_` restart/reopen/CAS/replacement/
+reorg/finality source tests were not built or executed in this tranche. All
+Shakedex value authorization and submission entrypoints remain unreachable
+while the fixed Shakedex and HNS Shakedex-funding/value/fee release gates are
+`false`; live Denuo/provider/UI
 integration and restart/reorg/regtest qualification are also pending.
 
 HNS authorization can authenticate and return a pending approval without
@@ -374,6 +396,14 @@ Opening a database with a newer schema fails. Schema upgrades are transactional.
 After plaintext rows are encrypted and deleted, unlock records a checkpoint,
 truncates the WAL, clears the marker, and truncates again; an interrupted
 checkpoint is retried on the next unlock before state is returned.
+
+The encrypted `ShakedexValue` payload keeps its internal schema version at v1
+and adds script FINALIZE as a new tagged structural-plan variant. The new
+reader still decodes and revalidates legacy v1 buyer/seller rows. An older
+binary does not know the new tag and cannot decode a wallet after such a row is
+written; downgrade is therefore unsupported and unqualified. This is only
+forward compatibility for old rows in the new binary, not a downgrade-safety
+claim.
 
 Legacy schema-v1 provider grants and replay records have deterministic migration
 paths. Legacy pending approvals are discarded because their creation time and

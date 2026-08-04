@@ -37,7 +37,7 @@ application workflows.
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | exact-existing-account read-only selector, HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, three-branch restoration, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
-| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact listing/cancellation protocol verification, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery value aggregate, canonical Denuo adapter, encrypted sequence/tombstone board | proof/listing/Denuo codecs, raw HNS keys, product coin selection, caller-asserted clock/chain truth, or release qualification |
+| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact listing/cancellation protocol verification, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Denuo adapter, encrypted sequence/tombstone board | proof/listing/Denuo codecs, raw HNS keys, product coin selection, caller-asserted clock/chain truth, or release qualification |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
@@ -126,20 +126,27 @@ WalletAccount/allocation transaction serialize restoration with every writer
 to that wallet database. The signer recomputes the canonical proof-economic
 terms commitment before proof, listing, or cancellation signing.
 
-Buyer fulfillment and seller recovery now use one aggregate
-`WorkflowKind::ShakedexValue` child rather than separate value journals. The
+Buyer fulfillment, seller recovery, and seller-script FINALIZE now use one
+aggregate `WorkflowKind::ShakedexValue` child rather than separate value journals. The
 child embeds the complete canonical parent plan and its commitment, exact lock
-source and ordered funding coins, recipient/value/fee/finality/expiry terms,
+or TRANSFER source and ordered funding coins, recipient/value/fee/finality/
+expiry terms,
 prepared and signed transaction bytes, approval identity, final fee quote,
 submission attempt/fence, and latest chain observation. Its deterministic key
 binds the parent workflow and action, so it cannot replace the parent row.
 Every load revalidates canonical transaction structure, funding-only witness
 changes, exact signed witnesses, fee algebra, and state-transition invariants.
+The FINALIZE structural variant additionally fixes the exact signed
+buyer-fulfillment or seller-recovery parent action/bytes/hash, TRANSFER
+transaction and output-zero coin, current NameState and owner inclusion,
+snapshot/mempool binding, and renewal evidence. These serialized facts remain
+historical evidence and never reconstruct the ephemeral current-TRANSFER
+authority.
 
 The HNS side creates protected `ShakedexSource` and `ShakedexFunding` entities
 for the aggregate's existing store CAS. The source entity uses a global ID
-derived from the lock outpoint, preventing cross-wallet/account double
-reservation within one wallet store; the funding entities bind current tracked
+derived from the lock or TRANSFER outpoint, preventing cross-wallet/account
+double reservation within one wallet store; the funding entities bind current tracked
 ordinary coins in transaction order. Runtime time caps prepared rows at the
 existing five-minute window. The aggregate and reservation inserts,
 prepared-to-active updates, prepared cancellation/expiry deletes, and
@@ -153,17 +160,22 @@ or an authenticated competing spender reaches that threshold under the same
 snapshot binding. The terminal workflow evidence and deletion of every
 protected row commit in one CAS transaction. Later reconciliation audits that
 terminal evidence without recreating reservations or rolling the workflow back;
-loss or change of terminal finality returns a recovery-required error. Durable
-script FINALIZE, product/startup integration, and executed qualification remain
-pending, and every release gate remains `false`.
+loss or change of terminal finality returns a recovery-required error. Product/
+startup integration and executed FINALIZE qualification remain pending, and
+every release gate remains `false`.
 
 Approval bytes encode the exact prepared aggregate and CAS revision. The HNS
-runtime owns time, reacquires the current lock and cache snapshot, authenticates
-the unchanged pending approval, preserves script input zero, and signs only the
-ordinary funding suffix. It returns the approval unconsumed so one store
-transaction can persist the verified signed bytes and exact final-byte quote,
+runtime owns time. Buyer fulfillment and seller recovery can enter only the
+current-lock APIs; seller-script FINALIZE has a separate purpose and APIs that
+can enter only with a freshly reacquired exact current TRANSFER. Save and
+authorization reacquire that authority, while submission reacquires it for the
+quote and again immediately before the broadcast fence. The runtime
+authenticates the unchanged pending approval, preserves script input zero, and
+signs only the ordinary funding suffix. It returns the approval unconsumed so
+one store transaction can persist the verified signed bytes and exact final-byte quote,
 activate reservations, and consume that same row. Before submission, the
-runtime re-quotes only the persisted bytes against fresh current-lock evidence;
+runtime re-quotes only the persisted bytes against fresh authority for that
+source;
 the wallet commits `RequiresRebroadcast`, the refreshed quote, bounded attempt
 metadata, and all active reservation revisions before calling the node.
 
@@ -173,9 +185,8 @@ confirmed, conflicted, and same-byte rebroadcast states; disappearance after a
 confirmation rolls back to `RequiresRebroadcast`, and an `Authorized` row can
 recover if its exact bytes were observed outside the recorded submit path.
 Persisted quote bindings are historical evidence only, and no caller-authored
-clock or chain status restores authority after restart. Durable
-script-controlled FINALIZE, product coin
-selection, live Denuo/provider/trusted-UI integration, and full
+clock or chain status restores authority after restart. Product coin selection,
+live Denuo/provider/trusted-UI integration, and full
 restart/reorg/regtest qualification remain pending. All Shakedex and dependent
 HNS Shakedex-funding/value/fee release gates remain `false`, so preparation,
 authorization, and submission cannot execute in a released product.

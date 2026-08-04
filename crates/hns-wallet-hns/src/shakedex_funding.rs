@@ -3,12 +3,15 @@ use super::*;
 use hns_wallet_store::{MAX_STATE_BYTES, PendingApproval};
 
 /// The only Shakedex actions that may ask the ordinary HNS key role to sign a
-/// funding suffix around a freshly authenticated FINALIZE lock spend.
+/// funding suffix. The script-FINALIZE purpose is deliberately distinct from
+/// the two FINALIZE-lock purposes so a persisted reservation cannot silently
+/// exchange current-lock authority for current-TRANSFER authority.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HnsShakedexFundingPurpose {
     BuyerFulfillment,
     SellerRecovery,
+    SellerScriptFinalize,
 }
 
 /// Opaque account namespace used to derive reservation record identifiers.
@@ -456,6 +459,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         funding_input_coins: &[Coin],
         expires_at_unix: u64,
     ) -> Result<(HnsShakedexFundingScope, HnsShakedexFundingReservation), HnsWalletError> {
+        require_lock_funding_purpose(purpose)?;
         let now_unix = self.clock.now_unix()?;
         let (account, account_revision, binding, mempool, cached_coins) = {
             let cache = self.cache_read()?;
@@ -569,6 +573,130 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(scope)
     }
 
+    /// Bind the ordinary funding suffix for a script-controlled FINALIZE to a
+    /// freshly reacquired, exact current TRANSFER. This API cannot accept a
+    /// `VerifiedCurrentShakedexLock`, and it fixes the reservation purpose
+    /// rather than trusting a caller-supplied enum value.
+    pub fn bind_shakedex_finalize_funding_reservation(
+        &self,
+        current_transfer: &VerifiedCurrentShakedexTransfer,
+        workflow_id: WorkflowId,
+        funding_input_coins: &[Coin],
+        expires_at_unix: u64,
+    ) -> Result<(HnsShakedexFundingScope, HnsShakedexFundingReservation), HnsWalletError> {
+        let now_unix = self.clock.now_unix()?;
+        let (account, account_revision, binding, mempool, cached_coins) = {
+            let cache = self.cache_read()?;
+            ensure_shakedex_funding_ready(&cache)?;
+            (
+                cache.account.clone(),
+                cache.account_revision,
+                cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?,
+                cache
+                    .mempool_binding
+                    .ok_or(HnsWalletError::StaleNodeSnapshot)?,
+                cache.coins.clone(),
+            )
+        };
+        if current_transfer.binding() != binding || current_transfer.mempool_binding() != mempool {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        let expected_transfer = TransactionHash::new(
+            current_transfer
+                .transfer_coin()
+                .outpoint
+                .transaction_hash
+                .into_bytes(),
+        );
+        let reacquired = self
+            .verify_current_shakedex_transfer(current_transfer.descriptor(), expected_transfer)?;
+        if !same_current_shakedex_transfer(current_transfer, &reacquired)
+            || reacquired.binding() != binding
+            || reacquired.mempool_binding() != mempool
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        let funding_inputs = bind_current_tracked_funding_coins(
+            &account,
+            &cached_coins,
+            funding_input_coins,
+            current_transfer.transfer_coin(),
+        )?;
+        let scope = HnsShakedexFundingScope {
+            config: account.config.clone(),
+        };
+        let name_hash = hash_name(&current_transfer.descriptor().name)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?
+            .into_bytes();
+        let source_outpoint = HnsOutpoint {
+            transaction: expected_transfer,
+            output_index: current_transfer.transfer_coin().outpoint.index,
+        };
+        let reservation = HnsShakedexFundingReservation::new(
+            &scope,
+            workflow_id,
+            HnsShakedexFundingPurpose::SellerScriptFinalize,
+            name_hash,
+            source_outpoint,
+            funding_inputs,
+            expires_at_unix,
+        )?;
+        validate_reservation_identity(&scope, &reservation, Some(now_unix))?;
+        let cache = self.cache_read()?;
+        if cache.account_revision != account_revision
+            || cache.account != account
+            || cache.binding != Some(binding)
+            || cache.mempool_binding != Some(mempool)
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok((scope, reservation))
+    }
+
+    /// Rebind deserialized script-FINALIZE reservation evidence to the exact
+    /// current account and current TRANSFER before it can be persisted.
+    pub fn validate_current_shakedex_finalize_funding_reservation(
+        &self,
+        current_transfer: &VerifiedCurrentShakedexTransfer,
+        reservation: &HnsShakedexFundingReservation,
+    ) -> Result<HnsShakedexFundingScope, HnsWalletError> {
+        require_finalize_funding_purpose(reservation.purpose)?;
+        let supplied_coins = reservation
+            .funding_inputs
+            .iter()
+            .map(TrackedHnsCoin::to_canonical_coin)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (scope, current) = self.bind_shakedex_finalize_funding_reservation(
+            current_transfer,
+            reservation.workflow_id,
+            &supplied_coins,
+            reservation.expires_at_unix,
+        )?;
+        if reservation.wallet_id != current.wallet_id
+            || reservation.account_id != current.account_id
+            || reservation.workflow_id != current.workflow_id
+            || reservation.purpose != current.purpose
+            || reservation.name_hash != current.name_hash
+            || reservation.source_outpoint != current.source_outpoint
+            || reservation.expires_at_unix != current.expires_at_unix
+            || reservation.funding_inputs.len() != current.funding_inputs.len()
+            || reservation
+                .funding_inputs
+                .iter()
+                .zip(&current.funding_inputs)
+                .any(|(expected, candidate)| {
+                    !same_reserved_funding_coin(
+                        expected,
+                        candidate,
+                        scope.config.minimum_confirmations,
+                    )
+                })
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        Ok(scope)
+    }
+
     /// Sign only ordinary P2PKH inputs `1..` of one exact, canonical Shakedex
     /// transaction. Input zero, including its seller/script witness, is
     /// preserved byte-for-byte. The returned approval remains unconsumed so
@@ -580,6 +708,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         prepared_transaction: &[u8],
         expected_approval: &HnsShakedexFundingApprovalExpectation,
     ) -> Result<HnsShakedexFundingAuthorization, HnsWalletError> {
+        require_lock_funding_purpose(reservation.purpose)?;
         let now_unix = self.clock.now_unix()?;
         let (account, account_revision, binding, mempool, cached_coins) = {
             let cache = self.cache_read()?;
@@ -619,6 +748,117 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         }
         validate_lock_reservation_binding(&reacquired, reservation)?;
         let prepared = validate_prepared_shakedex_funding_transaction(
+            &reacquired,
+            reservation,
+            prepared_transaction,
+        )?;
+
+        let (pending_approval, signed_transaction) = {
+            let store = self.store_lock()?;
+            validate_hns_shakedex_funding_reservations(
+                &store,
+                &scope,
+                reservation,
+                HnsShakedexFundingReservationState::Prepared,
+            )?;
+            let pending_approval = store
+                .get_pending_approval(expected_approval.approval_id, now_unix)?
+                .ok_or(HnsWalletError::ApprovalRequired)?;
+            if pending_approval.origin.as_str() != expected_approval.origin.as_str()
+                || pending_approval.expires_at_unix != expected_approval.expires_at_unix
+                || pending_approval.request_json.as_slice()
+                    != expected_approval.request_bytes.as_slice()
+            {
+                return Err(HnsWalletError::ApprovalRequired);
+            }
+            let roles = vec![KeyRole::HnsCoin; reservation.funding_inputs.len()];
+            let signed = sign_ordered_p2pkh_inputs_from(
+                &store,
+                &account,
+                prepared.clone(),
+                1,
+                &reservation.funding_inputs,
+                &roles,
+            )?;
+            validate_signed_shakedex_funding_suffix(
+                &prepared,
+                &signed,
+                &reservation.funding_inputs,
+            )?;
+            (pending_approval, signed)
+        };
+
+        let cache = self.cache_read()?;
+        if cache.account_revision != account_revision
+            || cache.account != account
+            || cache.binding != Some(binding)
+            || cache.mempool_binding != Some(mempool)
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok(HnsShakedexFundingAuthorization {
+            signed_transaction,
+            pending_approval,
+        })
+    }
+
+    /// Sign only ordinary P2PKH inputs `1..` of an exact script-FINALIZE.
+    /// Current TRANSFER authority, FINALIZE covenant/renewal structure, source
+    /// reservation purpose, and the untouched script witness at input zero are
+    /// all reauthenticated before any wallet key is used.
+    pub fn authorize_shakedex_finalize_funding_suffix(
+        &self,
+        current_transfer: &VerifiedCurrentShakedexTransfer,
+        reservation: &HnsShakedexFundingReservation,
+        prepared_transaction: &[u8],
+        expected_approval: &HnsShakedexFundingApprovalExpectation,
+    ) -> Result<HnsShakedexFundingAuthorization, HnsWalletError> {
+        require_finalize_funding_purpose(reservation.purpose)?;
+        let now_unix = self.clock.now_unix()?;
+        let (account, account_revision, binding, mempool, cached_coins) = {
+            let cache = self.cache_read()?;
+            ensure_shakedex_funding_ready(&cache)?;
+            (
+                cache.account.clone(),
+                cache.account_revision,
+                cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?,
+                cache
+                    .mempool_binding
+                    .ok_or(HnsWalletError::StaleNodeSnapshot)?,
+                cache.coins.clone(),
+            )
+        };
+        let scope = HnsShakedexFundingScope {
+            config: account.config.clone(),
+        };
+        validate_reservation_identity(&scope, reservation, Some(now_unix))?;
+        if expected_approval.expires_at_unix <= now_unix
+            || expected_approval.expires_at_unix > reservation.expires_at_unix
+        {
+            return Err(HnsWalletError::ApprovalRequired);
+        }
+        validate_current_funding_coins(&account, &cached_coins, reservation)?;
+        if current_transfer.binding() != binding || current_transfer.mempool_binding() != mempool {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+
+        let expected_transfer = TransactionHash::new(
+            current_transfer
+                .transfer_coin()
+                .outpoint
+                .transaction_hash
+                .into_bytes(),
+        );
+        let reacquired = self
+            .verify_current_shakedex_transfer(current_transfer.descriptor(), expected_transfer)?;
+        if !same_current_shakedex_transfer(current_transfer, &reacquired)
+            || reacquired.binding() != binding
+            || reacquired.mempool_binding() != mempool
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        validate_transfer_reservation_binding(&reacquired, reservation)?;
+        let prepared = validate_prepared_shakedex_finalize_funding_transaction(
             &reacquired,
             reservation,
             prepared_transaction,
@@ -746,6 +986,7 @@ pub fn validate_hns_shakedex_final_fee_quote_evidence(
     expected_fee: BaseUnits,
     maximum_fee: BaseUnits,
 ) -> Result<(), HnsWalletError> {
+    require_lock_funding_purpose(reservation.purpose)?;
     validate_lock_reservation_binding(current_lock, reservation)?;
     let mut coins = Vec::with_capacity(reservation.funding_inputs.len() + 1);
     coins.push(current_lock.locking_coin().clone());
@@ -756,6 +997,33 @@ pub fn validate_hns_shakedex_final_fee_quote_evidence(
         quote,
         current_lock.binding(),
         current_lock.mempool_binding(),
+        expected_fee,
+        maximum_fee,
+    )
+}
+
+/// Validate exact final node fee evidence for a script-controlled FINALIZE.
+/// Unlike the lock-spend validator, this accepts only current TRANSFER
+/// authority and the purpose dedicated to that source covenant.
+pub fn validate_hns_shakedex_finalize_final_fee_quote_evidence(
+    current_transfer: &VerifiedCurrentShakedexTransfer,
+    reservation: &HnsShakedexFundingReservation,
+    signed_transaction: &[u8],
+    quote: &HnsTransactionFeeQuote,
+    expected_fee: BaseUnits,
+    maximum_fee: BaseUnits,
+) -> Result<(), HnsWalletError> {
+    require_finalize_funding_purpose(reservation.purpose)?;
+    validate_transfer_reservation_binding(current_transfer, reservation)?;
+    let mut coins = Vec::with_capacity(reservation.funding_inputs.len() + 1);
+    coins.push(current_transfer.transfer_coin().clone());
+    coins.extend(canonical_input_coins(&reservation.funding_inputs)?);
+    validate_final_fee_quote_evidence(
+        signed_transaction,
+        &coins,
+        quote,
+        current_transfer.binding(),
+        current_transfer.mempool_binding(),
         expected_fee,
         maximum_fee,
     )
@@ -832,6 +1100,27 @@ fn ensure_shakedex_observation_ready(cache: &HnsRuntimeCache) -> Result<(), HnsW
         return Err(HnsWalletError::StaleNodeSnapshot);
     }
     Ok(())
+}
+
+fn require_lock_funding_purpose(purpose: HnsShakedexFundingPurpose) -> Result<(), HnsWalletError> {
+    if matches!(
+        purpose,
+        HnsShakedexFundingPurpose::BuyerFulfillment | HnsShakedexFundingPurpose::SellerRecovery
+    ) {
+        Ok(())
+    } else {
+        Err(HnsWalletError::InvalidWorkflow)
+    }
+}
+
+fn require_finalize_funding_purpose(
+    purpose: HnsShakedexFundingPurpose,
+) -> Result<(), HnsWalletError> {
+    if purpose == HnsShakedexFundingPurpose::SellerScriptFinalize {
+        Ok(())
+    } else {
+        Err(HnsWalletError::InvalidWorkflow)
+    }
 }
 
 fn validate_reservation_identity(
@@ -1039,6 +1328,21 @@ fn same_current_shakedex_lock(
         && left.current_name_state() == right.current_name_state()
 }
 
+fn same_current_shakedex_transfer(
+    left: &VerifiedCurrentShakedexTransfer,
+    right: &VerifiedCurrentShakedexTransfer,
+) -> bool {
+    left.binding() == right.binding()
+        && left.mempool_binding() == right.mempool_binding()
+        && left.descriptor() == right.descriptor()
+        && left.transfer_transaction() == right.transfer_transaction()
+        && left.transfer_coin() == right.transfer_coin()
+        && left.owner_inclusion() == right.owner_inclusion()
+        && left.current_name_state() == right.current_name_state()
+        && left.renewal_block_height() == right.renewal_block_height()
+        && left.renewal_block_hash() == right.renewal_block_hash()
+}
+
 fn validate_lock_reservation_binding(
     current_lock: &VerifiedCurrentShakedexLock,
     reservation: &HnsShakedexFundingReservation,
@@ -1056,8 +1360,38 @@ fn validate_lock_reservation_binding(
     Ok(())
 }
 
+fn validate_transfer_reservation_binding(
+    current_transfer: &VerifiedCurrentShakedexTransfer,
+    reservation: &HnsShakedexFundingReservation,
+) -> Result<(), HnsWalletError> {
+    require_finalize_funding_purpose(reservation.purpose)?;
+    let descriptor = current_transfer.descriptor();
+    let name_hash = hash_name(&descriptor.name).map_err(|_| HnsWalletError::InvalidEvidence)?;
+    let transfer = current_transfer.transfer_coin();
+    let outpoint = HnsOutpoint {
+        transaction: TransactionHash::new(transfer.outpoint.transaction_hash.into_bytes()),
+        output_index: transfer.outpoint.index,
+    };
+    if reservation.name_hash != *name_hash.as_bytes() || reservation.source_outpoint != outpoint {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(())
+}
+
 fn validate_prepared_shakedex_funding_transaction(
     current_lock: &VerifiedCurrentShakedexLock,
+    reservation: &HnsShakedexFundingReservation,
+    prepared_transaction: &[u8],
+) -> Result<Transaction, HnsWalletError> {
+    validate_prepared_shakedex_funding_transaction_for_source(
+        current_lock.locking_coin(),
+        reservation,
+        prepared_transaction,
+    )
+}
+
+fn validate_prepared_shakedex_funding_transaction_for_source(
+    source_coin: &Coin,
     reservation: &HnsShakedexFundingReservation,
     prepared_transaction: &[u8],
 ) -> Result<Transaction, HnsWalletError> {
@@ -1069,7 +1403,7 @@ fn validate_prepared_shakedex_funding_transaction(
         != prepared_transaction
         || transaction.is_coinbase()
         || transaction.inputs.len() != reservation.funding_inputs.len() + 1
-        || transaction.inputs[0].previous_output != current_lock.locking_coin().outpoint
+        || transaction.inputs[0].previous_output != source_coin.outpoint
         || transaction.inputs[0].witness.items.is_empty()
         || transaction.inputs[1..]
             .iter()
@@ -1084,6 +1418,41 @@ fn validate_prepared_shakedex_funding_transaction(
         if input.previous_output != coin.to_canonical_coin()?.outpoint {
             return Err(HnsWalletError::InvalidPreparedArtifact);
         }
+    }
+    Ok(transaction)
+}
+
+fn validate_prepared_shakedex_finalize_funding_transaction(
+    current_transfer: &VerifiedCurrentShakedexTransfer,
+    reservation: &HnsShakedexFundingReservation,
+    prepared_transaction: &[u8],
+) -> Result<Transaction, HnsWalletError> {
+    validate_transfer_reservation_binding(current_transfer, reservation)?;
+    let transaction = validate_prepared_shakedex_funding_transaction_for_source(
+        current_transfer.transfer_coin(),
+        reservation,
+        prepared_transaction,
+    )?;
+    hns_transaction::verify_finalize_at_index_zero(
+        &transaction,
+        current_transfer.transfer_coin(),
+        current_transfer.current_name_state(),
+        BlockHash::new(current_transfer.renewal_block_hash()),
+    )
+    .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+    let transfer = TransferCovenant::try_from(&current_transfer.transfer_coin().covenant)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    if transaction.inputs[0].witness
+        != current_transfer
+            .descriptor()
+            .finalize_witness()
+            .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?
+        || transaction.outputs.first().is_none_or(|output| {
+            output.address.version != transfer.recipient_version
+                || output.address.hash != transfer.recipient_hash
+        })
+    {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
     }
     Ok(transaction)
 }
@@ -1343,5 +1712,23 @@ mod tests {
         .expect("released rows absent");
         create_hns_shakedex_funding_reservations(&store, &second_scope, &second, 1_003)
             .expect("source reusable only after explicit release");
+    }
+
+    #[test]
+    fn production_next_shakedex_finalize_purpose_never_crosses_lock_authority() {
+        for purpose in [
+            HnsShakedexFundingPurpose::BuyerFulfillment,
+            HnsShakedexFundingPurpose::SellerRecovery,
+        ] {
+            assert!(require_lock_funding_purpose(purpose).is_ok());
+            assert!(require_finalize_funding_purpose(purpose).is_err());
+        }
+        assert!(
+            require_lock_funding_purpose(HnsShakedexFundingPurpose::SellerScriptFinalize).is_err()
+        );
+        assert!(
+            require_finalize_funding_purpose(HnsShakedexFundingPurpose::SellerScriptFinalize)
+                .is_ok()
+        );
     }
 }

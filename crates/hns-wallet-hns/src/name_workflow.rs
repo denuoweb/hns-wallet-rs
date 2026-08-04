@@ -268,14 +268,16 @@ impl fmt::Debug for VerifiedCurrentShakedexLock {
 }
 
 /// Ephemeral current-chain authority for the exact unspent TRANSFER created
-/// from a Shakedex lock. It additionally binds canonical FINALIZE renewal
-/// evidence under the same chain/mempool snapshot.
+/// from a Shakedex lock. It additionally binds the exact active-chain owner
+/// inclusion and canonical FINALIZE renewal evidence under the same
+/// chain/mempool snapshot.
 pub struct VerifiedCurrentShakedexTransfer {
     binding: SnapshotBinding,
     mempool: MempoolSnapshotBinding,
     descriptor: hns_swap::ShakedexLockDescriptor,
     transfer_transaction: Transaction,
     transfer_coin: Coin,
+    owner_inclusion: TransactionInclusion,
     current_state: NameState,
     renewal_block_height: u64,
     renewal_block_hash: [u8; 32],
@@ -302,6 +304,10 @@ impl VerifiedCurrentShakedexTransfer {
         &self.transfer_coin
     }
 
+    pub const fn owner_inclusion(&self) -> TransactionInclusion {
+        self.owner_inclusion
+    }
+
     pub const fn current_name_state(&self) -> &NameState {
         &self.current_state
     }
@@ -322,6 +328,7 @@ impl fmt::Debug for VerifiedCurrentShakedexTransfer {
             .field("binding", &self.binding)
             .field("mempool", &self.mempool)
             .field("transfer_outpoint", &self.transfer_coin.outpoint)
+            .field("owner_inclusion", &self.owner_inclusion)
             .field(
                 "name_hash",
                 &hex::encode(self.current_state.name_hash.as_bytes()),
@@ -2696,6 +2703,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             descriptor: descriptor.clone(),
             transfer_transaction,
             transfer_coin,
+            owner_inclusion: owner.inclusion,
             current_state: current.state,
             renewal_block_height,
             renewal_block_hash,

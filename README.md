@@ -57,6 +57,17 @@ maturity tracking, and reorg recovery. They remain unavailable through the
 product while the HNS value/fee gates are false and provider integration and
 qualification are incomplete.
 
+The encrypted Shakedex value aggregate also has a source-level
+seller-script-FINALIZE variant. It binds an exact signed buyer-fulfillment or
+seller-recovery parent, the canonical TRANSFER transaction/output-zero coin,
+current NameState and owner inclusion, snapshot/mempool and renewal evidence,
+purpose-separated funding reservations, revision-bound approval, signed bytes,
+final quote, pre-broadcast fence, and the existing terminal-release audit
+state. Save, signing, and submission reacquire the non-serializable current
+TRANSFER authority; persisted evidence never recreates it. Every Shakedex and
+dependent HNS funding/value/fee gate remains `false`, and the new focused
+source tests were not built or executed in this tranche.
+
 ## Crates
 
 - `hns-wallet-types`: wallet-local identifiers and UI-safe summaries.
@@ -65,7 +76,8 @@ qualification are incomplete.
 - `hns-wallet-chain-api`: modular chain and settlement capability traits.
 - `hns-wallet-hns`: Handshake account/name workflows and node backend.
 - `hns-wallet-provider`: hostile-page request, permission, and approval core.
-- `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery schemas.
+- `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery and
+  post-TRANSFER script-FINALIZE schemas.
 - `hns-wallet-market`: price-bound reservations and atomic-swap recovery.
 - `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, encrypted session-bound swap-key allocation primitive, and Bitcoin HTLC adapter.
 - `hns-wallet-ethereum`: offline native-ETH account derivation plus
