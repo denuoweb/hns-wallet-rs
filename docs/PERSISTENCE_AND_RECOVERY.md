@@ -100,10 +100,15 @@ can be resumed.
 The additive tagged FINALIZE structural variant stores the exact signed
 buyer-fulfillment or seller-recovery parent action, canonical bytes and hash;
 the TRANSFER transaction and output-zero coin; current NameState and owner
-inclusion; snapshot/mempool binding; and renewal height/hash. These facts are
-immutable restart evidence. They do not serialize or recreate
+inclusion; historical snapshot/mempool binding; and renewal height/hash. These
+facts are immutable restart evidence. They do not serialize or recreate
 `VerifiedCurrentShakedexTransfer`, and CAS cannot replace them with another
 parent, transfer, purpose, owner, state, or renewal commitment.
+On resume, fresh snapshot/mempool tokens may advance without changing this
+historical record. Authority reacquisition compares the stable descriptor,
+transaction/coin, owner inclusion, NameState, and renewal identity exactly;
+the HNS runtime separately enforces exact live bindings within each immediate
+bind/sign/submit fence.
 
 The initial workflow CAS also writes one protected source reservation and every
 protected funding reservation. The source row uses a store-global record ID
@@ -166,8 +171,8 @@ snapshot bindings as current authority.
 
 Script-controlled FINALIZE is durable in source, including atomic workflow plus
 source/funding reservation persistence and the shared evidence-backed terminal
-release path. The six new `production_next_` restart/reopen/CAS/replacement/
-reorg/finality source tests were not built or executed in this tranche. All
+release path. The seven new `production_next_` restart/reopen/CAS/replacement/
+binding-advance/reorg/finality source tests were not built or executed in this tranche. All
 Shakedex value authorization and submission entrypoints remain unreachable
 while the fixed Shakedex and HNS Shakedex-funding/value/fee release gates are
 `false`; live Denuo/provider/UI

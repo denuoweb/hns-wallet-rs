@@ -139,9 +139,10 @@ changes, exact signed witnesses, fee algebra, and state-transition invariants.
 The FINALIZE structural variant additionally fixes the exact signed
 buyer-fulfillment or seller-recovery parent action/bytes/hash, TRANSFER
 transaction and output-zero coin, current NameState and owner inclusion,
-snapshot/mempool binding, and renewal evidence. These serialized facts remain
-historical evidence and never reconstruct the ephemeral current-TRANSFER
-authority.
+historical snapshot/mempool binding, and renewal evidence. These serialized
+facts never reconstruct the ephemeral current-TRANSFER authority. Fresh
+authority may carry advanced binding tokens only when the stable descriptor,
+transaction/coin, owner inclusion, NameState, and renewal identity is exact.
 
 The HNS side creates protected `ShakedexSource` and `ShakedexFunding` entities
 for the aggregate's existing store CAS. The source entity uses a global ID
@@ -170,7 +171,10 @@ current-lock APIs; seller-script FINALIZE has a separate purpose and APIs that
 can enter only with a freshly reacquired exact current TRANSFER. Save and
 authorization reacquire that authority, while submission reacquires it for the
 quote and again immediately before the broadcast fence. The runtime
-authenticates the unchanged pending approval, preserves script input zero, and
+requires exact live current/reacquired binding equality within each of those
+immediate HNS operations; it does not compare a fresh binding to the historical
+construction tokens.
+It authenticates the unchanged pending approval, preserves script input zero, and
 signs only the ordinary funding suffix. It returns the approval unconsumed so
 one store transaction can persist the verified signed bytes and exact final-byte quote,
 activate reservations, and consume that same row. Before submission, the

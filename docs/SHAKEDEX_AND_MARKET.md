@@ -88,6 +88,11 @@ output-zero coin; current NameState and owner inclusion; chain/mempool binding;
 and renewal height/hash. Those fields are immutable evidence, not restored
 authority. A changed parent action, transfer, owner inclusion, state, renewal
 commitment, funding purpose, or CAS identity fails closed.
+The stored chain/mempool tokens describe construction history rather than a
+permanent liveness condition. A freshly reacquired authority may have advanced
+tokens only when the descriptor, parent bytes, TRANSFER coin, owner inclusion,
+NameState, and renewal height/hash remain exact; immediate HNS runtime fences
+still require their live current/reacquired tokens to match exactly.
 
 The `ShakedexValue` aggregate is a distinct child of one canonical buyer or
 seller plan. Its deterministic ID binds the parent and action, including a
@@ -127,7 +132,7 @@ revision. Runtime-owned time governs preparation, approval expiry,
 authorization, and submission timestamps. Buyer fulfillment and seller
 recovery use only current-lock authority; seller-script FINALIZE has a distinct
 reservation purpose and APIs that accept only current-TRANSFER authority. The
-runtime reacquires the relevant non-serializable authority and exact
+runtime reacquires the relevant non-serializable authority and its fresh
 chain/mempool binding, checks the protected reservations and current cached
 funding coins, preserves input zero and its script witness byte-for-byte, and
 signs only the ordinary P2PKH suffix. A lock-purpose reservation cannot cross
@@ -196,7 +201,8 @@ Denuo/provider/trusted-UI integration, and complete
 regtest/restart/reorg/product qualification are still required before any gate
 can change. The previously recorded terminal-release tests remain the only
 executed focused evidence; the six new `production_next_` FINALIZE source tests
-were not built or executed in this tranche. Reverse Dutch is deferred.
+plus the HNS purpose-separation test—seven `production_next_` tests total—were
+not built or executed in this tranche. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 

@@ -347,24 +347,70 @@ impl CurrentShakedexTransferEvidence {
         parent: &ShakedexScriptFinalizeParent,
         current: &VerifiedCurrentShakedexTransfer,
     ) -> Result<(), ShakedexError> {
+        // Persisted snapshot tokens authenticate historical construction, not
+        // liveness. The HNS runtime separately requires exact live bindings
+        // around each immediate reacquisition/signing/submission fence.
+        self.validate_stable_current_identity(
+            parent,
+            current.descriptor(),
+            current.transfer_transaction(),
+            current.transfer_coin(),
+            current.owner_inclusion(),
+            current.current_name_state(),
+            current.renewal_block_height(),
+            current.renewal_block_hash(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_stable_current_identity(
+        &self,
+        parent: &ShakedexScriptFinalizeParent,
+        descriptor: &hns_swap::ShakedexLockDescriptor,
+        transfer_transaction: &Transaction,
+        transfer_coin: &Coin,
+        owner_inclusion: TransactionInclusion,
+        current_name_state: &NameState,
+        renewal_block_height: u64,
+        renewal_block_hash: [u8; 32],
+    ) -> Result<(), ShakedexError> {
         let supplied_lock = parent.supplied_lock()?;
-        if current.descriptor() != supplied_lock.descriptor()
-            || current.binding() != self.binding
-            || current.mempool_binding() != self.mempool
-            || current
-                .transfer_transaction()
+        if descriptor != supplied_lock.descriptor()
+            || transfer_transaction
                 .encode()
                 .map_err(|_| ShakedexError::InvalidEvidence)?
                 != self.transfer_transaction
-            || current.transfer_coin() != &self.transfer_coin()?
-            || current.owner_inclusion() != self.owner_inclusion
-            || current.current_name_state() != &self.current_name_state(parent.name_hash())?
-            || current.renewal_block_height() != self.renewal_block_height
-            || current.renewal_block_hash() != self.renewal_block_hash
+            || transfer_coin != &self.transfer_coin()?
+            || owner_inclusion != self.owner_inclusion
+            || current_name_state != &self.current_name_state(parent.name_hash())?
+            || renewal_block_height != self.renewal_block_height
+            || renewal_block_hash != self.renewal_block_hash
         {
             return Err(ShakedexError::InvalidEvidence);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn validate_reacquired_evidence(
+        &self,
+        parent: &ShakedexScriptFinalizeParent,
+        reacquired: &Self,
+    ) -> Result<(), ShakedexError> {
+        let transaction = canonical_transaction(&reacquired.transfer_transaction)?;
+        let coin = reacquired.transfer_coin()?;
+        let state = reacquired.current_name_state(parent.name_hash())?;
+        let supplied_lock = parent.supplied_lock()?;
+        self.validate_stable_current_identity(
+            parent,
+            supplied_lock.descriptor(),
+            &transaction,
+            &coin,
+            reacquired.owner_inclusion,
+            &state,
+            reacquired.renewal_block_height,
+            reacquired.renewal_block_hash,
+        )
     }
 }
 
@@ -3625,6 +3671,39 @@ mod tests {
         );
         assert_eq!(transfer.owner_inclusion.height, 200);
         assert_eq!(transfer.renewal_block_hash, [0x66; 32]);
+    }
+
+    #[test]
+    fn production_next_script_finalize_harmless_binding_advance_preserves_stable_identity() {
+        let workflow = production_next_script_finalize_fixture();
+        let encoded = serde_json::to_vec(&workflow).expect("workflow encoding");
+        let restarted: ShakedexValueWorkflow =
+            serde_json::from_slice(&encoded).expect("workflow restart decode");
+        let (parent, historical) = restarted
+            .script_finalize_transfer_identity()
+            .expect("script FINALIZE identity");
+        let mut reacquired = historical.clone();
+        reacquired.binding = binding(10, 501, 0x73);
+        reacquired.mempool = MempoolSnapshotBinding {
+            instance_nonce: [0x74; 32],
+            generation: 1,
+        };
+        assert_ne!(reacquired.binding, historical.binding);
+        assert_ne!(reacquired.mempool, historical.mempool);
+        reacquired
+            .validate(parent)
+            .expect("advanced historical evidence remains structural");
+        historical
+            .validate_reacquired_evidence(parent, &reacquired)
+            .expect("harmless live binding advance");
+
+        reacquired.owner_inclusion.height += 1;
+        assert!(
+            historical
+                .validate_reacquired_evidence(parent, &reacquired)
+                .is_err(),
+            "stable owner identity changes must still fail closed"
+        );
     }
 
     #[cfg(unix)]

@@ -151,7 +151,7 @@ canonical parent plan, exact lock or TRANSFER source, ordered funding coins,
 recipient, value, exact fee and maximum, confirmation policy, expiry, and
 prepared bytes. FINALIZE also commits the exact signed parent action/bytes/hash,
 TRANSFER transaction/output-zero coin, NameState, owner inclusion,
-snapshot/mempool binding, and renewal evidence. The runtime owns the clock.
+historical snapshot/mempool binding, and renewal evidence. The runtime owns the clock.
 Lock spends accept only current-lock authority and their two existing purposes;
 FINALIZE uses a new purpose and APIs that accept only current-TRANSFER
 authority. The runtime reacquires that authority before signing and signs only
@@ -297,6 +297,11 @@ witnesses must be empty; authorization preserves input zero byte-for-byte, signs
 with exact P2PKH `SIGHASH_ALL` witnesses, and revalidates the canonical signed
 transaction. Persisted quote validation recomputes ordered input/output fee
 algebra after restart but does not treat the quote's old snapshot as current.
+Persisted construction bindings are likewise historical: harmless tip,
+mempool-generation, or node-instance advances are accepted only when the exact
+descriptor, transaction/coin, owner inclusion, NameState, and renewal identity
+remain stable. Within an immediate bind/sign/submit operation, the HNS runtime
+still requires exact live current/reacquired bindings.
 Submission reacquires current lock authority or exact current-TRANSFER
 authority, re-quotes the persisted bytes, and durably records
 `RequiresRebroadcast` with the active reservation CAS before the node call.
@@ -321,7 +326,7 @@ position; a sufficiently final authenticated competitor on any exact input may
 release the now-unspendable competing transaction. Released rows are never
 recreated, and later finality disagreement remains read-only
 `RecoveryRequired`. Product coin selection, live Denuo/provider/trusted-UI
-integration, execution of the six new focused tests, and complete
+integration, execution of the seven new focused tests, and complete
 restart/reorg/regtest qualification remain pending.
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`,

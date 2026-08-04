@@ -60,11 +60,15 @@ qualification are incomplete.
 The encrypted Shakedex value aggregate also has a source-level
 seller-script-FINALIZE variant. It binds an exact signed buyer-fulfillment or
 seller-recovery parent, the canonical TRANSFER transaction/output-zero coin,
-current NameState and owner inclusion, snapshot/mempool and renewal evidence,
+current NameState and owner inclusion, historical snapshot/mempool evidence,
+and exact renewal evidence,
 purpose-separated funding reservations, revision-bound approval, signed bytes,
 final quote, pre-broadcast fence, and the existing terminal-release audit
 state. Save, signing, and submission reacquire the non-serializable current
-TRANSFER authority; persisted evidence never recreates it. Every Shakedex and
+TRANSFER authority; a harmless live binding advance is accepted only when the
+stable transfer/owner/state/renewal identity is unchanged, while the HNS
+runtime requires exact bindings within each immediate live fence. Persisted
+evidence never recreates authority. Every Shakedex and
 dependent HNS funding/value/fee gate remains `false`, and the new focused
 source tests were not built or executed in this tranche.
 
