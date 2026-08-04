@@ -17,9 +17,13 @@ The checked-in service executable now requires an explicit existing wallet
 database, opens it through the platform filesystem checks in a locked state,
 and shares one decrypted-key authority between runtime control and encrypted
 provider permissions. ABI wallet status/unlock/lock and a narrow provider
-control surface are implemented. Wallet creation/restoration, account
-selection, chain reads, browser integration, and every value path remain
-unavailable in that executable.
+control surface are implemented. A separate library composition can bind one
+exact pre-existing HNS account selector to that identical shared authority and
+add only `hns_requestAccounts`/`hns_accounts`; selection is authenticated again
+on every read and never creates an account or contacts a node. The checked-in
+executable still has no account-selection inputs. Wallet creation/restoration,
+synchronized chain reads, browser integration, and every value path remain
+unavailable there.
 
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
@@ -67,8 +71,8 @@ qualification are incomplete.
 - `hns-wallet-ethereum`: offline native-ETH account derivation plus
   release-gated Helios/HTLC policy.
 - `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.
-- `hns-wallet-service`: private session/authority registry plus the locked,
-  existing-database provider control subprocess.
+- `hns-wallet-service`: private session/authority registry plus locked,
+  existing-database control and exact-account library compositions.
 - `hns-wallet-host`: caller-side negotiation, correlation, authority, approval,
   binding, and event-replay state for trusted browser/mobile adapters.
 - `hns-wallet-testkit`: deterministic, non-mainnet fixtures.

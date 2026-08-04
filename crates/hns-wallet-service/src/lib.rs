@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use hns_wallet_ffi::{
     APPROVAL_SCHEMA_VERSION, AccountSummary, ApprovalPrompt, ApprovalSummary, HostAuthorityFacts,
     HostFrame, MAX_PROVIDER_RESULT_BYTES, MAX_PUBLIC_STRING_BYTES, ModuleApprovalAction,
-    PROVIDER_SCHEMA_VERSION, ProviderBinding, ProviderCapabilitySnapshot,
-    ProviderEventEnvelope, ProviderEventPayload, ProviderNamespace, ServiceCapability,
-    ServiceErrorCode, ServiceFailure, ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest,
-    ServiceResponse, SessionEnvelope, WALLET_ABI_VERSION, WalletRequest, WalletResponse,
-    WalletRuntimeStatus, encode_service_frame,
+    PROVIDER_SCHEMA_VERSION, ProviderBinding, ProviderCapabilitySnapshot, ProviderEventEnvelope,
+    ProviderEventPayload, ProviderNamespace, ServiceCapability, ServiceErrorCode, ServiceFailure,
+    ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest, ServiceResponse, SessionEnvelope,
+    WALLET_ABI_VERSION, WalletRequest, WalletResponse, WalletRuntimeStatus, encode_service_frame,
 };
+use hns_wallet_hns::{HnsExistingAccountSelector, HnsWalletError};
 use hns_wallet_provider::{
     ApprovedCall, HostAuthorityRegistration, Origin, PROVIDER_API_VERSION, PendingApproval,
     PermissionSnapshot, ProviderAction, ProviderCore, ProviderError, ProviderMethod,
@@ -48,6 +48,15 @@ pub trait ServiceRuntime {
         &mut self,
         _: &ApprovedCall,
     ) -> Result<AccountSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    /// Return the runtime's current single HNS account selection without
+    /// prompting or accepting a caller-selected identity. Persisted account
+    /// permissions are rechecked against this value after every restart.
+    fn selected_hns_account(&self) -> Result<AccountSummary, ServiceFailure> {
         Err(ServiceFailure::unsupported(
             ServiceCapability::ProviderDispatch,
         ))
@@ -166,6 +175,158 @@ impl ServiceRuntime for PersistentControlRuntime {
             WalletRequest::CreateWallet { .. }
             | WalletRequest::RestoreWallet { .. }
             | WalletRequest::ListAccounts
+            | WalletRequest::Balance { .. }
+            | WalletRequest::ReceiveTarget { .. }
+            | WalletRequest::TransactionHistory { .. }
+            | WalletRequest::ModuleStatus { .. }
+            | WalletRequest::WorkflowStatus { .. } => Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            )),
+        }
+    }
+}
+
+/// Trusted library inputs for the exact-existing-account HNS composition.
+/// The checked-in executable intentionally has no insecure CLI defaults for
+/// wallet/account selection, so product code must build the selector from the
+/// same shared store handle passed to the service.
+pub struct PersistentHnsAccountConfig {
+    pub selector: HnsExistingAccountSelector,
+    pub account_label: String,
+}
+
+/// Concrete non-value runtime which can select and disclose only one exact
+/// authenticated pre-existing HNS account. Synchronized chain reads remain a
+/// separate unavailable composition.
+pub struct PersistentHnsAccountRuntime {
+    store: SharedWalletStore,
+    selector: HnsExistingAccountSelector,
+    account_label: String,
+}
+
+impl PersistentHnsAccountRuntime {
+    fn new(store: SharedWalletStore, config: PersistentHnsAccountConfig) -> Self {
+        Self {
+            store,
+            selector: config.selector,
+            account_label: config.account_label,
+        }
+    }
+
+    fn status(&self) -> Result<WalletRuntimeStatus, ServiceFailure> {
+        let locked = self.store.is_locked().map_err(persistent_store_failure)?;
+        let active_wallet = if locked {
+            None
+        } else {
+            Some(
+                self.selector
+                    .selected_account()
+                    .map_err(hns_runtime_failure)?
+                    .config
+                    .wallet_id,
+            )
+        };
+        Ok(WalletRuntimeStatus {
+            locked,
+            active_wallet,
+            enabled_modules: BTreeSet::new(),
+            mainnet_settlement_enabled: false,
+        })
+    }
+
+    fn exact_account(&self) -> Result<AccountSummary, ServiceFailure> {
+        if self.store.is_locked().map_err(persistent_store_failure)? {
+            return Err(wallet_locked());
+        }
+        let selected = self
+            .selector
+            .selected_account()
+            .map_err(hns_runtime_failure)?;
+        Ok(AccountSummary {
+            account_id: selected.config.account_id,
+            module: ModuleId::Handshake,
+            label: self.account_label.clone(),
+            receive_display: None,
+        })
+    }
+
+    fn unlock(&self, passphrase: &str) -> Result<(), ServiceFailure> {
+        self.store
+            .unlock(passphrase)
+            .map_err(persistent_store_failure)?;
+        if let Err(error) = self.selector.selected_account() {
+            self.store.lock().map_err(persistent_store_failure)?;
+            return Err(hns_runtime_failure(error));
+        }
+        Ok(())
+    }
+}
+
+impl ServiceRuntime for PersistentHnsAccountRuntime {
+    fn capabilities(&self) -> BTreeSet<ServiceCapability> {
+        BTreeSet::from([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::ProviderDispatch,
+        ])
+    }
+
+    fn supports_provider_method(&self, method: ProviderMethod) -> bool {
+        matches!(
+            method,
+            ProviderMethod::WalletGetStatus | ProviderMethod::HnsRequestAccounts
+        )
+    }
+
+    fn prepare_approval(&mut self, _: &PendingApproval) -> Result<ApprovalSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    fn prepare_hns_account_grant(
+        &mut self,
+        _: &ApprovedCall,
+    ) -> Result<AccountSummary, ServiceFailure> {
+        self.exact_account()
+    }
+
+    fn selected_hns_account(&self) -> Result<AccountSummary, ServiceFailure> {
+        self.exact_account()
+    }
+
+    fn execute_provider(&mut self, call: ApprovedCall) -> Result<Value, ServiceFailure> {
+        if call.method != ProviderMethod::WalletGetStatus {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ));
+        }
+        validate_empty_params(&call.params)?;
+        serde_json::to_value(self.status()?)
+            .map_err(|_| invalid_request("wallet status encoding failed"))
+    }
+
+    fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+        self.store.lock().map_err(persistent_store_failure)
+    }
+
+    fn execute_wallet(&mut self, request: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
+        match request {
+            WalletRequest::Status => Ok(WalletResponse::Status {
+                status: self.status()?,
+            }),
+            WalletRequest::Unlock { passphrase } => {
+                self.unlock(passphrase.expose_secret())?;
+                Ok(WalletResponse::Unlocked)
+            }
+            WalletRequest::Lock => {
+                self.lock_wallet()?;
+                Ok(WalletResponse::Locked)
+            }
+            WalletRequest::ListAccounts => Ok(WalletResponse::Accounts {
+                accounts: vec![self.exact_account()?],
+            }),
+            WalletRequest::CreateWallet { .. }
+            | WalletRequest::RestoreWallet { .. }
             | WalletRequest::Balance { .. }
             | WalletRequest::ReceiveTarget { .. }
             | WalletRequest::TransactionHistory { .. }
@@ -673,6 +834,14 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         };
         match action {
             ProviderAction::Execute(call) => {
+                let lock_permission_generation = if call.method == ProviderMethod::WalletLock {
+                    Some(
+                        self.provider_binding(authority_handle, authority_revision, now_unix_ms)?
+                            .permission_generation,
+                    )
+                } else {
+                    None
+                };
                 let value = self.execute_call(
                     authority_handle,
                     authority_revision,
@@ -680,8 +849,17 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     None,
                     now_unix_ms,
                 )?;
-                let binding =
-                    self.provider_binding(authority_handle, authority_revision, now_unix_ms)?;
+                let binding = match lock_permission_generation {
+                    Some(permission_generation) => ProviderBinding {
+                        authority_handle,
+                        authority_revision,
+                        wallet_session_id: self.provider.wallet_session_id(),
+                        permission_generation,
+                    },
+                    None => {
+                        self.provider_binding(authority_handle, authority_revision, now_unix_ms)?
+                    }
+                };
                 Ok(ServiceResponse::ProviderResult { binding, value })
             }
             ProviderAction::ApprovalRequired(approval) => {
@@ -1113,20 +1291,17 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         let record = permission
             .record
             .ok_or_else(|| provider_failure(ProviderError::Unauthorized))?;
+        let selected = self.runtime.selected_hns_account()?;
+        validate_hns_account_summary(&selected)?;
+        let selected_accounts = BTreeSet::from([selected.account_id]);
         if !record
             .capabilities
             .contains(&PermissionCapability::Accounts)
-            || record.approved_accounts.is_empty()
+            || record.approved_accounts != selected_accounts
         {
             return Err(provider_failure(ProviderError::Unauthorized));
         }
-        Ok(Value::Array(
-            record
-                .approved_accounts
-                .iter()
-                .map(|account| Value::String(account.to_string()))
-                .collect(),
-        ))
+        Ok(json!([selected.account_id.to_string()]))
     }
 }
 
@@ -1139,6 +1314,31 @@ impl WalletService<SharedWalletStore, PersistentControlRuntime> {
             return Err(ServiceError::PersistentStoreMustStartLocked);
         }
         let runtime = PersistentControlRuntime::new(store.clone());
+        Self::new(store, runtime, true)
+    }
+}
+
+impl WalletService<SharedWalletStore, PersistentHnsAccountRuntime> {
+    /// Compose a locked exact-account HNS provider around the identical shared
+    /// store/key authority used by `ProviderCore`. Another handle to the same
+    /// database path is not sufficient: Arc identity must match.
+    pub fn new_persistent_hns_accounts(
+        store: SharedWalletStore,
+        config: PersistentHnsAccountConfig,
+    ) -> Result<Self, ServiceError> {
+        if !store.is_locked()? {
+            return Err(ServiceError::PersistentStoreMustStartLocked);
+        }
+        if !config.selector.shares_store_authority(&store) {
+            return Err(ServiceError::PersistentStoreAuthorityMismatch);
+        }
+        if config.account_label.is_empty()
+            || config.account_label.len() > MAX_PUBLIC_STRING_BYTES
+            || !config.account_label.is_ascii()
+        {
+            return Err(ServiceError::InvalidPersistentHnsAccount);
+        }
+        let runtime = PersistentHnsAccountRuntime::new(store.clone(), config);
         Self::new(store, runtime, true)
     }
 }
@@ -1348,6 +1548,36 @@ fn invalid_request(message: &str) -> ServiceFailure {
     }
 }
 
+fn wallet_locked() -> ServiceFailure {
+    ServiceFailure {
+        code: ServiceErrorCode::WalletLocked,
+        message: "wallet is locked".to_owned(),
+        unsupported_capability: None,
+    }
+}
+
+fn hns_runtime_failure(error: HnsWalletError) -> ServiceFailure {
+    let (code, message) = match error {
+        HnsWalletError::StoreLocked => (ServiceErrorCode::WalletLocked, "wallet is locked"),
+        HnsWalletError::Store
+        | HnsWalletError::AccountConfigurationMismatch
+        | HnsWalletError::DuplicateAccountDerivation
+        | HnsWalletError::InvalidEvidence => (
+            ServiceErrorCode::PersistenceFailure,
+            "exact Handshake account selection failed",
+        ),
+        _ => (
+            ServiceErrorCode::RuntimeFailure,
+            "Handshake account selector failed",
+        ),
+    };
+    ServiceFailure {
+        code,
+        message: message.to_owned(),
+        unsupported_capability: None,
+    }
+}
+
 fn stale_approval() -> ServiceFailure {
     ServiceFailure {
         code: ServiceErrorCode::ApprovalStale,
@@ -1413,6 +1643,10 @@ pub enum ServiceError {
     Store(#[from] StoreError),
     #[error("persistent wallet service must start with a locked store")]
     PersistentStoreMustStartLocked,
+    #[error("persistent HNS selector must share the identical store authority")]
+    PersistentStoreAuthorityMismatch,
+    #[error("persistent HNS account configuration is invalid")]
+    InvalidPersistentHnsAccount,
     #[error("host must negotiate a private service session first")]
     HandshakeRequired,
     #[error("wallet service session was already negotiated")]
@@ -1431,9 +1665,12 @@ pub enum ServiceError {
 mod tests {
     use super::*;
     use hns_wallet_ffi::{HostHello, decode_service_frame, encode_host_frame};
+    use hns_wallet_hns::{HnsAccountRecord, HnsNetwork, HnsRuntimeConfig};
     use hns_wallet_provider::MemoryProviderState;
     use hns_wallet_store::WalletStore;
-    use hns_wallet_types::{AccountId, BrowserRuntimeSessionId, ProviderAuthorityFingerprint};
+    use hns_wallet_types::{
+        AccountId, BaseUnits, BrowserRuntimeSessionId, ProviderAuthorityFingerprint, WalletId,
+    };
 
     const NOW_MS: u64 = 100_000;
 
@@ -1505,6 +1742,16 @@ mod tests {
             _: &ApprovedCall,
         ) -> Result<AccountSummary, ServiceFailure> {
             Ok(self.account.clone())
+        }
+
+        fn selected_hns_account(&self) -> Result<AccountSummary, ServiceFailure> {
+            if self.account_join_available {
+                Ok(self.account.clone())
+            } else {
+                Err(ServiceFailure::unsupported(
+                    ServiceCapability::ProviderDispatch,
+                ))
+            }
         }
 
         fn execute_provider(&mut self, _: ApprovedCall) -> Result<Value, ServiceFailure> {
@@ -1586,6 +1833,113 @@ mod tests {
             .provider
             .set_wallet_state(service.wallet_session_id, false);
         service
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_hns_config(account_byte: u8, derivation_index: u32) -> HnsRuntimeConfig {
+        HnsRuntimeConfig {
+            wallet_id: WalletId::new([8_u8; 16]),
+            account_id: AccountId::new([account_byte; 16]),
+            account_derivation_index: derivation_index,
+            network: HnsNetwork::Regtest,
+            birthday_height: 0,
+            restore_lookahead: 1,
+            minimum_confirmations: 1,
+            dust_threshold: BaseUnits::new(1),
+            value_operations_enabled: false,
+            settlement_enabled: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_hns_account(config: HnsRuntimeConfig) -> HnsAccountRecord {
+        HnsAccountRecord {
+            config,
+            next_receive_index: 0,
+            next_change_index: 0,
+            next_name_index: 0,
+            next_shakedex_index: 0,
+            external_scan_end: 0,
+            internal_scan_end: 0,
+            name_scan_end: 0,
+            shakedex_scan_end: 0,
+            shakedex_scan_complete: false,
+            shakedex_scan_in_progress: false,
+            last_used_external: None,
+            last_used_internal: None,
+            last_used_name: None,
+            last_used_shakedex: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_hns_store(
+        database_path: &std::path::Path,
+        configs: &[HnsRuntimeConfig],
+    ) -> SharedWalletStore {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let store = SharedWalletStore::new(
+            WalletStore::create(database_path, PASSPHRASE).expect("create HNS account store"),
+        );
+        for (index, config) in configs.iter().cloned().enumerate() {
+            let selector = HnsExistingAccountSelector::new(store.clone(), config.clone())
+                .expect("account selector");
+            let account = production_hns_account(config);
+            store
+                .with_store_mut(|wallet| {
+                    wallet
+                        .save_wallet_account(
+                            &selector.expected_record_id(),
+                            0,
+                            &account,
+                            10 + index as u64,
+                        )
+                        .map(|_| ())
+                })
+                .expect("persist exact HNS account");
+        }
+        store.lock().expect("lock HNS account store");
+        store
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_hns_service(
+        store: SharedWalletStore,
+        config: HnsRuntimeConfig,
+    ) -> WalletService<SharedWalletStore, PersistentHnsAccountRuntime> {
+        let selector =
+            HnsExistingAccountSelector::new(store.clone(), config).expect("exact account selector");
+        WalletService::new_persistent_hns_accounts(
+            store,
+            PersistentHnsAccountConfig {
+                selector,
+                account_label: "Handshake".to_owned(),
+            },
+        )
+        .expect("persistent HNS account service")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unlock_production_hns(
+        service: &mut WalletService<SharedWalletStore, PersistentHnsAccountRuntime>,
+        now_unix_ms: u64,
+    ) {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Unlocked,
+        } = service
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Unlock {
+                        passphrase: hns_wallet_ffi::SecretString::new(PASSPHRASE.to_owned()),
+                    },
+                },
+                now_unix_ms,
+            )
+            .expect("unlock production HNS account service")
+        else {
+            panic!("unlock response")
+        };
     }
 
     fn hello() -> zeroize::Zeroizing<Vec<u8>> {
@@ -1848,6 +2202,472 @@ mod tests {
             .expect("restart permission snapshot");
         assert_eq!(permission.generation, 2);
         assert!(permission.record.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_next_advertises_only_exact_account_and_control_surface() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let first_directory = tempfile::tempdir().expect("first private directory");
+        std::fs::set_permissions(
+            first_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("first private permissions");
+        let config = production_hns_config(9, 0);
+        let first_store = production_hns_store(
+            &first_directory.path().join("wallet.sqlite3"),
+            std::slice::from_ref(&config),
+        );
+        let first_selector = HnsExistingAccountSelector::new(first_store.clone(), config.clone())
+            .expect("first selector");
+
+        let second_directory = tempfile::tempdir().expect("second private directory");
+        std::fs::set_permissions(
+            second_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("second private permissions");
+        let second_store = production_hns_store(
+            &second_directory.path().join("wallet.sqlite3"),
+            std::slice::from_ref(&config),
+        );
+        assert!(matches!(
+            WalletService::new_persistent_hns_accounts(
+                second_store.clone(),
+                PersistentHnsAccountConfig {
+                    selector: first_selector.clone(),
+                    account_label: "Handshake".to_owned(),
+                },
+            ),
+            Err(ServiceError::PersistentStoreAuthorityMismatch)
+        ));
+
+        let missing_selector = HnsExistingAccountSelector::new(
+            second_store.clone(),
+            production_hns_config(10, 1),
+        )
+        .expect("missing-account selector configuration");
+        let mut missing_account_service = WalletService::new_persistent_hns_accounts(
+            second_store.clone(),
+            PersistentHnsAccountConfig {
+                selector: missing_selector,
+                account_label: "Handshake".to_owned(),
+            },
+        )
+        .expect("locked missing-account composition");
+        assert!(matches!(
+            missing_account_service.dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Unlock {
+                        passphrase: hns_wallet_ffi::SecretString::new(
+                            "correct horse battery staple".to_owned(),
+                        ),
+                    },
+                },
+                NOW_MS,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PersistenceFailure,
+                ..
+            })
+        ));
+        assert!(second_store.is_locked().expect("failed unlock relocks store"));
+
+        let mut service = WalletService::new_persistent_hns_accounts(
+            first_store,
+            PersistentHnsAccountConfig {
+                selector: first_selector,
+                account_label: "Handshake".to_owned(),
+            },
+        )
+        .expect("same-authority composition");
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::ValueMovement)
+        );
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::BrowserIntegration)
+        );
+        service
+            .provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("authority");
+        unlock_production_hns(&mut service, NOW_MS + 1);
+        let ServiceResponse::ProviderCapabilities { capabilities, .. } = service
+            .provider_capabilities(handle(), 1, NOW_MS + 2)
+            .expect("capabilities")
+        else {
+            panic!("capabilities response")
+        };
+        assert_eq!(
+            capabilities.methods,
+            BTreeSet::from([
+                "hns_accounts".to_owned(),
+                "hns_requestAccounts".to_owned(),
+                "wallet_getCapabilities".to_owned(),
+                "wallet_getPermissions".to_owned(),
+                "wallet_getStatus".to_owned(),
+                "wallet_lock".to_owned(),
+                "wallet_revokePermissions".to_owned(),
+            ])
+        );
+        assert!(!capabilities.methods.contains("wallet_requestPermissions"));
+        assert!(!capabilities.methods.contains("hns_getBalance"));
+        assert!(!capabilities.methods.contains("hns_send"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_next_minimizes_and_rechecks_the_runtime_selected_singleton_account() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("private directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private permissions");
+        let config = production_hns_config(9, 0);
+        let alternate_config = production_hns_config(10, 1);
+        let store = production_hns_store(
+            &directory.path().join("wallet.sqlite3"),
+            &[config.clone(), alternate_config.clone()],
+        );
+        let mut service = production_hns_service(store.clone(), config.clone());
+        service
+            .provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("HNS authority");
+        let mut icann = registration();
+        icann.namespace = SelectedNamespace::Icann;
+        service
+            .provider
+            .register_authority(restart_handle(), icann, NOW_MS)
+            .expect("ICANN authority");
+        unlock_production_hns(&mut service, NOW_MS + 1);
+
+        assert!(matches!(
+            service.provider_request(
+                restart_handle(),
+                1,
+                1,
+                ProviderMethod::HnsRequestAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 2,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+
+        let ServiceResponse::ApprovalRequired { approval } = service
+            .provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::HnsRequestAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 3,
+            )
+            .expect("account approval")
+        else {
+            panic!("account approval response")
+        };
+        let ServiceResponse::ProviderResult { value, .. } = service
+            .approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 4,
+            )
+            .expect("account approval decision")
+        else {
+            panic!("account result")
+        };
+        assert_eq!(value, json!([config.account_id.to_string()]));
+        let permission = service
+            .provider
+            .permission(handle(), 1, NOW_MS + 4)
+            .expect("permission read")
+            .expect("account permission");
+        assert_eq!(
+            permission.approved_accounts,
+            BTreeSet::from([config.account_id])
+        );
+        assert_eq!(
+            permission.capabilities,
+            BTreeSet::from([PermissionCapability::Accounts])
+        );
+
+        let ServiceResponse::ProviderResult { value, .. } = service
+            .provider_request(
+                handle(),
+                1,
+                2,
+                ProviderMethod::HnsAccounts.wire_name().to_owned(),
+                Value::Object(serde_json::Map::new()),
+                NOW_MS + 5,
+            )
+            .expect("minimized account projection")
+        else {
+            panic!("account projection")
+        };
+        assert_eq!(value, json!([config.account_id.to_string()]));
+        assert!(matches!(
+            service.provider_request(
+                handle(),
+                1,
+                3,
+                ProviderMethod::HnsAccounts.wire_name().to_owned(),
+                json!({ "account": config.account_id }),
+                NOW_MS + 6,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Locked,
+        } = service
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Lock,
+                },
+                NOW_MS + 7,
+            )
+            .expect("lock before alternate selection restart")
+        else {
+            panic!("lock response")
+        };
+        drop(service);
+
+        let mut restarted = production_hns_service(store, alternate_config);
+        restarted
+            .provider
+            .register_authority(handle(), registration(), NOW_MS + 8)
+            .expect("restarted authority");
+        unlock_production_hns(&mut restarted, NOW_MS + 9);
+        assert!(matches!(
+            restarted.provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::HnsAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 10,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_next_restarts_locked_preserves_tombstone_and_returns_provider_lock() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("private directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private permissions");
+        let database_path = directory.path().join("wallet.sqlite3");
+        let config = production_hns_config(9, 0);
+        let first_store = production_hns_store(&database_path, std::slice::from_ref(&config));
+        let mut first = production_hns_service(first_store.clone(), config.clone());
+        first
+            .provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("first authority");
+        assert!(matches!(
+            first.provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::HnsRequestAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::WalletLocked,
+                ..
+            })
+        ));
+        unlock_production_hns(&mut first, NOW_MS + 1);
+        let ServiceResponse::ApprovalRequired { approval } = first
+            .provider_request(
+                handle(),
+                1,
+                2,
+                ProviderMethod::HnsRequestAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 2,
+            )
+            .expect("account approval")
+        else {
+            panic!("approval")
+        };
+        first
+            .approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 3,
+            )
+            .expect("grant account");
+        let ServiceResponse::ProviderResult { binding, .. } = first
+            .provider_request(
+                handle(),
+                1,
+                3,
+                ProviderMethod::WalletRevokePermissions
+                    .wire_name()
+                    .to_owned(),
+                Value::Null,
+                NOW_MS + 4,
+            )
+            .expect("revoke permission")
+        else {
+            panic!("revoke result")
+        };
+        assert_eq!(binding.permission_generation, 2);
+        let old_wallet_session = first.wallet_session_id;
+        let old_service_session = first.service_session_id;
+        let ServiceResponse::ProviderResult { binding, value } = first
+            .provider_request(
+                handle(),
+                1,
+                4,
+                ProviderMethod::WalletLock.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 5,
+            )
+            .expect("provider lock result")
+        else {
+            panic!("provider lock")
+        };
+        assert_eq!(binding.permission_generation, 2);
+        assert_ne!(binding.wallet_session_id, old_wallet_session);
+        assert_eq!(value, json!({ "locked": true }));
+        assert!(first_store.is_locked().expect("locked shared store"));
+        drop(first);
+        drop(first_store);
+
+        let reopened_store =
+            SharedWalletStore::new(WalletStore::open(&database_path).expect("reopen wallet store"));
+        let mut restarted = production_hns_service(reopened_store.clone(), config);
+        assert!(reopened_store.is_locked().expect("restart locked"));
+        assert_ne!(restarted.wallet_session_id, old_wallet_session);
+        assert_ne!(restarted.service_session_id, old_service_session);
+        assert!(restarted.pending.is_empty());
+        assert!(restarted.seen_request_ids.is_empty());
+        assert!(restarted.event_sequences.is_empty());
+        restarted
+            .provider
+            .register_authority(restart_handle(), registration(), NOW_MS + 6)
+            .expect("restart authority");
+        unlock_production_hns(&mut restarted, NOW_MS + 7);
+        let ServiceResponse::ProviderCapabilities {
+            binding,
+            capabilities,
+        } = restarted
+            .provider_capabilities(restart_handle(), 1, NOW_MS + 8)
+            .expect("restart capabilities")
+        else {
+            panic!("restart capabilities")
+        };
+        assert_eq!(binding.permission_generation, 2);
+        assert_eq!(capabilities.permission_generation, 2);
+        let tombstone = restarted
+            .provider
+            .permission_snapshot(restart_handle(), 1, NOW_MS + 8)
+            .expect("restart tombstone");
+        assert_eq!(tombstone.generation, 2);
+        assert!(tombstone.record.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_next_rejects_all_value_module_and_unspecified_chain_reads() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("private directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private permissions");
+        let config = production_hns_config(9, 0);
+        let store = production_hns_store(
+            &directory.path().join("wallet.sqlite3"),
+            std::slice::from_ref(&config),
+        );
+        let mut service = production_hns_service(store, config);
+        service
+            .provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("authority");
+        unlock_production_hns(&mut service, NOW_MS + 1);
+        let unsupported = [
+            ProviderMethod::HnsGetBalance,
+            ProviderMethod::HnsGetTransactions,
+            ProviderMethod::HnsGetReceiveAddress,
+            ProviderMethod::HnsGetNames,
+            ProviderMethod::HnsGetName,
+            ProviderMethod::HnsImportKnownName,
+            ProviderMethod::HnsSend,
+            ProviderMethod::HnsTransferName,
+            ProviderMethod::HnsFinalizeName,
+            ProviderMethod::HnsSignTypedMessage,
+            ProviderMethod::WalletEnableModule,
+            ProviderMethod::WalletDisableModule,
+        ];
+        for (index, method) in unsupported.into_iter().enumerate() {
+            assert!(matches!(
+                service.provider_request(
+                    handle(),
+                    1,
+                    u64::try_from(index).expect("bounded index") + 1,
+                    method.wire_name().to_owned(),
+                    Value::Null,
+                    NOW_MS + 2 + u64::try_from(index).expect("bounded index"),
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            service.provider_request(
+                handle(),
+                1,
+                100,
+                ProviderMethod::WalletRequestPermissions
+                    .wire_name()
+                    .to_owned(),
+                json!({ "capabilities": ["balance"] }),
+                NOW_MS + 100,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::UnsupportedCapability,
+                ..
+            })
+        ));
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::ValueMovement)
+        );
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::BrowserIntegration)
+        );
     }
 
     #[test]

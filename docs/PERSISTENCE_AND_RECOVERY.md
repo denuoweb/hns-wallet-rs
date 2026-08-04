@@ -15,12 +15,13 @@ does not write provider approvals or provider nonces there. This prevents stale
 provider rows from becoming actionable or consuming provider capacity after a
 restart.
 
-An HNS Accounts permission generation persists the exact bounded account-ID
-set selected for that origin and namespace. The service validates and encodes
-the minimized `hns_requestAccounts` result before the scoped permission write;
-after restart, `hns_accounts` projects only that authenticated set. Legacy or
-generic records that claim Accounts without an account binding are rejected,
-not migrated into broader authority. The write must compare equal to the
+An HNS Accounts permission generation persists the exact singleton account ID
+selected for that origin and namespace. The service validates and encodes the
+minimized `hns_requestAccounts` result before the scoped permission write;
+after restart, `hns_accounts` re-authenticates the current runtime selection
+and requires it to equal that persisted singleton. Legacy or generic records
+that claim Accounts without an account binding are rejected, not migrated into
+broader authority. The write must compare equal to the
 generation authenticated by the approval, so a concurrent grant or revocation
 makes that approval stale instead of rebinding it to newer authority. Runtime
 selection and website approvals remain process-local and must be reacquired
@@ -284,8 +285,13 @@ authority. Unlock completes any authenticated plaintext-removal checkpoint
 before rotating the wallet session; failure to rotate immediately re-locks the
 store. Permission records and tombstone generations can then be loaded, while
 authorities, approvals, replays, rate windows, request IDs, and event cursors
-remain process-local. Chain/account loading and steps 6 through 13 are not
-composed into this subprocess yet.
+remain process-local. A separate library composition can validate one exact
+pre-existing non-value HNS account from that same Arc-backed store during
+unlock and expose only the account join in addition to the control methods.
+It does not create/update an account or restore chain state, and each
+`hns_accounts` read requires the runtime-selected singleton to equal the
+persisted permission singleton. Chain synchronization and steps 6 through 13
+are not composed into either service runtime yet.
 
 The HNS source implements the concrete synchronous authenticated node adapter,
 bounded coin/name/Shakedex-role chain/mempool snapshot reconciliation, and

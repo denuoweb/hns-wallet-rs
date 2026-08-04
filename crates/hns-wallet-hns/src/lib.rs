@@ -66,8 +66,8 @@ use hns_wallet_chain_api::{
     VerifySettlementLockRequest,
 };
 use hns_wallet_store::{
-    EntityBatchDelete, EntityBatchSave, EntityKind, SecretKind, StoreError, StoredEntity,
-    StoredWorkflow, WalletStore,
+    EntityBatchDelete, EntityBatchSave, EntityKind, SecretKind, SharedWalletStore, StoreError,
+    StoredEntity, StoredWorkflow, WalletStore,
 };
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, BaseUnits, ChainCapabilities, DerivationReference, FeeModel,
@@ -1197,6 +1197,83 @@ pub struct HnsAccountRecord {
     pub last_used_name: Option<u32>,
     #[serde(default)]
     pub last_used_shakedex: Option<u32>,
+}
+
+/// Read-only selector for one exact pre-existing HNS account held by the same
+/// Arc-backed store/key authority as its caller.
+///
+/// Selection reads authenticated account records only. It never creates an
+/// account, rewrites runtime configuration, contacts a node, restores cached
+/// chain authority, signs, or enables a value path.
+#[derive(Clone)]
+pub struct HnsExistingAccountSelector {
+    store: SharedWalletStore,
+    expected: HnsRuntimeConfig,
+}
+
+impl HnsExistingAccountSelector {
+    pub fn new(
+        store: SharedWalletStore,
+        expected: HnsRuntimeConfig,
+    ) -> Result<Self, HnsWalletError> {
+        expected.validate()?;
+        if expected.value_operations_enabled || expected.settlement_enabled {
+            return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+        }
+        Ok(Self { store, expected })
+    }
+
+    pub fn expected_record_id(&self) -> [u8; 32] {
+        account_entity_id(&self.expected)
+    }
+
+    pub fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
+        self.store.is_same_authority(store)
+    }
+
+    /// Re-read and authenticate the selected account on every call. This makes
+    /// a restarted service fail closed if product configuration selects a
+    /// different account than a persisted provider permission.
+    pub fn selected_account(&self) -> Result<HnsAccountRecord, HnsWalletError> {
+        let expected_id = account_entity_id(&self.expected);
+        let (accounts, selected) = self
+            .store
+            .with_store(|store| {
+                if store.is_locked() {
+                    return Err(StoreError::Locked);
+                }
+                Ok((
+                    store.list_entities_by_id_prefix::<HnsAccountRecord>(
+                        EntityKind::WalletAccount,
+                        self.expected.wallet_id.as_bytes(),
+                        MAX_HISTORY_RESULTS,
+                    )?,
+                    store.wallet_account::<HnsAccountRecord>(&expected_id)?,
+                ))
+            })
+            .map_err(|error| match error {
+                StoreError::Locked => HnsWalletError::StoreLocked,
+                error => HnsWalletError::from(error),
+            })?;
+        for stored in accounts {
+            if stored.id != account_entity_id(&stored.value.config)
+                || stored.value.config.wallet_id != self.expected.wallet_id
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            if stored.value.config.account_id != self.expected.account_id
+                && stored.value.config.account_derivation_index
+                    == self.expected.account_derivation_index
+            {
+                return Err(HnsWalletError::DuplicateAccountDerivation);
+            }
+        }
+        let selected = selected.ok_or(HnsWalletError::AccountConfigurationMismatch)?;
+        if selected.id != expected_id || selected.value.config != self.expected {
+            return Err(HnsWalletError::AccountConfigurationMismatch);
+        }
+        Ok(selected.value)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

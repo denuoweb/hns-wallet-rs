@@ -91,8 +91,8 @@ session dimension before a result is accepted.
 Permission records and encrypted tombstone generations survive service
 restart. Their persistence scope is the exact selected namespace plus logical
 origin, stored under a domain-separated opaque key; the record retains both
-values and must match them when loaded. The persistent control runtime and
-provider core hold clones of one `SharedWalletStore`, so lock clears their one
+values and must match them when loaded. The persistent runtimes and provider
+core hold clones of one `SharedWalletStore`, so lock clears their one
 decrypted record key rather than leaving an independently unlocked permission
 connection. The service reads the current generation from that store; it never
 accepts one from a request. The first grant is
@@ -110,8 +110,10 @@ lifetime is 90 seconds, and old service sessions cannot resume them.
 Time-bearing provider entry points also reject a process-local wall-clock
 rollback instead of extending authority.
 
-`wallet_lock` is service-owned: the runtime locks first, then the service rotates
-the wallet session and clears approvals and event cursors. Unlock, creation, or
+`wallet_lock` is service-owned: it snapshots the authenticated permission
+generation, the runtime locks, and then the service rotates the wallet session
+and clears approvals and event cursors. Its result binds that prior generation
+to the new session without reopening the locked store. Unlock, creation, or
 restoration rotates the wallet session only after the runtime succeeds; if that
 rotation cannot obtain fresh entropy, the service synchronously locks the
 runtime again before returning failure. Send prompts are accepted only when the
@@ -145,18 +147,27 @@ method returns `unsupportedCapability`. The checked-in subprocess advertises
 only the private control subset and does not advertise value movement or browser
 integration.
 
-The service source now defines the atomic `hns_requestAccounts` join. Only an
-explicit runtime account-selector capability may advertise it. After the
-trusted approval, the runtime supplies one typed HNS account; the service
-validates and encodes its minimized ID result before atomically persisting that
-same ID in the approval-bound permission generation. `hns_accounts` is then a
-service-owned projection of only those persisted IDs; both methods return the
-IDs as ordered 32-character lowercase hexadecimal strings. Null or an empty
+Every HNS-prefixed method requires an HNS authority namespace before any
+permission lookup or approval can act. An ICANN authority cannot invoke an HNS
+method even when a persisted permission would otherwise cover it.
+
+The service source now defines the atomic `hns_requestAccounts` join. The
+library-only `PersistentHnsAccountRuntime` may advertise it only when its
+`HnsExistingAccountSelector` and provider retain clones of the identical
+Arc-backed store. Unlock authenticates one exact pre-existing non-value account;
+selection never creates or updates an account and performs no node I/O. After
+trusted approval, the service validates and encodes that singleton ID before
+atomically persisting the same ID in the approval-bound permission generation.
+Every `hns_accounts` call then re-authenticates the current selection and
+requires exact equality with the persisted singleton, including after restart.
+Both methods return one 32-character lowercase hexadecimal ID. Null or an empty
 object are the only accepted parameters, and generic `wallet_requestPermissions`
-cannot create Accounts authority. The checked-in subprocess uses
-`PersistentControlRuntime`, advertises neither HNS account method, and has no
-concrete `HnsWalletRuntime`/browser product adapter, so this source contract is
-not product availability.
+cannot create Accounts authority. This composition advertises exactly those
+two methods plus the five controls above; balance, history, receive, names,
+modules, signing, and value methods remain unsupported. The checked-in
+subprocess still uses `PersistentControlRuntime` and advertises neither HNS
+account method. No synchronized `HnsWalletRuntime` chain-read or browser product
+adapter is composed, so this source boundary is not product availability.
 
 ## Explicitly forbidden
 
@@ -175,5 +186,6 @@ stale approval, locked wallet, and unavailable module/backend are distinct
 errors. Errors minimize account and policy disclosure.
 
 The provider/ABI/service/host account-join tests are focused implementation
-evidence only; installed-browser and concrete-runtime qualification remain
-pending.
+evidence only. The new exact-account and all-HNS namespace regressions are
+source-only and have not been executed; installed-browser and synchronized
+chain-runtime qualification remain pending.

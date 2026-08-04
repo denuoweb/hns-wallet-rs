@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 getrandom.workspace = true
 hns-wallet-ffi.workspace = true
+hns-wallet-hns.workspace = true
 hns-wallet-provider.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true

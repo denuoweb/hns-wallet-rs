@@ -248,6 +248,24 @@ impl ProviderMethod {
         }
     }
 
+    pub const fn requires_hns_namespace(self) -> bool {
+        matches!(
+            self,
+            Self::HnsRequestAccounts
+                | Self::HnsAccounts
+                | Self::HnsGetBalance
+                | Self::HnsGetTransactions
+                | Self::HnsGetReceiveAddress
+                | Self::HnsSend
+                | Self::HnsGetNames
+                | Self::HnsGetName
+                | Self::HnsImportKnownName
+                | Self::HnsTransferName
+                | Self::HnsFinalizeName
+                | Self::HnsSignTypedMessage
+        )
+    }
+
     pub const fn permission(self) -> Option<PermissionCapability> {
         match self {
             Self::WalletGetCapabilities
@@ -720,11 +738,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
             return Err(ProviderError::Replay);
         }
         let method = ProviderMethod::parse(&request.method)?;
-        if matches!(
-            method,
-            ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
-        ) && authority.facts.namespace != SelectedNamespace::Hns
-        {
+        if method.requires_hns_namespace() && authority.facts.namespace != SelectedNamespace::Hns {
             return Err(ProviderError::Unauthorized);
         }
         validate_module_params(method, &request.params)?;
@@ -1423,6 +1437,46 @@ mod tests {
             ProviderMethod::parse("eth_sendTransaction"),
             Err(ProviderError::ForbiddenMethod)
         ));
+    }
+
+    #[test]
+    fn production_next_rejects_every_hns_method_outside_the_hns_namespace() {
+        let mut icann_registration = registration();
+        icann_registration.namespace = SelectedNamespace::Icann;
+        let mut provider =
+            ProviderCore::new(MemoryProviderState::default(), wallet_session(), false);
+        provider
+            .register_authority(handle(), icann_registration, NOW_MS)
+            .expect("register ICANN authority");
+
+        let hns_methods = ProviderMethod::ALL
+            .into_iter()
+            .filter(|method| method.requires_hns_namespace())
+            .collect::<Vec<_>>();
+        assert_eq!(hns_methods.len(), 12);
+        for (index, method) in hns_methods.into_iter().enumerate() {
+            let request = serde_json::to_vec(&serde_json::json!({
+                "method": method.wire_name(),
+                "params": null,
+            }))
+            .expect("encode provider request");
+            assert!(matches!(
+                provider.request(
+                    handle(),
+                    1,
+                    u64::try_from(index).expect("bounded method index") + 1,
+                    NOW_MS,
+                    &request,
+                ),
+                Err(ProviderError::Unauthorized)
+            ));
+        }
+        assert!(provider.pending.is_empty());
+        let permission = provider
+            .permission_snapshot(handle(), 1, NOW_MS)
+            .expect("ICANN permission snapshot");
+        assert_eq!(permission.generation, 0);
+        assert!(permission.record.is_none());
     }
 
     #[test]

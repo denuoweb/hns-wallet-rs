@@ -70,6 +70,15 @@ synchronously clears the shared key again. Lock clears that key before the
 provider session is rotated. Detection of a poisoned store mutex recovers it
 only long enough to clear the key and then fails closed.
 
+The exact-account library composition additionally proves Arc identity between
+its `HnsExistingAccountSelector`, runtime, and provider store. Unlock succeeds
+only if the configured non-value account already exists as an authenticated
+record with the exact expected configuration and no duplicate HD account
+component. Selection uses a bounded store closure, performs no node I/O, and
+never creates, updates, signs for, or broadcasts from an account. A separately
+opened handle to the same database path is rejected as a different key
+authority.
+
 This is authenticated record encryption, not whole-file encryption. Table
 names, row counts, indexes, selected authenticated metadata, filenames, SQLite
 journals, and access patterns may be visible. On Linux, persistent opening
@@ -161,17 +170,20 @@ once. Revocation stores an authenticated tombstone so delete/regrant cannot
 reset the generation. Service restart intentionally drops authorities,
 approvals, replay/rate state, request IDs, and event cursors while permissions
 survive.
-Accounts permission is valid only with a bounded nonempty set of exact HNS
-account IDs in the same encrypted permission generation. Generic permission
-requests cannot mint Accounts authority, and legacy capability-only records
-fail closed. The account result is validated and bounded before the scoped
-grant is persisted against the exact generation authenticated by the approval;
-a generation mismatch fails stale. `hns_accounts` reads only that stored set,
-and both account methods fail unavailable if the runtime selector is absent or
-later withdrawn. The checked-in persistent control runtime cannot advertise the
-join. It also cannot advertise or execute generic permission creation because
-none of its currently supported methods consumes a permission scope; this
-prevents dormant grants from gaining meaning after a runtime upgrade.
+Accounts permission is valid only with one exact HNS account ID in the same
+encrypted permission generation. Generic permission requests cannot mint
+Accounts authority, and legacy capability-only records fail closed. The
+account result is validated and bounded before the scoped grant is persisted
+against the exact generation authenticated by the approval; a generation
+mismatch fails stale. Every `hns_accounts` call re-authenticates the current
+runtime-selected singleton and requires exact equality with that persisted
+singleton, so a restart configured for another account cannot inherit the old
+grant. All HNS-prefixed methods are rejected outside the HNS namespace before
+permission or approval processing. The checked-in persistent control runtime
+cannot advertise the join; the explicit exact-account library composition can.
+Neither can advertise or execute generic permission creation because none of
+their currently supported methods consumes a non-Accounts permission scope;
+this prevents dormant grants from gaining meaning after a runtime upgrade.
 Host restart/reset independently drops every service-derived handle revision,
 pending request and approval, private binding, and event cursor. A response
 kind mismatch, stale session, sequence gap/replay, unknown request ID, or stale
@@ -182,6 +194,9 @@ handles remain reserved for the lifetime of the host process.
 Permission-change events clear every same-origin and same-namespace derived
 binding and reset the global event-cursor domain exactly as the service does;
 wallet-lock events clear provider state globally before further use.
+The direct `wallet_lock` result snapshots the authenticated permission
+generation before clearing the shared key, then returns that generation with
+the newly rotated wallet session without attempting a post-lock database read.
 It explicitly rejects seed/key extraction, raw signing, PSBT signing, generic
 Ethereum transactions/calls, chain switching, and arbitrary native-host access.
 

@@ -297,6 +297,12 @@ impl SharedWalletStore {
         operation(&store)
     }
 
+    /// Prove that two components retain clones of the identical Arc-backed
+    /// store/key authority. Path equality is deliberately insufficient.
+    pub fn is_same_authority(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn with_store_mut<T>(
         &self,
         operation: impl FnOnce(&mut WalletStore) -> Result<T, StoreError>,
