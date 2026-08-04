@@ -242,21 +242,24 @@ impl PersistentHnsAccountRuntime {
             .selector
             .selected_account()
             .map_err(hns_runtime_failure)?;
-        Ok(AccountSummary {
+        let account = AccountSummary {
             account_id: selected.config.account_id,
             module: ModuleId::Handshake,
             label: self.account_label.clone(),
             receive_display: None,
-        })
+        };
+        validate_hns_account_summary(&account)
+            .map_err(|_| hns_runtime_failure(HnsWalletError::InvalidEvidence))?;
+        Ok(account)
     }
 
     fn unlock(&self, passphrase: &str) -> Result<(), ServiceFailure> {
         self.store
             .unlock(passphrase)
             .map_err(persistent_store_failure)?;
-        if let Err(error) = self.selector.selected_account() {
+        if let Err(error) = self.exact_account() {
             self.store.lock().map_err(persistent_store_failure)?;
-            return Err(hns_runtime_failure(error));
+            return Err(error);
         }
         Ok(())
     }
@@ -1873,6 +1876,14 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn production_hns_record_id(config: &HnsRuntimeConfig) -> [u8; 32] {
+        let mut record_id = [0_u8; 32];
+        record_id[..16].copy_from_slice(config.wallet_id.as_bytes());
+        record_id[16..].copy_from_slice(config.account_id.as_bytes());
+        record_id
+    }
+
+    #[cfg(target_os = "linux")]
     fn production_hns_store(
         database_path: &std::path::Path,
         configs: &[HnsRuntimeConfig],
@@ -1882,18 +1893,12 @@ mod tests {
             WalletStore::create(database_path, PASSPHRASE).expect("create HNS account store"),
         );
         for (index, config) in configs.iter().cloned().enumerate() {
-            let selector = HnsExistingAccountSelector::new(store.clone(), config.clone())
-                .expect("account selector");
+            let record_id = production_hns_record_id(&config);
             let account = production_hns_account(config);
             store
                 .with_store_mut(|wallet| {
                     wallet
-                        .save_wallet_account(
-                            &selector.expected_record_id(),
-                            0,
-                            &account,
-                            10 + index as u64,
-                        )
+                        .save_wallet_account(&record_id, 0, &account, 10 + index as u64)
                         .map(|_| ())
                 })
                 .expect("persist exact HNS account");
@@ -2319,6 +2324,97 @@ mod tests {
         assert!(!capabilities.methods.contains("wallet_requestPermissions"));
         assert!(!capabilities.methods.contains("hns_getBalance"));
         assert!(!capabilities.methods.contains("hns_send"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_next_rejects_authenticated_zero_account_rows_without_exposure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let zero_directory = tempfile::tempdir().expect("zero-account private directory");
+        std::fs::set_permissions(
+            zero_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("zero-account private permissions");
+        let zero_config = production_hns_config(0, 0);
+        let zero_store = production_hns_store(
+            &zero_directory.path().join("wallet.sqlite3"),
+            std::slice::from_ref(&zero_config),
+        );
+        assert!(matches!(
+            HnsExistingAccountSelector::new(zero_store.clone(), zero_config),
+            Err(HnsWalletError::InvalidRuntimeConfiguration)
+        ));
+        assert!(zero_store.is_locked().expect("zero-account store remains locked"));
+
+        let malformed_directory = tempfile::tempdir().expect("malformed private directory");
+        std::fs::set_permissions(
+            malformed_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("malformed private permissions");
+        let expected = production_hns_config(9, 0);
+        let malformed = production_hns_account(production_hns_config(0, 0));
+        let malformed_store = SharedWalletStore::new(
+            WalletStore::create(
+                malformed_directory.path().join("wallet.sqlite3"),
+                "correct horse battery staple",
+            )
+            .expect("create malformed account store"),
+        );
+        malformed_store
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_wallet_account(
+                        &production_hns_record_id(&expected),
+                        0,
+                        &malformed,
+                        10,
+                    )
+                    .map(|_| ())
+            })
+            .expect("persist authenticated malformed row");
+        malformed_store.lock().expect("lock malformed account store");
+        let selector = HnsExistingAccountSelector::new(malformed_store.clone(), expected)
+            .expect("valid expected selector");
+        let mut service = WalletService::new_persistent_hns_accounts(
+            malformed_store.clone(),
+            PersistentHnsAccountConfig {
+                selector,
+                account_label: "Handshake".to_owned(),
+            },
+        )
+        .expect("locked malformed-row composition");
+        assert!(matches!(
+            service.dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Unlock {
+                        passphrase: hns_wallet_ffi::SecretString::new(
+                            "correct horse battery staple".to_owned(),
+                        ),
+                    },
+                },
+                NOW_MS,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PersistenceFailure,
+                ..
+            })
+        ));
+        assert!(malformed_store.is_locked().expect("malformed unlock relocks"));
+        assert!(matches!(
+            service.dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::ListAccounts,
+                },
+                NOW_MS + 1,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::WalletLocked,
+                ..
+            })
+        ));
     }
 
     #[cfg(target_os = "linux")]

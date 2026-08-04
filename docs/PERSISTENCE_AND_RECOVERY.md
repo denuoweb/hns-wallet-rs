@@ -15,10 +15,10 @@ does not write provider approvals or provider nonces there. This prevents stale
 provider rows from becoming actionable or consuming provider capacity after a
 restart.
 
-An HNS Accounts permission generation persists the exact singleton account ID
-selected for that origin and namespace. The service validates and encodes the
-minimized `hns_requestAccounts` result before the scoped permission write;
-after restart, `hns_accounts` re-authenticates the current runtime selection
+An HNS Accounts permission generation persists the exact nonzero singleton
+account ID selected for that origin and namespace. The service validates and
+encodes the minimized `hns_requestAccounts` result before the scoped
+permission write; after restart, `hns_accounts` re-authenticates the current runtime selection
 and requires it to equal that persisted singleton. Legacy or generic records
 that claim Accounts without an account binding are rejected, not migrated into
 broader authority. The write must compare equal to the

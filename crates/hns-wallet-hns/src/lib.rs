@@ -1139,6 +1139,9 @@ pub struct HnsRuntimeConfig {
 
 impl HnsRuntimeConfig {
     pub fn validate(&self) -> Result<(), HnsWalletError> {
+        if self.account_id.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(HnsWalletError::InvalidRuntimeConfiguration);
+        }
         if self.restore_lookahead == 0
             || self.restore_lookahead > MAX_RESTORE_LOOKAHEAD
             || self.restore_lookahead as usize * 2 > MAX_RESTORE_SCRIPTS_PER_QUERY

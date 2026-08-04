@@ -73,9 +73,9 @@ only long enough to clear the key and then fails closed.
 The exact-account library composition additionally proves Arc identity between
 its `HnsExistingAccountSelector`, runtime, and provider store. Unlock succeeds
 only if the configured non-value account already exists as an authenticated
-record with the exact expected configuration and no duplicate HD account
-component. Selection uses a bounded store closure, performs no node I/O, and
-never creates, updates, signs for, or broadcasts from an account. A separately
+record with a nonzero ID, the exact expected configuration, and no duplicate
+HD account component. Selection uses a bounded store closure, performs no
+node I/O, and never creates, updates, signs for, or broadcasts from an account. A separately
 opened handle to the same database path is rejected as a different key
 authority.
 
