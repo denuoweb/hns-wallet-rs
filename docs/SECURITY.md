@@ -79,6 +79,23 @@ node I/O, and never creates, updates, signs for, or broadcasts from an account. 
 opened handle to the same database path is rejected as a different key
 authority.
 
+The synchronized non-value HNS read composition proves the same Arc identity
+for its selector, service/provider state, and `HnsAccountReadRuntime`. It stages
+only authenticated rows inside bounded store closures; no backend method is
+called until the closure and mutex guard have returned. A durable discovery
+fence survives failure or process exit, and final persistence compares the
+exact account revision plus coin, transaction, name, and recovery rows loaded
+before node I/O. Account selection is checked again after scanning and after
+commit. Stale chain epochs, changed tips, restarted mempool instance nonces,
+generation changes, account changes, lock transitions, malformed evidence, or
+row changes fail closed. The one chain/mempool binding is trusted-service state
+and never appears in website JSON.
+
+This boundary reuses the canonical HNS scanner and reconciliation helpers. The
+legacy value runtime's full reconciliation still spans backend work while its
+private store mutex is held, so it is not an eligible provider/product read
+composition. Both value gates remain false.
+
 This is authenticated record encryption, not whole-file encryption. Table
 names, row counts, indexes, selected authenticated metadata, filenames, SQLite
 journals, and access patterns may be visible. On Linux, persistent opening
@@ -187,9 +204,25 @@ singleton, so a restart configured for another account cannot inherit the old
 grant. All HNS-prefixed methods are rejected outside the HNS namespace before
 permission or approval processing. The checked-in persistent control runtime
 cannot advertise the join; the explicit exact-account library composition can.
-Neither can advertise or execute generic permission creation because none of
-their currently supported methods consumes a non-Accounts permission scope;
-this prevents dormant grants from gaining meaning after a runtime upgrade.
+The control and account-only compositions cannot advertise or execute generic
+permission creation because none of their methods consumes a non-Accounts
+scope. The synchronized read composition can extend only an existing exact
+Accounts grant, preserving its singleton account. A Names approval freezes the
+current bounded set of at most 128 exact name hashes in the same encrypted
+generation; a nonempty set is invalid without HNS namespace, Accounts, Names,
+and a nonempty account binding. Empty scope means no names, and any missing or
+stale approved name fails the whole read instead of falling back to all known
+names.
+
+Public HNS reads are explicitly projected rather than serializing wallet
+records. Amounts are decimal strings; account IDs and transaction/name hashes
+are lowercase hexadecimal; keys are camelCase; heights and times must be
+JavaScript-safe integers; lists fail rather than truncate above 128 entries.
+Known-name output is limited to name, hash, proof height, coarse resource and
+ownership statuses, and registered/expired flags. Raw/current proof bytes,
+resource bytes, outpoints, derivations, node bindings, and internal epochs are
+never disclosed. Labels and display strings must be nonempty printable ASCII
+within their bounds.
 Host restart/reset independently drops every service-derived handle revision,
 pending request and approval, private binding, and event cursor. A response
 kind mismatch, stale session, sequence gap/replay, unknown request ID, or stale

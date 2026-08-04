@@ -27,6 +27,14 @@ makes that approval stale instead of rebinding it to newer authority. Runtime
 selection and website approvals remain process-local and must be reacquired
 after restart.
 
+An account-scoped read grant extends that same record; it never replaces the
+Accounts capability or singleton. When Names is approved, the service first
+performs a live reconciliation and persists the resulting exact bounded set of
+name hashes in the new permission generation. Nonempty name scope requires HNS
+namespace, Accounts, Names, and a nonempty account binding. Empty means no name
+disclosure. After restart, the current selected account and every requested or
+listed approved hash are checked again; a stale or missing hash fails closed.
+
 Sensitive values use XChaCha20-Poly1305 with random nonces. Associated data
 binds the database ID, record domain and identifier, plus plaintext columns that
 can affect a decision: entity/workflow revision and update time, workflow kind
@@ -224,10 +232,23 @@ identifiers include the role so the same branch/index cannot collide with an
 ordinary receive address. A complete reconciliation persists the combined
 account/address state only after the separate coin and name queries prove the
 same chain epoch/tip and mempool instance/generation.
-Reconciliation reloads the full authoritative account and its CAS revision
-after taking the store mutex, rejects any derivation high-water rollback, and
-holds that ordering through cache installation; a concurrently prepared send or
-settlement cannot be overwritten by a stale scan clone.
+The legacy value runtime reloads the full authoritative account and its CAS
+revision after taking its private store mutex, rejects derivation high-water
+rollback, and holds that ordering through cache installation; a concurrently
+prepared send or settlement cannot be overwritten by a stale scan clone. That
+legacy reconciliation still spans backend work and is not selected by the
+provider read composition.
+
+`HnsAccountReadRuntime` instead writes an authenticated durable discovery fence
+inside a short shared-store closure, copies the exact account/recovery/coin/
+transaction/name corpus and revisions, releases the mutex, and only then calls
+the node. Address derivation re-enters short closures that verify the same
+fence and returns before the scanner performs backend work. The final commit
+compares the unchanged fenced account and complete entity corpus, persists the
+canonical shared scanner/reconciliation result, writes recovery checkpoints,
+and clears the fence with the final account CAS. A crash or stale node leaves
+the fence set; a later process re-authenticates the partial corpus and performs
+a fresh complete scan before clearing it.
 
 Name-role scan advancement is monotonic and bounded across restart and reorg.
 Outputs to discovered name keys remain visible to history/reconciliation but
@@ -316,11 +337,15 @@ store. Permission records and tombstone generations can then be loaded, while
 authorities, approvals, replays, rate windows, request IDs, and event cursors
 remain process-local. A separate library composition can validate one exact
 pre-existing non-value HNS account from that same Arc-backed store during
-unlock and expose only the account join in addition to the control methods.
-It does not create/update an account or restore chain state, and each
-`hns_accounts` read requires the runtime-selected singleton to equal the
-persisted permission singleton. Chain synchronization and steps 6 through 13
-are not composed into either service runtime yet.
+unlock and expose only the account join in addition to the control methods. A
+second library composition uses the synchronized read runtime and an explicitly
+supplied backend to perform the non-value parts of steps 6 through 8 for every
+account-scoped balance, history, receive-target, or name result. It does not
+create an account, accept a caller-selected account, sign, broadcast, enable a
+module, or move value. Every `hns_accounts` and chain read requires the
+runtime-selected singleton to equal the persisted permission singleton. The
+checked-in subprocess selects neither HNS composition, and steps 9 through 13
+plus all value supervision remain uncomposed there.
 
 The HNS source implements the concrete synchronous authenticated node adapter,
 bounded coin/name/Shakedex-role chain/mempool snapshot reconciliation, and

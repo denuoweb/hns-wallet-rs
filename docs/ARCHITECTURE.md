@@ -35,14 +35,14 @@ application workflows.
 | `hns-wallet-types` | IDs, integer amounts, capabilities, UI-safe summaries | consensus/wire types |
 | `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, complete bounded binary-prefix entity and opaque-workflow reads, atomic approval-consume/workflow/reservation commits, provider permission tombstones, persisted workflow approvals/replays, one cloneable process-local lock/key authority | browser storage, ABI v2 authority handles, or remote truth |
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
-| `hns-wallet-hns` | exact-existing-account read-only selector, HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, three-branch restoration, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
+| `hns-wallet-hns` | exact-existing-account selector, synchronized non-value account-read runtime, HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, shared three-branch restoration/reconciliation, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact listing/cancellation protocol verification, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Denuo adapter, encrypted sequence/tombstone board | proof/listing/Denuo codecs, raw HNS keys, product coin selection, caller-asserted clock/chain truth, or release qualification |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events | raw keys/native commands or engine authority objects |
-| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition, locked existing-database control runtime, same-Arc exact-existing-account library runtime, runtime-selected atomic HNS account grant and singleton persisted-account recheck | synchronized HNS chain-read/runtime composition, browser engine policy, or product availability claims |
+| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition, locked existing-database control runtime, same-Arc exact-account and synchronized non-value HNS read library runtimes, atomic account grant, singleton persisted-account recheck, scoped public read projections | browser engine policy, value enablement, or product availability claims |
 | `hns-wallet-host` | host-owned negotiation, identifiers/nonces, bounded request correlation, authority revisions, approval ownership, private provider bindings, and event replay cursors | platform process launch, engine policy, page injection, artifact trust, or availability claims |
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
 
@@ -74,6 +74,25 @@ and hash; the adapter must convert the exact version-0 `Address` to its node
 outpoint-spend evidence bound to that same snapshot. A stale cursor, restarted
 mempool instance, or generation change restarts the bounded snapshot rather
 than combining observations from different views.
+
+`HnsAccountReadRuntime` is the product-composable non-value read boundary. It
+uses the canonical account record, derivation, three-branch scanner, coin and
+transaction reconciliation, name proof validation, checkpoint, and encrypted
+persistence helpers; it is not a second wallet index or cache schema. Each
+call stages one durable discovery fence and the exact account/entity corpus in
+short `SharedWalletStore` closures, releases the store mutex before every node
+request, and commits only if account selection, revisions, ciphertext-backed
+rows, chain tip/epoch, and mempool instance/generation still match. The service
+retains the resulting binding internally and projects only the account's
+balance, transaction summaries, receive target, and approved known-name
+summaries.
+
+The earlier value-capable `HnsWalletRuntime` still owns a private
+`Mutex<WalletStore>` and its legacy full reconciliation holds that mutex across
+backend work. The synchronized provider read composition does not use that
+path. Removing the legacy lock span remains required before any future value or
+product composition may select it; the new read runtime does not change either
+false HNS value gate.
 
 HNS preparation authenticates the current account, workflow, and reservation
 revisions before atomically committing change-index advancement, the prepared

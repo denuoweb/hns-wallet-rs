@@ -24,6 +24,7 @@ pub const MAX_REGISTERED_AUTHORITIES: usize = 256;
 pub const MAX_PENDING_APPROVALS: usize = 128;
 pub const MAX_REPLAY_NONCES: usize = 4_096;
 pub const MAX_APPROVED_ACCOUNTS: usize = 16;
+pub const MAX_APPROVED_NAMES: usize = 128;
 pub const PROVIDER_API_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1015,11 +1016,17 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         let binds_accounts = !approved_accounts.is_empty();
         if capabilities.is_empty()
             || approved_accounts.len() > MAX_APPROVED_ACCOUNTS
+            || approved_names.len() > MAX_APPROVED_NAMES
             || approved_accounts
                 .iter()
                 .any(|account| account.as_bytes().iter().all(|byte| *byte == 0))
             || capabilities.contains(&PermissionCapability::Accounts) != binds_accounts
             || (binds_accounts && authority.facts.namespace != SelectedNamespace::Hns)
+            || (!approved_names.is_empty()
+                && (!capabilities.contains(&PermissionCapability::Names)
+                    || !capabilities.contains(&PermissionCapability::Accounts)
+                    || approved_accounts.is_empty()
+                    || authority.facts.namespace != SelectedNamespace::Hns))
             || expires_at_unix.is_some_and(|expiry| expiry <= now_unix)
         {
             return Err(ProviderError::InvalidPermission);
@@ -1215,6 +1222,7 @@ fn validate_permission_identity(
         || permission.generation == 0
         || permission.capabilities.is_empty()
         || permission.approved_accounts.len() > MAX_APPROVED_ACCOUNTS
+        || permission.approved_names.len() > MAX_APPROVED_NAMES
         || permission
             .approved_accounts
             .iter()
@@ -1225,6 +1233,15 @@ fn validate_permission_identity(
             != !permission.approved_accounts.is_empty()
         || (!permission.approved_accounts.is_empty()
             && permission.namespace != SelectedNamespace::Hns)
+        || (!permission.approved_names.is_empty()
+            && (!permission
+                .capabilities
+                .contains(&PermissionCapability::Names)
+                || !permission
+                    .capabilities
+                    .contains(&PermissionCapability::Accounts)
+                || permission.approved_accounts.is_empty()
+                || permission.namespace != SelectedNamespace::Hns))
         || permission.created_at_unix > now_unix
         || permission
             .expires_at_unix
@@ -1512,6 +1529,89 @@ mod tests {
             .expect("tombstone snapshot");
         assert_eq!(tombstone.generation, 2);
         assert!(tombstone.record.is_none());
+    }
+
+    #[test]
+    fn production_followup_name_scope_requires_bounded_hns_account_authority() {
+        let account = AccountId::new([7_u8; 16]);
+        let name = [8_u8; 32];
+        let mut provider = provider();
+        assert!(matches!(
+            provider.grant_permissions(
+                handle(),
+                1,
+                BTreeSet::from([PermissionCapability::Names]),
+                BTreeSet::from([name]),
+                NOW_MS,
+                None,
+            ),
+            Err(ProviderError::InvalidPermission)
+        ));
+        assert!(matches!(
+            provider.grant_scoped_permissions(
+                handle(),
+                1,
+                BTreeSet::from([PermissionCapability::Names]),
+                BTreeSet::from([account]),
+                BTreeSet::from([name]),
+                NOW_MS,
+                None,
+            ),
+            Err(ProviderError::InvalidPermission)
+        ));
+        let granted = provider
+            .grant_scoped_permissions(
+                handle(),
+                1,
+                BTreeSet::from([
+                    PermissionCapability::Accounts,
+                    PermissionCapability::Names,
+                ]),
+                BTreeSet::from([account]),
+                BTreeSet::from([name]),
+                NOW_MS,
+                None,
+            )
+            .expect("account-bound name scope");
+        assert_eq!(granted.approved_names, BTreeSet::from([name]));
+
+        let oversized = (0_u16..=MAX_APPROVED_NAMES as u16)
+            .map(|index| {
+                let mut name_hash = [0_u8; 32];
+                name_hash[..2].copy_from_slice(&index.to_be_bytes());
+                name_hash
+            })
+            .collect();
+        assert!(matches!(
+            provider.grant_scoped_permissions(
+                handle(),
+                1,
+                BTreeSet::from([
+                    PermissionCapability::Accounts,
+                    PermissionCapability::Names,
+                ]),
+                BTreeSet::from([account]),
+                oversized,
+                NOW_MS,
+                None,
+            ),
+            Err(ProviderError::InvalidPermission)
+        ));
+
+        let orphan = PermissionRecord {
+            origin: origin(),
+            namespace: SelectedNamespace::Hns,
+            generation: 1,
+            capabilities: BTreeSet::from([PermissionCapability::Names]),
+            approved_accounts: BTreeSet::new(),
+            approved_names: BTreeSet::from([name]),
+            created_at_unix: 1,
+            expires_at_unix: None,
+        };
+        assert!(matches!(
+            validate_permission_identity(Some(orphan), &registration(), NOW_MS / 1_000),
+            Err(ProviderError::Persistence)
+        ));
     }
 
     #[test]

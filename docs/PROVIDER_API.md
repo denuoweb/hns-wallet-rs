@@ -31,12 +31,15 @@ Handshake:
 The method vocabulary is stable even when a capability is unavailable. The HNS
 runtime now persists split proof/current canonical summaries, exact current
 resource bytes, and account-bound ownership/transfer direction after fresh
-reconciliation; legacy rows stay explicitly watch-only. Provider dispatch for
-these methods is not yet product-integrated. `hns_transferName` and
+reconciliation; legacy rows stay explicitly watch-only. A library-only service
+composition now dispatches the non-value account, balance, transaction,
+receive-target, and scoped known-name methods from fresh synchronized wallet
+state. It is not selected by the checked-in executable or an installed browser
+product. `hns_transferName` and
 `hns_finalizeName` remain unavailable even though typed wallet-owned P2PKH
 TRANSFER/direct-FINALIZE workflows now exist in the wallet source. Provider
-dispatch, trusted product approval UI, adapter qualification, and both HNS
-value gates are incomplete. Persisted status, incoming-recipient
+value dispatch, trusted product approval UI, adapter qualification, and both
+HNS value gates are incomplete. Persisted status, incoming-recipient
 classification, or a node projection never authorize signing.
 
 External assets:
@@ -162,12 +165,62 @@ Every `hns_accounts` call then re-authenticates the current selection and
 requires exact equality with the persisted singleton, including after restart.
 Both methods return one 32-character lowercase hexadecimal ID. Null or an empty
 object are the only accepted parameters, and generic `wallet_requestPermissions`
-cannot create Accounts authority. This composition advertises exactly those
-two methods plus the five controls above; balance, history, receive, names,
-modules, signing, and value methods remain unsupported. The checked-in
-subprocess still uses `PersistentControlRuntime` and advertises neither HNS
-account method. No synchronized `HnsWalletRuntime` chain-read or browser product
-adapter is composed, so this source boundary is not product availability.
+cannot create Accounts authority. The account-only composition advertises
+exactly those two methods plus the five controls above.
+
+The library-only `PersistentHnsReadRuntime` requires an
+`HnsAccountReadRuntime` backed by the identical Arc authority and extends that
+surface with `hns_getBalance`, `hns_getTransactions`,
+`hns_getReceiveAddress`, `hns_getNames`, and `hns_getName`. Every call performs
+one bounded live reconciliation, retains its exact chain-tip/epoch and mempool
+instance/generation binding inside the trusted service, rechecks the selected
+account, and returns nothing if the binding, store corpus, lock state, or
+selection changes. Node calls occur only after every shared-store closure has
+returned.
+
+Read capabilities are additive only after a persisted exact Accounts grant.
+`wallet_requestPermissions` cannot replace or select that account. Approving
+Names stores the current exact set of at most 128 name hashes in the same
+permission generation. An empty set authorizes disclosure of no names; a
+missing/stale hash or a requested hash outside the set fails with permission
+denied. A nonempty name set is invalid unless the grant also contains Accounts,
+Names, a nonempty account set, and the HNS namespace.
+
+Balance, transaction, receive-address, and name-list calls accept only null or
+an empty object. `hns_getName` accepts exactly one 64-character lowercase-hex
+`nameHash`. The exact public result shapes are:
+
+```json
+{"amount":{"asset":"HNS","baseUnits":"42"}}
+```
+
+```json
+{"transactions":[{"module":"handshake","txid":"<64 lowercase hex>","status":"confirmed","netAmount":{"negative":false,"magnitude":"17"},"fee":"2","blockHeight":99,"firstSeenUnix":1700000000,"confirmationCount":3}]}
+```
+
+```json
+{"target":{"module":"handshake","account":"<32 lowercase hex>","display":"rs1...","derivationIndex":7}}
+```
+
+```json
+{"names":[{"name":"alpha","nameHash":"<64 lowercase hex>","proofHeight":99,"resourceStatus":"canonicalDecoded","ownershipStatus":"walletOwned","registered":true,"expired":false}]}
+```
+
+`hns_getName` returns the same minimized object under `{"name":...}`. No result
+contains raw proof/current state, raw resource bytes, owner outpoints,
+derivations, node identity, chain epoch/tip, or mempool generation. Amounts and
+signed magnitudes are decimal strings. Optional fee/height/time and
+registered/expired fields are JSON null when unavailable. Heights and times
+must fit JavaScript's exact integer range. Transaction and name lists are
+limited to 128 and fail closed rather than truncate; the encoded provider
+result retains the ABI byte bound. All labels and website display strings are
+bounded printable ASCII.
+
+The checked-in subprocess still uses `PersistentControlRuntime`, advertises no
+HNS account or read method, and has no account/backend construction inputs.
+HNS send, name import, transfer/finalize, signing, module control, and every
+settlement method remain unsupported in the read composition. This source
+boundary is not browser product availability and changes no value gate.
 
 ## Explicitly forbidden
 
@@ -185,7 +238,8 @@ origins, unauthorized capabilities, replays, request flooding, stale context,
 stale approval, locked wallet, and unavailable module/backend are distinct
 errors. Errors minimize account and policy disclosure.
 
-The provider/ABI/service/host account-join tests are focused implementation
-evidence only. The new exact-account and all-HNS namespace regressions are
-source-only and have not been executed; installed-browser and synchronized
-chain-runtime qualification remain pending.
+The earlier provider/ABI/service/host account-join tests are focused
+implementation evidence only. The new `production_followup_` synchronized
+runtime, scoped-permission, and public-projection regressions are source-only
+and have not been executed. Installed-browser and product chain-runtime
+qualification remain pending.

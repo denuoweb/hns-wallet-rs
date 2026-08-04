@@ -1280,6 +1280,189 @@ impl HnsExistingAccountSelector {
     }
 }
 
+/// Exact confirmed-chain and mempool authority for one synchronized account
+/// read. The trusted service composition retains this binding internally to
+/// prevent mixed-snapshot projections; website/provider JSON must not receive
+/// node identity, epoch, tip, or mempool-generation details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HnsAccountReadBinding {
+    pub chain: SnapshotBinding,
+    pub mempool: MempoolSnapshotBinding,
+}
+
+/// Complete non-value HNS account projection produced by one bounded wallet
+/// reconciliation. All fields are derived from the same chain/mempool binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HnsAccountReadSnapshot {
+    pub account_id: AccountId,
+    pub binding: HnsAccountReadBinding,
+    pub balance: Amount,
+    pub transactions: Vec<TransactionSummary>,
+    pub receive_target: ReceiveTarget,
+    pub known_names: Vec<KnownName>,
+}
+
+/// Synchronized, non-value HNS runtime for product/provider compositions that
+/// already own an exact account and one process-local store authority.
+///
+/// Local encrypted state is staged under short `SharedWalletStore` closures,
+/// every node call runs after the closure has returned, and the result commits
+/// only after an exact account/entity revision fence is re-authenticated. This
+/// type exposes no signing, broadcasting, import, allocation, or settlement
+/// method and does not alter either HNS value release gate.
+pub struct HnsAccountReadRuntime<B, C = SystemClock> {
+    backend: B,
+    clock: C,
+    store: SharedWalletStore,
+    selector: HnsExistingAccountSelector,
+    synchronization: Mutex<()>,
+}
+
+impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
+    pub fn new(
+        backend: B,
+        clock: C,
+        store: SharedWalletStore,
+        selector: HnsExistingAccountSelector,
+    ) -> Result<Self, HnsWalletError> {
+        if !selector.shares_store_authority(&store) {
+            return Err(HnsWalletError::StoreAuthorityMismatch);
+        }
+        Ok(Self {
+            backend,
+            clock,
+            store,
+            selector,
+            synchronization: Mutex::new(()),
+        })
+    }
+
+    pub fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
+        self.store.is_same_authority(store) && self.selector.shares_store_authority(store)
+    }
+
+    pub fn selected_account(&self) -> Result<HnsAccountRecord, HnsWalletError> {
+        self.selector.selected_account()
+    }
+
+    /// Reconcile every currently supported non-value account projection once.
+    /// Stale snapshots are surfaced to the caller; this layer never polls.
+    pub fn synchronize(&self) -> Result<HnsAccountReadSnapshot, HnsWalletError> {
+        let _synchronization = self
+            .synchronization
+            .lock()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)?;
+        let now_unix = self.clock.now_unix()?;
+        let selected = self.selector.selected_account()?;
+        let preparation = self
+            .store
+            .with_store_mut(|store| Ok(prepare_hns_account_read(store, &selected, now_unix)))
+            .map_err(map_shared_store_error)??;
+        let tip = self.backend.get_chain_tip()?;
+        let scan = scan_hns_account_read(
+            &self.backend,
+            &self.store,
+            &preparation,
+            tip,
+        )?;
+        let selected_after_scan = self.selector.selected_account()?;
+        if selected_after_scan != preparation.fenced_account {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+
+        let common_ancestor = hns_read_common_ancestor(
+            &self.backend,
+            &preparation.recovery,
+            scan.binding,
+            preparation.fenced_account.config.birthday_height,
+        )?;
+        let previous_transactions = preparation
+            .transactions
+            .iter()
+            .map(|stored| stored.value.clone())
+            .collect::<Vec<_>>();
+        let transactions = reconcile_hns_read_transactions(
+            &self.backend,
+            &scan.history,
+            &scan.addresses,
+            scan.binding,
+            scan.mempool,
+            common_ancestor,
+            &previous_transactions,
+        )?;
+        let names = revalidate_hns_read_names(
+            &self.backend,
+            &preparation.names,
+            &scan.addresses,
+            scan.binding,
+        )?;
+        let coins = reconcile_coins(scan.indexed_coins, &scan.addresses, tip.height)?;
+        let balance = coins.iter().try_fold(BaseUnits::ZERO, |total, coin| {
+            if is_ordinary_hns_spend_candidate(coin) {
+                total
+                    .checked_add(coin.coin.value)
+                    .map_err(|_| HnsWalletError::Arithmetic)
+            } else {
+                Ok(total)
+            }
+        })?;
+        let receive_target = hns_read_receive_target(&scan.account, &scan.addresses)?;
+        let checkpoints = hns_read_checkpoints(
+            &self.backend,
+            scan.binding,
+            scan.account.config.birthday_height,
+        )?;
+        let recovery = HnsRecoveryState {
+            checkpoints,
+            last_tip: Some(tip),
+            last_common_ancestor: common_ancestor,
+            last_reconciled_unix: now_unix,
+        };
+        verify_hns_read_snapshot_current(
+            &self.backend,
+            &scan.branch_scripts,
+            scan.binding,
+            scan.mempool,
+        )?;
+        self.store
+            .with_store_mut(|store| {
+                Ok(commit_hns_account_read(
+                    store,
+                    &preparation,
+                    &scan.account,
+                    &scan.addresses,
+                    &coins,
+                    &transactions,
+                    &names,
+                    &recovery,
+                    now_unix,
+                ))
+            })
+            .map_err(map_shared_store_error)??;
+        if self.selector.selected_account()? != scan.account {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+
+        Ok(HnsAccountReadSnapshot {
+            account_id: scan.account.config.account_id,
+            binding: HnsAccountReadBinding {
+                chain: scan.binding,
+                mempool: scan.mempool,
+            },
+            balance: Amount {
+                asset: WalletAsset::Hns,
+                base_units: balance,
+            },
+            transactions: transactions
+                .into_iter()
+                .map(|transaction| transaction.summary)
+                .collect(),
+            receive_target,
+            known_names: names,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DerivedHnsAddress {
     pub account_id: AccountId,
@@ -1527,6 +1710,27 @@ struct HnsRuntimeCache {
     transactions: Vec<HnsTransactionRecord>,
     binding: Option<SnapshotBinding>,
     mempool_binding: Option<MempoolSnapshotBinding>,
+}
+
+struct HnsReadPreparation {
+    fenced_account: HnsAccountRecord,
+    scan_account: HnsAccountRecord,
+    account_revision: u64,
+    recovery: HnsRecoveryState,
+    recovery_row: Option<StoredEntity<HnsRecoveryState>>,
+    coins: Vec<StoredEntity<TrackedHnsCoin>>,
+    transactions: Vec<StoredEntity<HnsTransactionRecord>>,
+    names: Vec<StoredEntity<KnownName>>,
+}
+
+struct HnsReadScan {
+    account: HnsAccountRecord,
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+    addresses: Vec<DerivedHnsAddress>,
+    history: Vec<HistoryEntry>,
+    indexed_coins: Vec<IndexedWalletCoin>,
+    branch_scripts: [Vec<WalletAddressKey>; 3],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3034,256 +3238,31 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             &account,
             now_unix,
         )?;
-        let allocated_next = shakedex_key::allocation_next_index(store, &account.config).map_err(
-            |error| match error {
-                HnsShakedexKeyAllocationError::MissingRecoverySeed => HnsWalletError::MissingSeed,
-                HnsShakedexKeyAllocationError::Store(_) => HnsWalletError::Store,
-                HnsShakedexKeyAllocationError::Wallet(error) => error,
-                _ => HnsWalletError::InvalidEvidence,
-            },
-        )?;
-        if allocated_next >= MAX_RESTORE_LOOKAHEAD {
-            return Err(HnsWalletError::ScanCapacityExhausted);
-        }
-        account.next_shakedex_index = account.next_shakedex_index.max(allocated_next);
-        if account.external_scan_end >= MAX_RESTORE_LOOKAHEAD
-            || account.internal_scan_end >= MAX_RESTORE_LOOKAHEAD
-            || account.name_scan_end >= MAX_RESTORE_LOOKAHEAD
-            || account.shakedex_scan_end >= MAX_RESTORE_LOOKAHEAD
-            || account.next_receive_index >= MAX_RESTORE_LOOKAHEAD
-            || account.next_change_index >= MAX_RESTORE_LOOKAHEAD
-            || account.next_name_index >= MAX_RESTORE_LOOKAHEAD
-            || account.next_shakedex_index >= MAX_RESTORE_LOOKAHEAD
-        {
-            return Err(HnsWalletError::InvalidLookahead);
-        }
-        let gap = account.config.restore_lookahead;
-        let minimum_external_end = account
-            .next_receive_index
-            .saturating_add(gap - 1)
-            .min(MAX_RESTORE_LOOKAHEAD - 1);
-        let minimum_internal_end = account
-            .next_change_index
-            .saturating_add(gap - 1)
-            .min(MAX_RESTORE_LOOKAHEAD - 1);
-        let minimum_name_end = account
-            .next_name_index
-            .saturating_add(gap - 1)
-            .min(MAX_RESTORE_LOOKAHEAD - 1);
-        let minimum_shakedex_end = account
-            .next_shakedex_index
-            .saturating_add(gap - 1)
-            .min(MAX_RESTORE_LOOKAHEAD - 1);
-        account.external_scan_end = account.external_scan_end.max(minimum_external_end);
-        account.internal_scan_end = account.internal_scan_end.max(minimum_internal_end);
-        account.name_scan_end = account.name_scan_end.max(minimum_name_end);
-        account.shakedex_scan_end = account.shakedex_scan_end.max(minimum_shakedex_end);
-
-        let mut expected_binding = None;
-        let mut expected_mempool = None;
-        let (mut addresses, mut history, indexed_coins, binding, mempool_binding) = loop {
-            let coin_addresses = derive_restore_addresses(store, &account, KeyRole::HnsCoin)?;
-            let name_addresses = derive_restore_addresses(store, &account, KeyRole::HnsName)?;
-            let shakedex_addresses =
-                derive_restore_addresses(store, &account, KeyRole::HnsShakedex)?;
-            validate_disjoint_restore_programs(
-                &coin_addresses,
-                &name_addresses,
-                &shakedex_addresses,
-            )?;
-
-            let (coin_scripts, coin_index_remap) = sorted_restore_scripts(&coin_addresses)?;
-            let (binding, mempool_binding, coin_history, coin_coins) = load_wallet_snapshot(
-                &self.backend,
-                &coin_scripts,
-                &coin_index_remap,
-                expected_tip,
-                expected_binding,
-                expected_mempool,
-            )?;
-            if expected_binding.is_some_and(|expected| expected != binding) {
-                return Err(HnsWalletError::StaleNodeSnapshot);
-            }
-            if expected_mempool.is_some_and(|expected| expected != mempool_binding) {
-                return Err(HnsWalletError::StaleNodeSnapshot);
-            }
-
-            let (name_scripts, name_index_remap) = sorted_restore_scripts(&name_addresses)?;
-            let (name_binding, name_mempool_binding, name_history, name_coins) =
-                load_wallet_snapshot(
-                    &self.backend,
-                    &name_scripts,
-                    &name_index_remap,
-                    expected_tip,
-                    Some(binding),
-                    Some(mempool_binding),
-                )?;
-            validate_same_restore_snapshot(
-                binding,
-                mempool_binding,
-                name_binding,
-                name_mempool_binding,
-            )?;
-
-            let (shakedex_scripts, shakedex_index_remap) =
-                sorted_restore_scripts(&shakedex_addresses)?;
-            let (shakedex_binding, shakedex_mempool_binding, shakedex_history, shakedex_coins) =
-                load_wallet_snapshot(
-                    &self.backend,
-                    &shakedex_scripts,
-                    &shakedex_index_remap,
-                    expected_tip,
-                    Some(binding),
-                    Some(mempool_binding),
-                )?;
-            validate_same_restore_snapshot(
-                binding,
-                mempool_binding,
-                shakedex_binding,
-                shakedex_mempool_binding,
-            )?;
-            expected_binding = Some(binding);
-            expected_mempool = Some(mempool_binding);
-
-            let mut addresses = Vec::new();
-            let mut history = Vec::new();
-            let mut indexed_coins = Vec::new();
-            append_restore_branch(
-                &mut addresses,
-                &mut history,
-                &mut indexed_coins,
-                coin_addresses,
-                coin_history,
-                coin_coins,
-            )?;
-            append_restore_branch(
-                &mut addresses,
-                &mut history,
-                &mut indexed_coins,
-                name_addresses,
-                name_history,
-                name_coins,
-            )?;
-            append_restore_branch(
-                &mut addresses,
-                &mut history,
-                &mut indexed_coins,
-                shakedex_addresses,
-                shakedex_history,
-                shakedex_coins,
-            )?;
-
-            let mut last_external = None;
-            let mut last_internal = None;
-            let mut last_name = None;
-            let mut last_shakedex = None;
-            for entry in &history {
-                let derivation = addresses
-                    .get(entry.script_index as usize)
-                    .ok_or(HnsWalletError::InvalidEvidence)?
-                    .derivation;
-                match restore_derivation_key(derivation)? {
-                    (HNS_COIN_DERIVATION_TAG, 0, index) => {
-                        last_external =
-                            Some(last_external.map_or(index, |last: u32| last.max(index)))
-                    }
-                    (HNS_COIN_DERIVATION_TAG, 1, index) => {
-                        last_internal =
-                            Some(last_internal.map_or(index, |last: u32| last.max(index)))
-                    }
-                    (HNS_NAME_DERIVATION_TAG, 0, index) => {
-                        last_name = Some(last_name.map_or(index, |last: u32| last.max(index)))
-                    }
-                    (HNS_SHAKEDEX_DERIVATION_TAG, 0, index) => {
-                        last_shakedex =
-                            Some(last_shakedex.map_or(index, |last: u32| last.max(index)))
-                    }
-                    _ => return Err(HnsWalletError::InvalidEvidence),
-                }
-            }
-            ensure_trailing_gap(last_external, gap)?;
-            ensure_trailing_gap(last_internal, gap)?;
-            ensure_trailing_gap(last_name, gap)?;
-            ensure_trailing_gap(last_shakedex, gap)?;
-            let required_external =
-                required_scan_end(last_external, account.external_scan_end, gap);
-            let required_internal =
-                required_scan_end(last_internal, account.internal_scan_end, gap);
-            let required_name = required_scan_end(last_name, account.name_scan_end, gap);
-            let required_shakedex =
-                required_scan_end(last_shakedex, account.shakedex_scan_end, gap);
-            checked_scan_address_count(&[required_external, required_internal])?;
-            checked_scan_address_count(&[required_name])?;
-            checked_scan_address_count(&[required_shakedex])?;
-            if required_external <= account.external_scan_end
-                && required_internal <= account.internal_scan_end
-                && required_name <= account.name_scan_end
-                && required_shakedex <= account.shakedex_scan_end
-            {
-                break (addresses, history, indexed_coins, binding, mempool_binding);
-            }
-            account.external_scan_end = required_external;
-            account.internal_scan_end = required_internal;
-            account.name_scan_end = required_name;
-            account.shakedex_scan_end = required_shakedex;
-        };
-
-        let used: BTreeSet<(u8, u32, u32)> = history
-            .iter()
-            .map(|entry| -> Result<_, HnsWalletError> {
-                let derivation = addresses[entry.script_index as usize].derivation;
-                restore_derivation_key(derivation)
-            })
-            .collect::<Result<_, _>>()?;
-        for address in &mut addresses {
-            address.used = used.contains(&restore_derivation_key(address.derivation)?);
-        }
-        account.last_used_external = used
-            .iter()
-            .filter(|(role, change, _)| *role == HNS_COIN_DERIVATION_TAG && *change == 0)
-            .map(|(_, _, index)| *index)
-            .max();
-        account.last_used_internal = used
-            .iter()
-            .filter(|(role, change, _)| *role == HNS_COIN_DERIVATION_TAG && *change == 1)
-            .map(|(_, _, index)| *index)
-            .max();
-        account.last_used_name = used
-            .iter()
-            .filter(|(role, change, _)| *role == HNS_NAME_DERIVATION_TAG && *change == 0)
-            .map(|(_, _, index)| *index)
-            .max();
-        account.last_used_shakedex = used
-            .iter()
-            .filter(|(role, change, _)| *role == HNS_SHAKEDEX_DERIVATION_TAG && *change == 0)
-            .map(|(_, _, index)| *index)
-            .max();
-        account.next_receive_index =
-            advance_next_derivation_index(account.next_receive_index, account.last_used_external);
-        account.next_change_index =
-            advance_next_derivation_index(account.next_change_index, account.last_used_internal);
-        account.next_name_index =
-            advance_next_derivation_index(account.next_name_index, account.last_used_name);
-        account.next_shakedex_index =
-            advance_next_derivation_index(account.next_shakedex_index, account.last_used_shakedex);
-        account.shakedex_scan_complete = true;
-        account.shakedex_scan_in_progress = false;
-        persist_derived_addresses(store, &account.config, &addresses, now_unix)?;
+        let allocated_next = shakedex_key::allocation_next_index(store, &account.config)
+            .map_err(map_shakedex_restore_error)?;
+        normalize_restore_scan_account(&mut account, allocated_next)?;
+        let scan = scan_restore_snapshot(&self.backend, account, expected_tip, |account| {
+            Ok([
+                derive_restore_addresses(store, account, KeyRole::HnsCoin)?,
+                derive_restore_addresses(store, account, KeyRole::HnsName)?,
+                derive_restore_addresses(store, account, KeyRole::HnsShakedex)?,
+            ])
+        })?;
+        persist_derived_addresses(store, &scan.account.config, &scan.addresses, now_unix)?;
         let account_revision = store.save_wallet_account(
-            &account_entity_id(&account.config),
+            &account_entity_id(&scan.account.config),
             expected_account_revision,
-            &account,
+            &scan.account,
             now_unix,
         )?;
-        history.sort_by_key(|entry| (entry.txid, entry.script_index));
         Ok((
-            account,
+            scan.account,
             account_revision,
-            binding,
-            mempool_binding,
-            addresses,
-            history,
-            indexed_coins,
+            scan.binding,
+            scan.mempool,
+            scan.addresses,
+            scan.history,
+            scan.indexed_coins,
         ))
     }
 
@@ -3370,138 +3349,16 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         mempool_binding: MempoolSnapshotBinding,
         common_ancestor: Option<u64>,
     ) -> Result<Vec<HnsTransactionRecord>, HnsWalletError> {
-        let mut history = coalesce_transaction_history(history)?;
-        let observed_txids: BTreeSet<TransactionHash> =
-            history.iter().map(|entry| entry.txid).collect();
-        if addresses.is_empty()
-            || addresses.len() > MAX_RESTORE_ADDRESS_RECORDS
-            || addresses
-                .iter()
-                .any(|address| restore_derivation_key(address.derivation).is_err())
-        {
-            return Err(HnsWalletError::InvalidEvidence);
-        }
-        let programs: BTreeSet<Vec<u8>> = addresses
-            .iter()
-            .map(|address| address.program.clone())
-            .collect();
-        if programs.len() != addresses.len()
-            || addresses.iter().any(|address| {
-                validate_restore_program(address.derivation, &address.program).is_err()
-            })
-        {
-            return Err(HnsWalletError::InvalidEvidence);
-        }
-        let previous: BTreeMap<TransactionHash, TransactionSummary> = self
-            .cache_read()?
-            .transactions
-            .iter()
-            .map(|record| (record.summary.txid, record.summary.clone()))
-            .collect();
-        for summary in previous.values() {
-            if !observed_txids.contains(&summary.txid) {
-                history.push(HistoryEntry {
-                    txid: summary.txid,
-                    height: summary.block_height,
-                    block_hash: None,
-                    transaction_position: None,
-                    spent: false,
-                    first_seen_unix: summary.first_seen_unix,
-                    script_index: 0,
-                });
-            }
-        }
-        let mut raw_cache = BTreeMap::new();
-        let mut records = Vec::with_capacity(history.len());
-        let persisted_raw: BTreeMap<TransactionHash, Vec<u8>> = self
-            .cache_read()?
-            .transactions
-            .iter()
-            .map(|record| (record.summary.txid, record.raw.clone()))
-            .collect();
-        for entry in &history {
-            let evidence = self.backend.get_transaction_evidence(
-                entry.txid,
-                binding,
-                Some(mempool_binding),
-            )?;
-            if evidence.binding != binding || evidence.mempool != mempool_binding {
-                return Err(HnsWalletError::StaleNodeSnapshot);
-            }
-            let raw = match evidence.raw {
-                Some(raw) => raw,
-                None => persisted_raw
-                    .get(&entry.txid)
-                    .cloned()
-                    .ok_or(HnsWalletError::InvalidEvidence)?,
-            };
-            let transaction = decode_transaction_for_id(&raw, entry.txid)?;
-            raw_cache.insert(entry.txid, transaction.clone());
-            let status = evidence.status;
-            let competing_spender =
-                self.has_competing_spender(entry.txid, &transaction, binding)?;
-            let inclusion = evidence.inclusion;
-            validate_inclusion(
-                entry,
-                status,
-                inclusion,
-                binding.tip,
-                observed_txids.contains(&entry.txid),
-            )?;
-            let (net_amount, fee) = transaction_value_effect(
-                &self.backend,
-                &transaction,
-                &programs,
-                &mut raw_cache,
-                &persisted_raw,
-                binding,
-                mempool_binding,
-            )?;
-            let current_status = if status.conflicted || competing_spender {
-                LocalTransactionStatus::Conflicted
-            } else if status.confirmation_count > 0 {
-                LocalTransactionStatus::Confirmed
-            } else if status.in_mempool {
-                LocalTransactionStatus::Mempool
-            } else if previous.get(&entry.txid).is_some_and(|old| {
-                old.status == LocalTransactionStatus::Confirmed
-                    && old.block_height.is_some_and(|height| {
-                        common_ancestor.is_none_or(|ancestor| height > ancestor)
-                    })
-            }) {
-                LocalTransactionStatus::Reorged
-            } else {
-                LocalTransactionStatus::Dropped
-            };
-            records.push(HnsTransactionRecord {
-                summary: TransactionSummary {
-                    module: ModuleId::Handshake,
-                    txid: entry.txid,
-                    status: current_status,
-                    net_amount,
-                    fee,
-                    block_height: inclusion.map(|value| value.height),
-                    first_seen_unix: entry.first_seen_unix,
-                    confirmation_count: status.confirmation_count,
-                },
-                raw,
-                inclusion,
-            });
-        }
-        records.sort_by(|left, right| {
-            right
-                .summary
-                .block_height
-                .cmp(&left.summary.block_height)
-                .then_with(|| {
-                    right
-                        .summary
-                        .first_seen_unix
-                        .cmp(&left.summary.first_seen_unix)
-                })
-                .then_with(|| left.summary.txid.cmp(&right.summary.txid))
-        });
-        Ok(records)
+        let previous = self.cache_read()?.transactions.clone();
+        reconcile_hns_read_transactions(
+            &self.backend,
+            history,
+            addresses,
+            binding,
+            mempool_binding,
+            common_ancestor,
+            &previous,
+        )
     }
 
     fn revalidate_names(
@@ -3517,25 +3374,24 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             &account_entity_prefix(&config),
             MAX_HISTORY_RESULTS,
         )?;
-        let mut count = 0;
-        for stored in names {
-            let current = validated_name_evidence(
-                &self.backend,
-                &stored.value.name,
-                binding,
-                Some(&wallet_name_addresses),
-            )?
-            .known_name;
-            if current.proof_height != binding.tip.height {
-                return Err(HnsWalletError::InvalidEvidence);
-            }
+        let addresses = wallet_name_addresses;
+        let current_names = revalidate_hns_read_names(&self.backend, &names, &addresses, binding)?;
+        let revisions = names
+            .iter()
+            .map(|stored| (stored.value.name_hash, stored.revision))
+            .collect::<BTreeMap<_, _>>();
+        let count = current_names.len();
+        for current in current_names {
+            let revision = revisions
+                .get(&current.name_hash)
+                .copied()
+                .ok_or(HnsWalletError::InvalidEvidence)?;
             store.save_known_name(
                 &namespaced_name_id(&config, current.name_hash),
-                stored.revision,
+                revision,
                 &current,
                 now_unix,
             )?;
-            count += 1;
         }
         Ok(count)
     }
@@ -3648,20 +3504,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         transaction: &Transaction,
         binding: SnapshotBinding,
     ) -> Result<bool, HnsWalletError> {
-        let mut outpoints = Vec::new();
-        for input in &transaction.inputs {
-            if input.previous_output.is_null() {
-                continue;
-            }
-            let outpoint = HnsOutpoint {
-                transaction: TransactionHash::new(
-                    input.previous_output.transaction_hash.into_bytes(),
-                ),
-                output_index: input.previous_output.index,
-            };
-            outpoints.push(outpoint);
-        }
-        has_competing_spender_in_batches(&self.backend, &outpoints, binding, transaction_id)
+        hns_read_has_competing_spender(&self.backend, transaction_id, transaction, binding)
     }
 
     fn cleanup_input_reservations(
@@ -3932,6 +3775,580 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     }
 }
 
+fn map_shared_store_error(error: StoreError) -> HnsWalletError {
+    match error {
+        StoreError::Locked => HnsWalletError::StoreLocked,
+        _ => HnsWalletError::Store,
+    }
+}
+
+fn prepare_hns_account_read(
+    store: &mut WalletStore,
+    selected: &HnsAccountRecord,
+    now_unix: u64,
+) -> Result<HnsReadPreparation, HnsWalletError> {
+    if store.is_locked() {
+        return Err(HnsWalletError::StoreLocked);
+    }
+    selected.config.validate()?;
+    if selected.config.value_operations_enabled || selected.config.settlement_enabled {
+        return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+    }
+    let account_id = account_entity_id(&selected.config);
+    let stored = store
+        .wallet_account::<HnsAccountRecord>(&account_id)?
+        .ok_or(HnsWalletError::AccountConfigurationMismatch)?;
+    if stored.id.as_slice() != account_id.as_slice() || stored.value != *selected {
+        return Err(HnsWalletError::StaleAccountRead);
+    }
+
+    // Persist the same crash-safe Shakedex discovery fence used by the full
+    // runtime before deriving or querying any separated seller-key script.
+    let mut fenced_account = stored.value;
+    fenced_account.shakedex_scan_in_progress = true;
+    let account_revision = store.save_wallet_account(
+        &account_id,
+        stored.revision,
+        &fenced_account,
+        now_unix,
+    )?;
+    let fenced = store
+        .wallet_account::<HnsAccountRecord>(&account_id)?
+        .ok_or(HnsWalletError::StaleAccountRead)?;
+    if fenced.id.as_slice() != account_id.as_slice()
+        || fenced.revision != account_revision
+        || fenced.value != fenced_account
+    {
+        return Err(HnsWalletError::StaleAccountRead);
+    }
+    let allocated_next = shakedex_key::allocation_next_index(store, &fenced_account.config)
+        .map_err(map_shakedex_restore_error)?;
+    let mut scan_account = fenced_account.clone();
+    normalize_restore_scan_account(&mut scan_account, allocated_next)?;
+    let prefix = account_entity_prefix(&fenced_account.config);
+    let recovery_row = store.hns_recovery_state::<HnsRecoveryState>(&recovery_entity_id(
+        &fenced_account.config,
+    ))?;
+    let recovery = recovery_row
+        .as_ref()
+        .map_or_else(HnsRecoveryState::default, |stored| stored.value.clone());
+    if recovery.checkpoints.len() > MAX_RECOVERY_CHECKPOINTS
+        || !recovery
+            .checkpoints
+            .windows(2)
+            .all(|pair| pair[0].height < pair[1].height)
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let coins = store.list_entities_by_id_prefix::<TrackedHnsCoin>(
+        EntityKind::HnsUtxo,
+        &prefix,
+        MAX_WALLET_COINS,
+    )?;
+    for stored in &coins {
+        let expected = namespaced_outpoint_id(&fenced_account.config, stored.value.coin.outpoint);
+        if stored.id.as_slice() != expected.as_slice()
+            || stored.value.derivation.account
+                != fenced_account.config.account_derivation_index
+            || stored.value.to_canonical_coin().is_err()
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
+    let transactions = store.list_entities_by_id_prefix::<HnsTransactionRecord>(
+        EntityKind::HnsTransaction,
+        &prefix,
+        MAX_HISTORY_RESULTS,
+    )?;
+    for stored in &transactions {
+        let expected = namespaced_transaction_id(&fenced_account.config, stored.value.summary.txid);
+        if stored.id.as_slice() != expected.as_slice()
+            || stored.value.summary.module != ModuleId::Handshake
+            || decode_transaction_for_id(&stored.value.raw, stored.value.summary.txid).is_err()
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
+    let names = store.list_entities_by_id_prefix::<KnownName>(
+        EntityKind::KnownName,
+        &prefix,
+        MAX_HISTORY_RESULTS,
+    )?;
+    for stored in &names {
+        let expected = namespaced_name_id(&fenced_account.config, stored.value.name_hash);
+        let actual_hash = hash_name(&stored.value.name)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?
+            .into_bytes();
+        if stored.id.as_slice() != expected.as_slice()
+            || actual_hash != stored.value.name_hash
+            || !validate_name(&stored.value.name)
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
+    Ok(HnsReadPreparation {
+        fenced_account,
+        scan_account,
+        account_revision,
+        recovery,
+        recovery_row,
+        coins,
+        transactions,
+        names,
+    })
+}
+
+fn verify_hns_read_account_fence(
+    store: &WalletStore,
+    preparation: &HnsReadPreparation,
+) -> Result<(), HnsWalletError> {
+    if store.is_locked() {
+        return Err(HnsWalletError::StoreLocked);
+    }
+    let account_id = account_entity_id(&preparation.fenced_account.config);
+    let stored = store
+        .wallet_account::<HnsAccountRecord>(&account_id)?
+        .ok_or(HnsWalletError::StaleAccountRead)?;
+    if stored.id.as_slice() != account_id.as_slice()
+        || stored.revision != preparation.account_revision
+        || stored.value != preparation.fenced_account
+    {
+        return Err(HnsWalletError::StaleAccountRead);
+    }
+    Ok(())
+}
+
+fn scan_hns_account_read<B: HnsBackend>(
+    backend: &B,
+    store: &SharedWalletStore,
+    preparation: &HnsReadPreparation,
+    expected_tip: ChainTip,
+) -> Result<HnsReadScan, HnsWalletError> {
+    scan_restore_snapshot(
+        backend,
+        preparation.scan_account.clone(),
+        expected_tip,
+        |account| {
+            store
+                .with_store(|store| {
+                    Ok((|| {
+                        verify_hns_read_account_fence(store, preparation)?;
+                        Ok([
+                            derive_restore_addresses(store, account, KeyRole::HnsCoin)?,
+                            derive_restore_addresses(store, account, KeyRole::HnsName)?,
+                            derive_restore_addresses(store, account, KeyRole::HnsShakedex)?,
+                        ])
+                    })())
+                })
+                .map_err(map_shared_store_error)?
+        },
+    )
+}
+
+fn hns_read_common_ancestor<B: HnsBackend>(
+    backend: &B,
+    recovery: &HnsRecoveryState,
+    binding: SnapshotBinding,
+    birthday_height: u64,
+) -> Result<Option<u64>, HnsWalletError> {
+    if recovery.last_tip.is_none() {
+        return Ok(None);
+    }
+    for checkpoint in recovery.checkpoints.iter().rev() {
+        if checkpoint.height > binding.tip.height {
+            continue;
+        }
+        let evidence = backend.get_block_hash(checkpoint.height, binding)?;
+        if evidence.binding != binding || evidence.height != checkpoint.height {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        if evidence.block_hash == Some(checkpoint.block_hash) {
+            return Ok(Some(checkpoint.height));
+        }
+    }
+    Ok(account_birthday_ancestor(birthday_height))
+}
+
+fn hns_read_checkpoints<B: HnsBackend>(
+    backend: &B,
+    binding: SnapshotBinding,
+    birthday_height: u64,
+) -> Result<Vec<HnsChainCheckpoint>, HnsWalletError> {
+    if birthday_height > binding.tip.height {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let start = binding
+        .tip
+        .height
+        .saturating_sub((MAX_RECOVERY_CHECKPOINTS - 1) as u64)
+        .max(birthday_height);
+    let mut checkpoints = Vec::new();
+    for height in start..=binding.tip.height {
+        let block_hash = if height == binding.tip.height {
+            Some(binding.tip.block_hash)
+        } else {
+            let evidence = backend.get_block_hash(height, binding)?;
+            if evidence.binding != binding || evidence.height != height {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            evidence.block_hash
+        }
+        .ok_or(HnsWalletError::InvalidEvidence)?;
+        checkpoints.push(HnsChainCheckpoint { height, block_hash });
+    }
+    Ok(checkpoints)
+}
+
+fn hns_read_receive_target(
+    account: &HnsAccountRecord,
+    addresses: &[DerivedHnsAddress],
+) -> Result<ReceiveTarget, HnsWalletError> {
+    let address = addresses
+        .iter()
+        .find(|address| {
+            address.account_id == account.config.account_id
+                && address.derivation.role == KeyRole::HnsCoin
+                && address.derivation.account == account.config.account_derivation_index
+                && address.derivation.change == 0
+                && address.derivation.index == account.next_receive_index
+        })
+        .ok_or(HnsWalletError::InvalidEvidence)?;
+    let target = ReceiveTarget {
+        module: ModuleId::Handshake,
+        account: account.config.account_id,
+        display: address.address.clone(),
+        derivation_index: address.derivation.index,
+    };
+    target
+        .validate()
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    Ok(target)
+}
+
+fn reconcile_hns_read_transactions<B: HnsBackend>(
+    backend: &B,
+    history: &[HistoryEntry],
+    addresses: &[DerivedHnsAddress],
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+    common_ancestor: Option<u64>,
+    previous_records: &[HnsTransactionRecord],
+) -> Result<Vec<HnsTransactionRecord>, HnsWalletError> {
+    let mut history = coalesce_transaction_history(history)?;
+    let observed_txids: BTreeSet<TransactionHash> =
+        history.iter().map(|entry| entry.txid).collect();
+    if addresses.is_empty()
+        || addresses.len() > MAX_RESTORE_ADDRESS_RECORDS
+        || addresses
+            .iter()
+            .any(|address| restore_derivation_key(address.derivation).is_err())
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let programs: BTreeSet<Vec<u8>> = addresses
+        .iter()
+        .map(|address| address.program.clone())
+        .collect();
+    if programs.len() != addresses.len()
+        || addresses.iter().any(|address| {
+            validate_restore_program(address.derivation, &address.program).is_err()
+        })
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let previous: BTreeMap<TransactionHash, TransactionSummary> = previous_records
+        .iter()
+        .map(|record| (record.summary.txid, record.summary.clone()))
+        .collect();
+    for summary in previous.values() {
+        if !observed_txids.contains(&summary.txid) {
+            history.push(HistoryEntry {
+                txid: summary.txid,
+                height: summary.block_height,
+                block_hash: None,
+                transaction_position: None,
+                spent: false,
+                first_seen_unix: summary.first_seen_unix,
+                script_index: 0,
+            });
+        }
+    }
+    if history.len() > MAX_HISTORY_RESULTS {
+        return Err(HnsWalletError::HistoryLimit);
+    }
+    let persisted_raw: BTreeMap<TransactionHash, Vec<u8>> = previous_records
+        .iter()
+        .map(|record| (record.summary.txid, record.raw.clone()))
+        .collect();
+    let mut raw_cache = BTreeMap::new();
+    let mut records = Vec::with_capacity(history.len());
+    for entry in &history {
+        let evidence = backend.get_transaction_evidence(entry.txid, binding, Some(mempool))?;
+        if evidence.binding != binding || evidence.mempool != mempool {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        let raw = match evidence.raw {
+            Some(raw) => raw,
+            None => persisted_raw
+                .get(&entry.txid)
+                .cloned()
+                .ok_or(HnsWalletError::InvalidEvidence)?,
+        };
+        let transaction = decode_transaction_for_id(&raw, entry.txid)?;
+        raw_cache.insert(entry.txid, transaction.clone());
+        let competing_spender = hns_read_has_competing_spender(
+            backend,
+            entry.txid,
+            &transaction,
+            binding,
+        )?;
+        validate_inclusion(
+            entry,
+            evidence.status,
+            evidence.inclusion,
+            binding.tip,
+            observed_txids.contains(&entry.txid),
+        )?;
+        let (net_amount, fee) = transaction_value_effect(
+            backend,
+            &transaction,
+            &programs,
+            &mut raw_cache,
+            &persisted_raw,
+            binding,
+            mempool,
+        )?;
+        let status = if evidence.status.conflicted || competing_spender {
+            LocalTransactionStatus::Conflicted
+        } else if evidence.status.confirmation_count > 0 {
+            LocalTransactionStatus::Confirmed
+        } else if evidence.status.in_mempool {
+            LocalTransactionStatus::Mempool
+        } else if previous.get(&entry.txid).is_some_and(|old| {
+            old.status == LocalTransactionStatus::Confirmed
+                && old.block_height.is_some_and(|height| {
+                    common_ancestor.is_none_or(|ancestor| height > ancestor)
+                })
+        }) {
+            LocalTransactionStatus::Reorged
+        } else {
+            LocalTransactionStatus::Dropped
+        };
+        records.push(HnsTransactionRecord {
+            summary: TransactionSummary {
+                module: ModuleId::Handshake,
+                txid: entry.txid,
+                status,
+                net_amount,
+                fee,
+                block_height: evidence.inclusion.map(|inclusion| inclusion.height),
+                first_seen_unix: entry.first_seen_unix,
+                confirmation_count: evidence.status.confirmation_count,
+            },
+            raw,
+            inclusion: evidence.inclusion,
+        });
+    }
+    records.sort_by(|left, right| {
+        right
+            .summary
+            .block_height
+            .cmp(&left.summary.block_height)
+            .then_with(|| {
+                right
+                    .summary
+                    .first_seen_unix
+                    .cmp(&left.summary.first_seen_unix)
+            })
+            .then_with(|| left.summary.txid.cmp(&right.summary.txid))
+    });
+    Ok(records)
+}
+
+fn hns_read_has_competing_spender<B: HnsBackend>(
+    backend: &B,
+    transaction_id: TransactionHash,
+    transaction: &Transaction,
+    binding: SnapshotBinding,
+) -> Result<bool, HnsWalletError> {
+    let outpoints = transaction
+        .inputs
+        .iter()
+        .filter(|input| !input.previous_output.is_null())
+        .map(|input| HnsOutpoint {
+            transaction: TransactionHash::new(input.previous_output.transaction_hash.into_bytes()),
+            output_index: input.previous_output.index,
+        })
+        .collect::<Vec<_>>();
+    has_competing_spender_in_batches(backend, &outpoints, binding, transaction_id)
+}
+
+fn revalidate_hns_read_names<B: HnsBackend>(
+    backend: &B,
+    stored_names: &[StoredEntity<KnownName>],
+    addresses: &[DerivedHnsAddress],
+    binding: SnapshotBinding,
+) -> Result<Vec<KnownName>, HnsWalletError> {
+    if stored_names.len() > MAX_HISTORY_RESULTS {
+        return Err(HnsWalletError::HistoryLimit);
+    }
+    let wallet_name_addresses = addresses
+        .iter()
+        .filter(|address| address.derivation.role == KeyRole::HnsName)
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_wallet_name_addresses(&wallet_name_addresses)?;
+    let mut names = Vec::with_capacity(stored_names.len());
+    for stored in stored_names {
+        let current = validated_name_evidence(
+            backend,
+            &stored.value.name,
+            binding,
+            Some(&wallet_name_addresses),
+        )?
+        .known_name;
+        if current.name_hash != stored.value.name_hash
+            || current.proof_height != binding.tip.height
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        names.push(current);
+    }
+    names.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.name_hash.cmp(&right.name_hash))
+    });
+    Ok(names)
+}
+
+fn verify_hns_read_snapshot_current<B: HnsBackend>(
+    backend: &B,
+    branch_scripts: &[Vec<WalletAddressKey>; 3],
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+) -> Result<(), HnsWalletError> {
+    for scripts in branch_scripts {
+        if scripts.is_empty() || scripts.len() > MAX_RESTORE_SCRIPTS_PER_QUERY {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let confirmed = backend.get_confirmed_wallet_page(ConfirmedWalletPageRequest {
+            scripts,
+            expected_tip: binding.tip,
+            expected_epoch: Some(binding.chain_epoch),
+            cursor: None,
+            limit: 1,
+        })?;
+        if confirmed.binding != binding
+            || confirmed.history.len().saturating_add(confirmed.utxos.len()) > 1
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        let current_mempool = backend.get_mempool_wallet_page(MempoolWalletPageRequest {
+            scripts,
+            binding,
+            expected_mempool: Some(mempool),
+            cursor: None,
+            limit: 1,
+        })?;
+        if current_mempool.binding != binding
+            || current_mempool.mempool != mempool
+            || current_mempool.history.len() > 1
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_hns_account_read(
+    store: &mut WalletStore,
+    preparation: &HnsReadPreparation,
+    account: &HnsAccountRecord,
+    addresses: &[DerivedHnsAddress],
+    coins: &[TrackedHnsCoin],
+    transactions: &[HnsTransactionRecord],
+    names: &[KnownName],
+    recovery: &HnsRecoveryState,
+    now_unix: u64,
+) -> Result<(), HnsWalletError> {
+    verify_hns_read_account_fence(store, preparation)?;
+    let prefix = account_entity_prefix(&preparation.fenced_account.config);
+    let current_coins = store.list_entities_by_id_prefix::<TrackedHnsCoin>(
+        EntityKind::HnsUtxo,
+        &prefix,
+        MAX_WALLET_COINS,
+    )?;
+    let current_transactions = store.list_entities_by_id_prefix::<HnsTransactionRecord>(
+        EntityKind::HnsTransaction,
+        &prefix,
+        MAX_HISTORY_RESULTS,
+    )?;
+    let current_names = store.list_entities_by_id_prefix::<KnownName>(
+        EntityKind::KnownName,
+        &prefix,
+        MAX_HISTORY_RESULTS,
+    )?;
+    let current_recovery = store.hns_recovery_state::<HnsRecoveryState>(&recovery_entity_id(
+        &preparation.fenced_account.config,
+    ))?;
+    if current_coins != preparation.coins
+        || current_transactions != preparation.transactions
+        || current_names != preparation.names
+        || current_recovery != preparation.recovery_row
+        || !same_account_identity(&account.config, &preparation.fenced_account.config)
+        || account.config != preparation.fenced_account.config
+        || account.shakedex_scan_in_progress
+        || !account.shakedex_scan_complete
+    {
+        return Err(HnsWalletError::StaleAccountRead);
+    }
+
+    // A crash before the final WalletAccount save leaves the durable discovery
+    // fence set. A later synchronization re-authenticates every partial entity
+    // revision and replaces it from a fresh live snapshot before clearing it.
+    persist_derived_addresses(store, &account.config, addresses, now_unix)?;
+    persist_reconciled_entities(store, &account.config, coins, transactions, now_unix)?;
+    let name_revisions = preparation
+        .names
+        .iter()
+        .map(|stored| (stored.value.name_hash, stored.revision))
+        .collect::<BTreeMap<_, _>>();
+    if name_revisions.len() != names.len() {
+        return Err(HnsWalletError::StaleAccountRead);
+    }
+    for name in names {
+        let revision = name_revisions
+            .get(&name.name_hash)
+            .copied()
+            .ok_or(HnsWalletError::StaleAccountRead)?;
+        store.save_known_name(
+            &namespaced_name_id(&account.config, name.name_hash),
+            revision,
+            name,
+            now_unix,
+        )?;
+    }
+    let recovery_revision = preparation
+        .recovery_row
+        .as_ref()
+        .map_or(0, |stored| stored.revision);
+    store.save_hns_recovery_state(
+        &recovery_entity_id(&account.config),
+        recovery_revision,
+        recovery,
+        now_unix,
+    )?;
+    store.save_wallet_account(
+        &account_entity_id(&account.config),
+        preparation.account_revision,
+        account,
+        now_unix,
+    )?;
+    Ok(())
+}
+
 fn account_number(account: &HnsAccountRecord) -> u32 {
     account.config.account_derivation_index
 }
@@ -4146,6 +4563,266 @@ fn validate_same_restore_snapshot(
         Err(HnsWalletError::StaleNodeSnapshot)
     } else {
         Ok(())
+    }
+}
+
+fn map_shakedex_restore_error(error: HnsShakedexKeyAllocationError) -> HnsWalletError {
+    match error {
+        HnsShakedexKeyAllocationError::MissingRecoverySeed => HnsWalletError::MissingSeed,
+        HnsShakedexKeyAllocationError::Store(StoreError::Locked) => HnsWalletError::StoreLocked,
+        HnsShakedexKeyAllocationError::Store(_) => HnsWalletError::Store,
+        HnsShakedexKeyAllocationError::Wallet(error) => error,
+        _ => HnsWalletError::InvalidEvidence,
+    }
+}
+
+fn normalize_restore_scan_account(
+    account: &mut HnsAccountRecord,
+    allocated_next: u32,
+) -> Result<(), HnsWalletError> {
+    if allocated_next >= MAX_RESTORE_LOOKAHEAD {
+        return Err(HnsWalletError::ScanCapacityExhausted);
+    }
+    account.next_shakedex_index = account.next_shakedex_index.max(allocated_next);
+    if account.external_scan_end >= MAX_RESTORE_LOOKAHEAD
+        || account.internal_scan_end >= MAX_RESTORE_LOOKAHEAD
+        || account.name_scan_end >= MAX_RESTORE_LOOKAHEAD
+        || account.shakedex_scan_end >= MAX_RESTORE_LOOKAHEAD
+        || account.next_receive_index >= MAX_RESTORE_LOOKAHEAD
+        || account.next_change_index >= MAX_RESTORE_LOOKAHEAD
+        || account.next_name_index >= MAX_RESTORE_LOOKAHEAD
+        || account.next_shakedex_index >= MAX_RESTORE_LOOKAHEAD
+    {
+        return Err(HnsWalletError::InvalidLookahead);
+    }
+    let gap = account.config.restore_lookahead;
+    if gap == 0 {
+        return Err(HnsWalletError::InvalidLookahead);
+    }
+    let minimum_external_end = account
+        .next_receive_index
+        .saturating_add(gap - 1)
+        .min(MAX_RESTORE_LOOKAHEAD - 1);
+    let minimum_internal_end = account
+        .next_change_index
+        .saturating_add(gap - 1)
+        .min(MAX_RESTORE_LOOKAHEAD - 1);
+    let minimum_name_end = account
+        .next_name_index
+        .saturating_add(gap - 1)
+        .min(MAX_RESTORE_LOOKAHEAD - 1);
+    let minimum_shakedex_end = account
+        .next_shakedex_index
+        .saturating_add(gap - 1)
+        .min(MAX_RESTORE_LOOKAHEAD - 1);
+    account.external_scan_end = account.external_scan_end.max(minimum_external_end);
+    account.internal_scan_end = account.internal_scan_end.max(minimum_internal_end);
+    account.name_scan_end = account.name_scan_end.max(minimum_name_end);
+    account.shakedex_scan_end = account.shakedex_scan_end.max(minimum_shakedex_end);
+    Ok(())
+}
+
+/// One canonical restore scanner shared by the legacy value runtime and the
+/// SharedWalletStore read adapter. The address source closure is the only
+/// persistence boundary; it must return before this function performs any
+/// backend operation.
+fn scan_restore_snapshot<B, F>(
+    backend: &B,
+    mut account: HnsAccountRecord,
+    expected_tip: ChainTip,
+    mut derive_branches: F,
+) -> Result<HnsReadScan, HnsWalletError>
+where
+    B: HnsBackend,
+    F: FnMut(&HnsAccountRecord) -> Result<[Vec<DerivedHnsAddress>; 3], HnsWalletError>,
+{
+    let gap = account.config.restore_lookahead;
+    let mut expected_binding = None;
+    let mut expected_mempool = None;
+    loop {
+        let [coin_addresses, name_addresses, shakedex_addresses] = derive_branches(&account)?;
+        validate_disjoint_restore_programs(
+            &coin_addresses,
+            &name_addresses,
+            &shakedex_addresses,
+        )?;
+
+        let (coin_scripts, coin_index_remap) = sorted_restore_scripts(&coin_addresses)?;
+        let (binding, mempool, coin_history, coin_coins) = load_wallet_snapshot(
+            backend,
+            &coin_scripts,
+            &coin_index_remap,
+            expected_tip,
+            expected_binding,
+            expected_mempool,
+        )?;
+        if expected_binding.is_some_and(|expected| expected != binding)
+            || expected_mempool.is_some_and(|expected| expected != mempool)
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+
+        let (name_scripts, name_index_remap) = sorted_restore_scripts(&name_addresses)?;
+        let (name_binding, name_mempool, name_history, name_coins) = load_wallet_snapshot(
+            backend,
+            &name_scripts,
+            &name_index_remap,
+            expected_tip,
+            Some(binding),
+            Some(mempool),
+        )?;
+        validate_same_restore_snapshot(binding, mempool, name_binding, name_mempool)?;
+
+        let (shakedex_scripts, shakedex_index_remap) =
+            sorted_restore_scripts(&shakedex_addresses)?;
+        let (shakedex_binding, shakedex_mempool, shakedex_history, shakedex_coins) =
+            load_wallet_snapshot(
+                backend,
+                &shakedex_scripts,
+                &shakedex_index_remap,
+                expected_tip,
+                Some(binding),
+                Some(mempool),
+            )?;
+        validate_same_restore_snapshot(
+            binding,
+            mempool,
+            shakedex_binding,
+            shakedex_mempool,
+        )?;
+        expected_binding = Some(binding);
+        expected_mempool = Some(mempool);
+
+        let mut addresses = Vec::new();
+        let mut history = Vec::new();
+        let mut indexed_coins = Vec::new();
+        append_restore_branch(
+            &mut addresses,
+            &mut history,
+            &mut indexed_coins,
+            coin_addresses,
+            coin_history,
+            coin_coins,
+        )?;
+        append_restore_branch(
+            &mut addresses,
+            &mut history,
+            &mut indexed_coins,
+            name_addresses,
+            name_history,
+            name_coins,
+        )?;
+        append_restore_branch(
+            &mut addresses,
+            &mut history,
+            &mut indexed_coins,
+            shakedex_addresses,
+            shakedex_history,
+            shakedex_coins,
+        )?;
+
+        let mut last_external = None;
+        let mut last_internal = None;
+        let mut last_name = None;
+        let mut last_shakedex = None;
+        for entry in &history {
+            let derivation = addresses
+                .get(entry.script_index as usize)
+                .ok_or(HnsWalletError::InvalidEvidence)?
+                .derivation;
+            match restore_derivation_key(derivation)? {
+                (HNS_COIN_DERIVATION_TAG, 0, index) => {
+                    last_external = Some(last_external.map_or(index, |last: u32| last.max(index)))
+                }
+                (HNS_COIN_DERIVATION_TAG, 1, index) => {
+                    last_internal = Some(last_internal.map_or(index, |last: u32| last.max(index)))
+                }
+                (HNS_NAME_DERIVATION_TAG, 0, index) => {
+                    last_name = Some(last_name.map_or(index, |last: u32| last.max(index)))
+                }
+                (HNS_SHAKEDEX_DERIVATION_TAG, 0, index) => {
+                    last_shakedex = Some(last_shakedex.map_or(index, |last: u32| last.max(index)))
+                }
+                _ => return Err(HnsWalletError::InvalidEvidence),
+            }
+        }
+        ensure_trailing_gap(last_external, gap)?;
+        ensure_trailing_gap(last_internal, gap)?;
+        ensure_trailing_gap(last_name, gap)?;
+        ensure_trailing_gap(last_shakedex, gap)?;
+        let required_external = required_scan_end(last_external, account.external_scan_end, gap);
+        let required_internal = required_scan_end(last_internal, account.internal_scan_end, gap);
+        let required_name = required_scan_end(last_name, account.name_scan_end, gap);
+        let required_shakedex =
+            required_scan_end(last_shakedex, account.shakedex_scan_end, gap);
+        checked_scan_address_count(&[required_external, required_internal])?;
+        checked_scan_address_count(&[required_name])?;
+        checked_scan_address_count(&[required_shakedex])?;
+        if required_external > account.external_scan_end
+            || required_internal > account.internal_scan_end
+            || required_name > account.name_scan_end
+            || required_shakedex > account.shakedex_scan_end
+        {
+            account.external_scan_end = required_external;
+            account.internal_scan_end = required_internal;
+            account.name_scan_end = required_name;
+            account.shakedex_scan_end = required_shakedex;
+            continue;
+        }
+
+        let used: BTreeSet<(u8, u32, u32)> = history
+            .iter()
+            .map(|entry| {
+                let derivation = addresses
+                    .get(entry.script_index as usize)
+                    .ok_or(HnsWalletError::InvalidEvidence)?
+                    .derivation;
+                restore_derivation_key(derivation)
+            })
+            .collect::<Result<_, _>>()?;
+        for address in &mut addresses {
+            address.used = used.contains(&restore_derivation_key(address.derivation)?);
+        }
+        account.last_used_external = used
+            .iter()
+            .filter(|(role, change, _)| *role == HNS_COIN_DERIVATION_TAG && *change == 0)
+            .map(|(_, _, index)| *index)
+            .max();
+        account.last_used_internal = used
+            .iter()
+            .filter(|(role, change, _)| *role == HNS_COIN_DERIVATION_TAG && *change == 1)
+            .map(|(_, _, index)| *index)
+            .max();
+        account.last_used_name = used
+            .iter()
+            .filter(|(role, change, _)| *role == HNS_NAME_DERIVATION_TAG && *change == 0)
+            .map(|(_, _, index)| *index)
+            .max();
+        account.last_used_shakedex = used
+            .iter()
+            .filter(|(role, change, _)| *role == HNS_SHAKEDEX_DERIVATION_TAG && *change == 0)
+            .map(|(_, _, index)| *index)
+            .max();
+        account.next_receive_index =
+            advance_next_derivation_index(account.next_receive_index, account.last_used_external);
+        account.next_change_index =
+            advance_next_derivation_index(account.next_change_index, account.last_used_internal);
+        account.next_name_index =
+            advance_next_derivation_index(account.next_name_index, account.last_used_name);
+        account.next_shakedex_index =
+            advance_next_derivation_index(account.next_shakedex_index, account.last_used_shakedex);
+        account.shakedex_scan_complete = true;
+        account.shakedex_scan_in_progress = false;
+        history.sort_by_key(|entry| (entry.txid, entry.script_index));
+        return Ok(HnsReadScan {
+            account,
+            binding,
+            mempool,
+            addresses,
+            history,
+            indexed_coins,
+            branch_scripts: [coin_scripts, name_scripts, shakedex_scripts],
+        });
     }
 }
 
@@ -6948,8 +7625,12 @@ pub enum HnsWalletError {
     InvalidWorkflow,
     #[error("wallet store must be unlocked")]
     StoreLocked,
+    #[error("wallet read runtime does not share the selected store authority")]
+    StoreAuthorityMismatch,
     #[error("persisted account configuration does not match")]
     AccountConfigurationMismatch,
+    #[error("the selected account or durable read fence changed during synchronization")]
+    StaleAccountRead,
     #[error("the HD account component is already assigned in this wallet")]
     DuplicateAccountDerivation,
     #[error("runtime synchronization lock is unavailable")]
@@ -7012,6 +7693,9 @@ impl From<serde_json::Error> for HnsWalletError {
 mod tests {
     use super::*;
     use hns_primitives::{BlockHash, Height, Outpoint as CanonicalOutpoint};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn test_runtime_config() -> HnsRuntimeConfig {
         HnsRuntimeConfig {
@@ -7062,6 +7746,299 @@ mod tests {
             instance_nonce: [23; 32],
             generation,
         }
+    }
+
+    const PRODUCTION_FOLLOWUP_PASSPHRASE: &str = "correct horse battery staple";
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ProductionFollowupReadFault {
+        Healthy,
+        StaleChain,
+        RestartedMempool,
+        ChangedAccount,
+        LockedStore,
+    }
+
+    struct ProductionFollowupReadBackend {
+        store: SharedWalletStore,
+        account_id: [u8; 32],
+        fault: ProductionFollowupReadFault,
+        tip_calls: AtomicUsize,
+        confirmed_calls: AtomicUsize,
+        mempool_calls: AtomicUsize,
+    }
+
+    impl ProductionFollowupReadBackend {
+        fn new(
+            store: SharedWalletStore,
+            config: &HnsRuntimeConfig,
+            fault: ProductionFollowupReadFault,
+        ) -> Self {
+            Self {
+                store,
+                account_id: account_entity_id(config),
+                fault,
+                tip_calls: AtomicUsize::new(0),
+                confirmed_calls: AtomicUsize::new(0),
+                mempool_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn binding() -> SnapshotBinding {
+            SnapshotBinding {
+                tip: ChainTip {
+                    height: 1,
+                    block_hash: [31; 32],
+                    tree_root: [32; 32],
+                    median_time_past: 1_700_000_000,
+                },
+                chain_epoch: 7,
+            }
+        }
+
+        fn mempool() -> MempoolSnapshotBinding {
+            MempoolSnapshotBinding {
+                instance_nonce: [33; 32],
+                generation: 9,
+            }
+        }
+
+        fn prove_store_mutex_is_released(&self) -> Result<(), HnsWalletError> {
+            let store = self.store.clone();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let result = store.with_store(|_| Ok(())).is_ok();
+                let _ = sender.send(result);
+            });
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(HnsWalletError::Backend(
+                    "shared store probe failed during backend I/O".to_owned(),
+                )),
+                Err(_) => Err(HnsWalletError::Backend(
+                    "backend was invoked while the shared store mutex was held".to_owned(),
+                )),
+            }
+        }
+
+        fn fail_if_unexpected(method: &str) -> HnsWalletError {
+            HnsWalletError::Backend(format!(
+                "unexpected value or evidence method in account read: {method}"
+            ))
+        }
+    }
+
+    impl HnsBackend for ProductionFollowupReadBackend {
+        fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            if self.tip_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                match self.fault {
+                    ProductionFollowupReadFault::ChangedAccount => {
+                        self.store
+                            .with_store_mut(|store| {
+                                let stored = store
+                                    .wallet_account::<HnsAccountRecord>(&self.account_id)?
+                                    .ok_or(StoreError::CorruptMetadata)?;
+                                let mut changed = stored.value;
+                                changed.next_receive_index = changed
+                                    .next_receive_index
+                                    .checked_add(1)
+                                    .ok_or(StoreError::RevisionOverflow)?;
+                                store
+                                    .save_wallet_account(
+                                        &self.account_id,
+                                        stored.revision,
+                                        &changed,
+                                        101,
+                                    )
+                                    .map(|_| ())
+                            })
+                            .map_err(HnsWalletError::from)?;
+                    }
+                    ProductionFollowupReadFault::LockedStore => {
+                        self.store.lock().map_err(HnsWalletError::from)?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Self::binding().tip)
+        }
+
+        fn get_block_hash(
+            &self,
+            height: u64,
+            binding: SnapshotBinding,
+        ) -> Result<BlockHashEvidence, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            Ok(BlockHashEvidence {
+                binding,
+                height,
+                block_hash: Some(if height == binding.tip.height {
+                    binding.tip.block_hash
+                } else {
+                    [35; 32]
+                }),
+            })
+        }
+
+        fn get_confirmed_wallet_page(
+            &self,
+            _: ConfirmedWalletPageRequest<'_>,
+        ) -> Result<ConfirmedWalletPage, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            let call = self.confirmed_calls.fetch_add(1, Ordering::SeqCst);
+            let mut binding = Self::binding();
+            if self.fault == ProductionFollowupReadFault::StaleChain && call > 0 {
+                binding.chain_epoch += 1;
+            }
+            Ok(ConfirmedWalletPage {
+                binding,
+                next_cursor: None,
+                history: Vec::new(),
+                utxos: Vec::new(),
+            })
+        }
+
+        fn get_mempool_wallet_page(
+            &self,
+            _: MempoolWalletPageRequest<'_>,
+        ) -> Result<MempoolWalletPage, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            let call = self.mempool_calls.fetch_add(1, Ordering::SeqCst);
+            let mempool = if self.fault == ProductionFollowupReadFault::RestartedMempool
+                && call >= 3
+            {
+                MempoolSnapshotBinding {
+                    instance_nonce: [34; 32],
+                    generation: 1,
+                }
+            } else {
+                Self::mempool()
+            };
+            Ok(MempoolWalletPage {
+                binding: Self::binding(),
+                mempool,
+                next_cursor: None,
+                history: Vec::new(),
+            })
+        }
+
+        fn get_transaction_evidence(
+            &self,
+            _: TransactionHash,
+            _: SnapshotBinding,
+            _: Option<MempoolSnapshotBinding>,
+        ) -> Result<TransactionEvidence, HnsWalletError> {
+            Err(Self::fail_if_unexpected("get_transaction_evidence"))
+        }
+
+        fn get_outpoint_spend_evidence(
+            &self,
+            _: &[HnsOutpoint],
+            _: SnapshotBinding,
+        ) -> Result<OutpointSpendEvidence, HnsWalletError> {
+            Err(Self::fail_if_unexpected("get_outpoint_spend_evidence"))
+        }
+
+        fn broadcast_transaction(&self, _: &[u8]) -> Result<TransactionHash, HnsWalletError> {
+            Err(Self::fail_if_unexpected("broadcast_transaction"))
+        }
+
+        fn quote_transaction_fee(
+            &self,
+            _: &[u8],
+            _: &[Coin],
+            _: u16,
+            _: SnapshotBinding,
+            _: MempoolSnapshotBinding,
+        ) -> Result<HnsTransactionFeeQuote, HnsWalletError> {
+            Err(Self::fail_if_unexpected("quote_transaction_fee"))
+        }
+
+        fn estimate_fee_rate(&self, _: u16) -> Result<BaseUnits, HnsWalletError> {
+            Err(Self::fail_if_unexpected("estimate_fee_rate"))
+        }
+
+        fn get_name_evidence(
+            &self,
+            _: [u8; 32],
+            _: SnapshotBinding,
+        ) -> Result<NameEvidence, HnsWalletError> {
+            Err(Self::fail_if_unexpected("get_name_evidence"))
+        }
+
+        fn get_name_action_context(
+            &self,
+            _: HnsNameAction,
+            _: [u8; 32],
+            _: SnapshotBinding,
+            _: MempoolSnapshotBinding,
+        ) -> Result<NameActionContextEvidence, HnsWalletError> {
+            Err(Self::fail_if_unexpected("get_name_action_context"))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ProductionFollowupClock;
+
+    impl HnsClock for ProductionFollowupClock {
+        fn now_unix(&self) -> Result<u64, HnsWalletError> {
+            Ok(100)
+        }
+    }
+
+    fn production_followup_read_store() -> (SharedWalletStore, HnsRuntimeConfig) {
+        let mut config = test_runtime_config();
+        config.birthday_height = 0;
+        config.restore_lookahead = 1;
+        config.minimum_confirmations = 1;
+        let mut store = WalletStore::create(":memory:", PRODUCTION_FOLLOWUP_PASSPHRASE)
+            .expect("create synchronized-read store");
+        store
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[41; 64],
+                1,
+            )
+            .expect("persist synchronized-read seed");
+        let account = HnsAccountRecord {
+            config: config.clone(),
+            next_receive_index: 0,
+            next_change_index: 0,
+            next_name_index: 0,
+            next_shakedex_index: 0,
+            external_scan_end: 0,
+            internal_scan_end: 0,
+            name_scan_end: 0,
+            shakedex_scan_end: 0,
+            shakedex_scan_complete: false,
+            shakedex_scan_in_progress: false,
+            last_used_external: None,
+            last_used_internal: None,
+            last_used_name: None,
+            last_used_shakedex: None,
+        };
+        store
+            .save_wallet_account(&account_entity_id(&config), 0, &account, 1)
+            .expect("persist synchronized-read account");
+        (SharedWalletStore::new(store), config)
+    }
+
+    fn production_followup_read_runtime(
+        store: SharedWalletStore,
+        config: HnsRuntimeConfig,
+        fault: ProductionFollowupReadFault,
+    ) -> HnsAccountReadRuntime<ProductionFollowupReadBackend, ProductionFollowupClock> {
+        let selector = HnsExistingAccountSelector::new(store.clone(), config.clone())
+            .expect("exact synchronized-read selector");
+        HnsAccountReadRuntime::new(
+            ProductionFollowupReadBackend::new(store.clone(), &config, fault),
+            ProductionFollowupClock,
+            store,
+            selector,
+        )
+        .expect("synchronized account read runtime")
     }
 
     fn canonical_name_view(
@@ -7981,6 +8958,132 @@ mod tests {
                 &[KeyRole::HnsCoin, KeyRole::HnsCoin],
             ),
             Err(HnsWalletError::InvalidPreparedArtifact)
+        ));
+    }
+
+    #[test]
+    fn production_followup_account_reads_commit_one_live_binding_without_store_locked_node_io() {
+        let (store, config) = production_followup_read_store();
+        let runtime = production_followup_read_runtime(
+            store.clone(),
+            config.clone(),
+            ProductionFollowupReadFault::Healthy,
+        );
+
+        let snapshot = runtime.synchronize().expect("one synchronized read");
+        assert_eq!(snapshot.account_id, config.account_id);
+        assert_eq!(snapshot.binding.chain, ProductionFollowupReadBackend::binding());
+        assert_eq!(snapshot.binding.mempool, ProductionFollowupReadBackend::mempool());
+        assert_eq!(snapshot.balance, Amount::new(WalletAsset::Hns, 0));
+        assert!(snapshot.transactions.is_empty());
+        assert!(snapshot.known_names.is_empty());
+        assert_eq!(snapshot.receive_target.module, ModuleId::Handshake);
+        assert_eq!(snapshot.receive_target.account, config.account_id);
+        assert_eq!(snapshot.receive_target.derivation_index, 0);
+        assert!(snapshot.receive_target.display.starts_with("rs1"));
+
+        store
+            .with_store(|wallet| {
+                let account = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .ok_or(StoreError::CorruptMetadata)?;
+                assert!(account.value.shakedex_scan_complete);
+                assert!(!account.value.shakedex_scan_in_progress);
+                let recovery = wallet
+                    .hns_recovery_state::<HnsRecoveryState>(&recovery_entity_id(&config))?
+                    .ok_or(StoreError::CorruptMetadata)?;
+                assert_eq!(recovery.value.last_tip, Some(snapshot.binding.chain.tip));
+                assert_eq!(recovery.value.last_reconciled_unix, 100);
+                Ok(())
+            })
+            .expect("authenticated read commit");
+    }
+
+    #[test]
+    fn production_followup_account_reads_fail_closed_on_stale_restart_account_and_lock_fences() {
+        let (stale_store, stale_config) = production_followup_read_store();
+        let stale = production_followup_read_runtime(
+            stale_store.clone(),
+            stale_config.clone(),
+            ProductionFollowupReadFault::StaleChain,
+        );
+        assert!(matches!(
+            stale.synchronize(),
+            Err(HnsWalletError::StaleNodeSnapshot)
+        ));
+        stale_store
+            .with_store(|wallet| {
+                let account = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&stale_config))?
+                    .ok_or(StoreError::CorruptMetadata)?;
+                assert!(account.value.shakedex_scan_in_progress);
+                assert!(!account.value.shakedex_scan_complete);
+                Ok(())
+            })
+            .expect("durable stale scan fence");
+        drop(stale);
+        let recovered = production_followup_read_runtime(
+            stale_store,
+            stale_config,
+            ProductionFollowupReadFault::Healthy,
+        );
+        recovered
+            .synchronize()
+            .expect("fresh process recovers the durable scan fence");
+
+        let (restart_store, restart_config) = production_followup_read_store();
+        let restarted_node = production_followup_read_runtime(
+            restart_store,
+            restart_config,
+            ProductionFollowupReadFault::RestartedMempool,
+        );
+        assert!(matches!(
+            restarted_node.synchronize(),
+            Err(HnsWalletError::StaleNodeSnapshot)
+        ));
+
+        let (changed_store, changed_config) = production_followup_read_store();
+        let changed_account = production_followup_read_runtime(
+            changed_store,
+            changed_config,
+            ProductionFollowupReadFault::ChangedAccount,
+        );
+        assert!(matches!(
+            changed_account.synchronize(),
+            Err(HnsWalletError::StaleAccountRead)
+        ));
+
+        let (locked_store, locked_config) = production_followup_read_store();
+        let locked = production_followup_read_runtime(
+            locked_store.clone(),
+            locked_config,
+            ProductionFollowupReadFault::LockedStore,
+        );
+        assert!(matches!(
+            locked.synchronize(),
+            Err(HnsWalletError::StoreLocked)
+        ));
+        assert!(locked_store.is_locked().expect("locked read store"));
+
+        let (selector_store, selector_config) = production_followup_read_store();
+        let selector = HnsExistingAccountSelector::new(
+            selector_store,
+            selector_config.clone(),
+        )
+        .expect("selector authority");
+        let (different_store, _) = production_followup_read_store();
+        assert!(matches!(
+            HnsAccountReadRuntime::new(
+                ProductionFollowupReadBackend::new(
+                    different_store.clone(),
+                    &selector_config,
+                    ProductionFollowupReadFault::Healthy,
+                ),
+                ProductionFollowupClock,
+                different_store,
+                selector,
+            ),
+            Err(HnsWalletError::StoreAuthorityMismatch)
         ));
     }
 

@@ -17,13 +17,18 @@ The checked-in service executable now requires an explicit existing wallet
 database, opens it through the platform filesystem checks in a locked state,
 and shares one decrypted-key authority between runtime control and encrypted
 provider permissions. ABI wallet status/unlock/lock and a narrow provider
-control surface are implemented. A separate library composition can bind one
-exact pre-existing HNS account selector to that identical shared authority and
-add only `hns_requestAccounts`/`hns_accounts`; selection is authenticated again
-on every read and never creates an account or contacts a node. The checked-in
-executable still has no account-selection inputs. Wallet creation/restoration,
-synchronized chain reads, browser integration, and every value path remain
-unavailable there.
+control surface are implemented. One library composition can bind an exact
+pre-existing HNS account selector to that identical shared authority and add
+`hns_requestAccounts`/`hns_accounts`. A second library composition adds live,
+account-scoped `hns_getBalance`, `hns_getTransactions`,
+`hns_getReceiveAddress`, `hns_getNames`, and `hns_getName` reads through the
+real HNS backend and encrypted wallet state. It authenticates the selected
+account around each bounded reconciliation, retains one exact chain/mempool
+binding internally, performs no node I/O while a `SharedWalletStore` closure is
+active, and commits only across exact account/entity revision fences. The
+checked-in executable still has no account-selection or backend inputs, so it
+remains the control-only runtime. Wallet creation/restoration, browser
+integration, and every value path remain unavailable there.
 
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
@@ -75,6 +80,10 @@ revision `9d0cbeb8e59dcd74c189ec973b218a9f3afe167e`, the one combined
 Shakedex tests with zero failures; this is not product, regtest, or full-gate
 qualification.
 
+The synchronized account-read tranche adds focused `production_followup_`
+runtime/provider/service tests in source. They have not been executed in this
+change; the prior results above do not qualify the new composition.
+
 ## Crates
 
 - `hns-wallet-types`: wallet-local identifiers and UI-safe summaries.
@@ -91,7 +100,8 @@ qualification.
   release-gated Helios/HTLC policy.
 - `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.
 - `hns-wallet-service`: private session/authority registry plus locked,
-  existing-database control and exact-account library compositions.
+  existing-database control, exact-account, and synchronized non-value HNS read
+  library compositions.
 - `hns-wallet-host`: caller-side negotiation, correlation, authority, approval,
   binding, and event-replay state for trusted browser/mobile adapters.
 - `hns-wallet-testkit`: deterministic, non-mainnet fixtures.

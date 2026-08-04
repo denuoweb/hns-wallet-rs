@@ -11,7 +11,11 @@ use hns_wallet_ffi::{
     ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest, ServiceResponse, SessionEnvelope,
     WALLET_ABI_VERSION, WalletRequest, WalletResponse, WalletRuntimeStatus, encode_service_frame,
 };
-use hns_wallet_hns::{HnsExistingAccountSelector, HnsWalletError};
+use hns_wallet_hns::{
+    HnsAccountReadRuntime, HnsAccountReadSnapshot, HnsBackend, HnsClock,
+    HnsExistingAccountSelector, HnsWalletError, KnownName, NameOwnershipStatus,
+    NameResourceStatus,
+};
 use hns_wallet_provider::{
     ApprovedCall, HostAuthorityRegistration, Origin, PROVIDER_API_VERSION, PendingApproval,
     PermissionSnapshot, ProviderAction, ProviderCore, ProviderError, ProviderMethod,
@@ -19,14 +23,17 @@ use hns_wallet_provider::{
 };
 use hns_wallet_store::{SharedWalletStore, StoreError};
 use hns_wallet_types::{
-    ApprovalId, ApprovalKind, HostAuthorityHandleId, HostSessionId, ModuleId, PermissionCapability,
-    ProviderApprovalId, ProviderRequestId, WalletServiceSessionId, WalletSessionId,
+    Amount, ApprovalId, ApprovalKind, HostAuthorityHandleId, HostSessionId,
+    LocalTransactionStatus, ModuleId, PermissionCapability, ProviderApprovalId, ProviderRequestId,
+    ReceiveTarget, TransactionSummary, WalletAsset, WalletServiceSessionId, WalletSessionId,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
 
 pub const MAX_SEEN_REQUEST_IDS: usize = 4_096;
 pub const MAX_SERVICE_PENDING_APPROVALS: usize = 128;
+pub const MAX_PROVIDER_HNS_READ_ITEMS: usize = 128;
+pub const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// Execution boundary supplied by a wallet composition. Runtime method support
 /// is checked independently from the closed provider vocabulary, and value or
@@ -57,6 +64,28 @@ pub trait ServiceRuntime {
     /// prompting or accepting a caller-selected identity. Persisted account
     /// permissions are rechecked against this value after every restart.
     fn selected_hns_account(&self) -> Result<AccountSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    /// Reconcile and return the exact bounded known-name set disclosed by a
+    /// newly approved `Names` capability. A later read is restricted to this
+    /// persisted set until the origin explicitly re-approves it.
+    fn current_hns_name_scope(&mut self) -> Result<BTreeSet<[u8; 32]>, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    /// Execute a name read under the exact persisted name-hash set. Other
+    /// runtimes cannot accidentally inherit unscoped name disclosure merely
+    /// by advertising a method name.
+    fn execute_hns_name_read(
+        &mut self,
+        _: ApprovedCall,
+        _: &BTreeSet<[u8; 32]>,
+    ) -> Result<Value, ServiceFailure> {
         Err(ServiceFailure::unsupported(
             ServiceCapability::ProviderDispatch,
         ))
@@ -333,6 +362,249 @@ impl ServiceRuntime for PersistentHnsAccountRuntime {
             | WalletRequest::Balance { .. }
             | WalletRequest::ReceiveTarget { .. }
             | WalletRequest::TransactionHistory { .. }
+            | WalletRequest::ModuleStatus { .. }
+            | WalletRequest::WorkflowStatus { .. } => Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            )),
+        }
+    }
+}
+
+/// Trusted library inputs for the synchronized HNS read composition. The
+/// runtime already owns the exact selector/store/backend join; the service
+/// accepts it only when its Arc-backed store authority is identical.
+pub struct PersistentHnsReadConfig<B, C> {
+    pub runtime: HnsAccountReadRuntime<B, C>,
+    pub account_label: String,
+}
+
+/// Product-composable HNS account runtime that performs one live, bounded
+/// reconciliation for every balance/history/receive/name result. It exposes
+/// no value, signing, import, module, marketplace, or settlement path.
+pub struct PersistentHnsReadRuntime<B, C> {
+    store: SharedWalletStore,
+    runtime: HnsAccountReadRuntime<B, C>,
+    account_label: String,
+}
+
+impl<B: HnsBackend, C: HnsClock> PersistentHnsReadRuntime<B, C> {
+    fn new(store: SharedWalletStore, config: PersistentHnsReadConfig<B, C>) -> Self {
+        Self {
+            store,
+            runtime: config.runtime,
+            account_label: config.account_label,
+        }
+    }
+
+    fn status(&self) -> Result<WalletRuntimeStatus, ServiceFailure> {
+        let locked = self.store.is_locked().map_err(persistent_store_failure)?;
+        let active_wallet = if locked {
+            None
+        } else {
+            Some(
+                self.runtime
+                    .selected_account()
+                    .map_err(hns_read_failure)?
+                    .config
+                    .wallet_id,
+            )
+        };
+        Ok(WalletRuntimeStatus {
+            locked,
+            active_wallet,
+            enabled_modules: BTreeSet::from([ModuleId::Handshake]),
+            mainnet_settlement_enabled: false,
+        })
+    }
+
+    fn exact_account(&self) -> Result<AccountSummary, ServiceFailure> {
+        if self.store.is_locked().map_err(persistent_store_failure)? {
+            return Err(wallet_locked());
+        }
+        let selected = self
+            .runtime
+            .selected_account()
+            .map_err(hns_read_failure)?;
+        let account = AccountSummary {
+            account_id: selected.config.account_id,
+            module: ModuleId::Handshake,
+            label: self.account_label.clone(),
+            receive_display: None,
+        };
+        validate_hns_account_summary(&account)?;
+        Ok(account)
+    }
+
+    fn synchronize(&self) -> Result<HnsAccountReadSnapshot, ServiceFailure> {
+        let selected = self.exact_account()?;
+        let snapshot = self.runtime.synchronize().map_err(hns_read_failure)?;
+        if snapshot.account_id != selected.account_id {
+            return Err(hns_read_failure(HnsWalletError::StaleAccountRead));
+        }
+        Ok(snapshot)
+    }
+
+    fn unlock(&self, passphrase: &str) -> Result<(), ServiceFailure> {
+        self.store
+            .unlock(passphrase)
+            .map_err(persistent_store_failure)?;
+        if let Err(error) = self.exact_account() {
+            self.store.lock().map_err(persistent_store_failure)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsReadRuntime<B, C> {
+    fn capabilities(&self) -> BTreeSet<ServiceCapability> {
+        BTreeSet::from([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::ProviderDispatch,
+        ])
+    }
+
+    fn supports_provider_method(&self, method: ProviderMethod) -> bool {
+        matches!(
+            method,
+            ProviderMethod::WalletGetStatus
+                | ProviderMethod::HnsRequestAccounts
+                | ProviderMethod::HnsGetBalance
+                | ProviderMethod::HnsGetTransactions
+                | ProviderMethod::HnsGetReceiveAddress
+                | ProviderMethod::HnsGetNames
+                | ProviderMethod::HnsGetName
+        )
+    }
+
+    fn prepare_approval(&mut self, _: &PendingApproval) -> Result<ApprovalSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    fn prepare_hns_account_grant(
+        &mut self,
+        _: &ApprovedCall,
+    ) -> Result<AccountSummary, ServiceFailure> {
+        self.exact_account()
+    }
+
+    fn selected_hns_account(&self) -> Result<AccountSummary, ServiceFailure> {
+        self.exact_account()
+    }
+
+    fn current_hns_name_scope(&mut self) -> Result<BTreeSet<[u8; 32]>, ServiceFailure> {
+        let names = self.synchronize()?.known_names;
+        if names.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+            return Err(hns_read_result_bound());
+        }
+        for name in &names {
+            public_hns_name_summary(name)?;
+        }
+        let name_count = names.len();
+        let scope = names
+            .into_iter()
+            .map(|name| name.name_hash)
+            .collect::<BTreeSet<_>>();
+        if scope.len() != name_count {
+            return Err(hns_read_failure(HnsWalletError::InvalidEvidence));
+        }
+        Ok(scope)
+    }
+
+    fn execute_hns_name_read(
+        &mut self,
+        call: ApprovedCall,
+        approved_names: &BTreeSet<[u8; 32]>,
+    ) -> Result<Value, ServiceFailure> {
+        if approved_names.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+            return Err(provider_failure(ProviderError::Persistence));
+        }
+        let snapshot = self.synchronize()?;
+        public_hns_name_read(&call, approved_names, &snapshot.known_names)
+    }
+
+    fn execute_provider(&mut self, call: ApprovedCall) -> Result<Value, ServiceFailure> {
+        match call.method {
+            ProviderMethod::WalletGetStatus => {
+                validate_empty_params(&call.params)?;
+                serde_json::to_value(self.status()?)
+                    .map_err(|_| invalid_request("wallet status encoding failed"))
+            }
+            ProviderMethod::HnsGetBalance
+            | ProviderMethod::HnsGetTransactions
+            | ProviderMethod::HnsGetReceiveAddress => {
+                let snapshot = self.synchronize()?;
+                public_hns_non_name_read(&call, &snapshot)
+            }
+            ProviderMethod::HnsGetNames | ProviderMethod::HnsGetName => Err(
+                ServiceFailure::unsupported(ServiceCapability::ProviderDispatch),
+            ),
+            _ => Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            )),
+        }
+    }
+
+    fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+        self.store.lock().map_err(persistent_store_failure)
+    }
+
+    fn execute_wallet(&mut self, request: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
+        match request {
+            WalletRequest::Status => Ok(WalletResponse::Status {
+                status: self.status()?,
+            }),
+            WalletRequest::Unlock { passphrase } => {
+                self.unlock(passphrase.expose_secret())?;
+                Ok(WalletResponse::Unlocked)
+            }
+            WalletRequest::Lock => {
+                self.lock_wallet()?;
+                Ok(WalletResponse::Locked)
+            }
+            WalletRequest::ListAccounts => Ok(WalletResponse::Accounts {
+                accounts: vec![self.exact_account()?],
+            }),
+            WalletRequest::Balance { module, account } => {
+                let snapshot = self.synchronize()?;
+                validate_hns_wallet_read_scope(module, account, snapshot.account_id)?;
+                Ok(WalletResponse::Balance {
+                    amount: snapshot.balance,
+                })
+            }
+            WalletRequest::ReceiveTarget { module, account } => {
+                let snapshot = self.synchronize()?;
+                validate_hns_wallet_read_scope(module, account, snapshot.account_id)?;
+                Ok(WalletResponse::ReceiveTarget {
+                    target: snapshot.receive_target,
+                })
+            }
+            WalletRequest::TransactionHistory { module, account } => {
+                let snapshot = self.synchronize()?;
+                validate_hns_wallet_read_scope(module, account, snapshot.account_id)?;
+                if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+                    return Err(hns_read_result_bound());
+                }
+                Ok(WalletResponse::TransactionHistory {
+                    transactions: snapshot.transactions,
+                })
+            }
+            WalletRequest::ModuleStatus { module } if module == ModuleId::Handshake => {
+                let snapshot = self.synchronize()?;
+                Ok(WalletResponse::ModuleStatus {
+                    status: hns_wallet_types::SyncStatus {
+                        phase: hns_wallet_types::SyncPhase::Ready,
+                        validated_height: snapshot.binding.chain.tip.height,
+                        scanned_height: snapshot.binding.chain.tip.height,
+                        target_height: Some(snapshot.binding.chain.tip.height),
+                        last_error: None,
+                    },
+                })
+            }
+            WalletRequest::CreateWallet { .. }
+            | WalletRequest::RestoreWallet { .. }
             | WalletRequest::ModuleStatus { .. }
             | WalletRequest::WorkflowStatus { .. } => Err(ServiceFailure::unsupported(
                 ServiceCapability::WalletOperations,
@@ -753,9 +1025,17 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         let method = ProviderMethod::parse(&method_name).map_err(provider_failure)?;
         if matches!(
             method,
-            ProviderMethod::HnsRequestAccounts | ProviderMethod::HnsAccounts
+            ProviderMethod::HnsRequestAccounts
+                | ProviderMethod::HnsAccounts
+                | ProviderMethod::HnsGetBalance
+                | ProviderMethod::HnsGetTransactions
+                | ProviderMethod::HnsGetReceiveAddress
+                | ProviderMethod::HnsGetNames
         ) {
             validate_empty_params(&params)?;
+        }
+        if method == ProviderMethod::HnsGetName {
+            hns_name_hash_param(&params)?;
         }
         if matches!(
             method,
@@ -1084,14 +1364,23 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 }))
             }
             ProviderMethod::WalletRequestPermissions => {
-                let capabilities = requested_capabilities(&call)?;
-                if !capabilities.is_subset(&self.grantable_permission_capabilities()) {
+                let requested = requested_capabilities(&call)?;
+                if !requested.is_subset(&self.grantable_permission_capabilities()) {
                     return Err(ServiceFailure::unsupported(
                         ServiceCapability::ProviderDispatch,
                     ));
                 }
                 let expected_generation =
                     expected_permission_generation.ok_or_else(stale_approval)?;
+                let (capabilities, approved_accounts, approved_names, expires_at_unix) = self
+                    .hns_read_permission_extension(
+                        authority_handle,
+                        authority_revision,
+                        &call,
+                        expected_generation,
+                        requested,
+                        now_unix_ms,
+                    )?;
                 let permission = self
                     .provider
                     .grant_scoped_permissions_at_generation(
@@ -1099,10 +1388,10 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                         authority_revision,
                         expected_generation,
                         capabilities,
-                        BTreeSet::new(),
-                        BTreeSet::new(),
+                        approved_accounts,
+                        approved_names,
                         now_unix_ms,
-                        None,
+                        expires_at_unix,
                     )
                     .map_err(provider_failure)?;
                 self.pending.clear();
@@ -1128,8 +1417,134 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     .map_err(ServiceFailure::from)?;
                 Ok(json!({ "locked": true }))
             }
+            _ if hns_account_read_method(call.method) => {
+                let approved_names = self.authorize_hns_account_read(
+                    authority_handle,
+                    authority_revision,
+                    &call,
+                    now_unix_ms,
+                )?;
+                if matches!(
+                    call.method,
+                    ProviderMethod::HnsGetNames | ProviderMethod::HnsGetName
+                ) {
+                    self.runtime.execute_hns_name_read(call, &approved_names)
+                } else {
+                    self.runtime.execute_provider(call)
+                }
+            }
             _ => self.runtime.execute_provider(call),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hns_read_permission_extension(
+        &mut self,
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        call: &ApprovedCall,
+        expected_generation: u64,
+        requested: BTreeSet<PermissionCapability>,
+        now_unix_ms: u64,
+    ) -> Result<
+        (
+            BTreeSet<PermissionCapability>,
+            BTreeSet<hns_wallet_types::AccountId>,
+            BTreeSet<[u8; 32]>,
+            Option<u64>,
+        ),
+        ServiceFailure,
+    > {
+        let account_scoped = ProviderMethod::ALL.into_iter().any(|method| {
+            hns_account_read_method(method)
+                && self.runtime.supports_provider_method(method)
+                && method
+                    .permission()
+                    .is_some_and(|capability| requested.contains(&capability))
+        });
+        if !account_scoped {
+            return Ok((requested, BTreeSet::new(), BTreeSet::new(), None));
+        }
+        if call.namespace != SelectedNamespace::Hns {
+            return Err(provider_failure(ProviderError::Unauthorized));
+        }
+        let snapshot = self
+            .provider
+            .permission_snapshot(authority_handle, authority_revision, now_unix_ms)
+            .map_err(provider_failure)?;
+        if snapshot.generation != expected_generation {
+            return Err(stale_approval());
+        }
+        let record = snapshot
+            .record
+            .ok_or_else(|| provider_failure(ProviderError::Unauthorized))?;
+        let selected = self.runtime.selected_hns_account()?;
+        validate_hns_account_summary(&selected)?;
+        let approved_accounts = BTreeSet::from([selected.account_id]);
+        if !record
+            .capabilities
+            .contains(&PermissionCapability::Accounts)
+            || record.approved_accounts != approved_accounts
+        {
+            return Err(provider_failure(ProviderError::Unauthorized));
+        }
+        let refresh_name_scope = requested.contains(&PermissionCapability::Names);
+        let approved_names = if refresh_name_scope {
+            self.runtime.current_hns_name_scope()?
+        } else {
+            record.approved_names
+        };
+        if approved_names.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+            return Err(hns_read_result_bound());
+        }
+        let mut capabilities = record.capabilities;
+        capabilities.extend(requested);
+        Ok((
+            capabilities,
+            approved_accounts,
+            approved_names,
+            record.expires_at_unix,
+        ))
+    }
+
+    fn authorize_hns_account_read(
+        &mut self,
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        call: &ApprovedCall,
+        now_unix_ms: u64,
+    ) -> Result<BTreeSet<[u8; 32]>, ServiceFailure> {
+        if call.namespace != SelectedNamespace::Hns {
+            return Err(provider_failure(ProviderError::Unauthorized));
+        }
+        let required = call
+            .method
+            .permission()
+            .ok_or_else(|| invalid_request("HNS read has no permission capability"))?;
+        let record = self
+            .provider
+            .permission_snapshot(authority_handle, authority_revision, now_unix_ms)
+            .map_err(provider_failure)?
+            .record
+            .ok_or_else(|| provider_failure(ProviderError::Unauthorized))?;
+        let selected = self.runtime.selected_hns_account()?;
+        validate_hns_account_summary(&selected)?;
+        if !record.capabilities.contains(&PermissionCapability::Accounts)
+            || !record.capabilities.contains(&required)
+            || record.approved_accounts != BTreeSet::from([selected.account_id])
+        {
+            return Err(provider_failure(ProviderError::Unauthorized));
+        }
+        if record.approved_names.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+            return Err(provider_failure(ProviderError::Persistence));
+        }
+        if call.method == ProviderMethod::HnsGetName {
+            let requested = hns_name_hash_param(&call.params)?;
+            if !record.approved_names.contains(&requested) {
+                return Err(provider_failure(ProviderError::Unauthorized));
+            }
+        }
+        Ok(record.approved_names)
     }
 
     fn provider_binding(
@@ -1337,11 +1752,36 @@ impl WalletService<SharedWalletStore, PersistentHnsAccountRuntime> {
         }
         if config.account_label.is_empty()
             || config.account_label.len() > MAX_PUBLIC_STRING_BYTES
-            || !config.account_label.is_ascii()
+            || !is_printable_ascii(&config.account_label)
         {
             return Err(ServiceError::InvalidPersistentHnsAccount);
         }
         let runtime = PersistentHnsAccountRuntime::new(store.clone(), config);
+        Self::new(store, runtime, true)
+    }
+}
+
+impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsReadRuntime<B, C>> {
+    /// Compose synchronized HNS reads around one exact SharedWalletStore
+    /// authority. The backend remains a concrete product type; no public mutex
+    /// guard or dynamic backend crosses this boundary.
+    pub fn new_persistent_hns_reads(
+        store: SharedWalletStore,
+        config: PersistentHnsReadConfig<B, C>,
+    ) -> Result<Self, ServiceError> {
+        if !store.is_locked()? {
+            return Err(ServiceError::PersistentStoreMustStartLocked);
+        }
+        if !config.runtime.shares_store_authority(&store) {
+            return Err(ServiceError::PersistentStoreAuthorityMismatch);
+        }
+        if config.account_label.is_empty()
+            || config.account_label.len() > MAX_PUBLIC_STRING_BYTES
+            || !is_printable_ascii(&config.account_label)
+        {
+            return Err(ServiceError::InvalidPersistentHnsAccount);
+        }
+        let runtime = PersistentHnsReadRuntime::new(store.clone(), config);
         Self::new(store, runtime, true)
     }
 }
@@ -1373,6 +1813,17 @@ fn service_owned_method(method: ProviderMethod) -> bool {
             | ProviderMethod::WalletRevokePermissions
             | ProviderMethod::HnsAccounts
             | ProviderMethod::WalletLock
+    )
+}
+
+fn hns_account_read_method(method: ProviderMethod) -> bool {
+    matches!(
+        method,
+        ProviderMethod::HnsGetBalance
+            | ProviderMethod::HnsGetTransactions
+            | ProviderMethod::HnsGetReceiveAddress
+            | ProviderMethod::HnsGetNames
+            | ProviderMethod::HnsGetName
     )
 }
 
@@ -1429,15 +1880,295 @@ fn validate_empty_params(params: &Value) -> Result<(), ServiceFailure> {
     }
 }
 
+fn bounded_provider_value(value: Value) -> Result<Value, ServiceFailure> {
+    if serde_json::to_vec(&value)
+        .map_err(|_| invalid_request("provider result encoding failed"))?
+        .len()
+        > MAX_PROVIDER_RESULT_BYTES
+    {
+        return Err(invalid_request("provider result exceeds the provider bound"));
+    }
+    Ok(value)
+}
+
+fn hns_name_hash_param(params: &Value) -> Result<[u8; 32], ServiceFailure> {
+    let object = params
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .ok_or_else(|| invalid_request("hns_getName requires only nameHash"))?;
+    let encoded = object
+        .get("nameHash")
+        .and_then(Value::as_str)
+        .filter(|encoded| encoded.len() == 64)
+        .ok_or_else(|| invalid_request("nameHash must be 32-byte lowercase hexadecimal"))?;
+    let mut output = [0_u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let decode = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        let high = decode(pair[0])
+            .ok_or_else(|| invalid_request("nameHash must be canonical lowercase hexadecimal"))?;
+        let low = decode(pair[1])
+            .ok_or_else(|| invalid_request("nameHash must be canonical lowercase hexadecimal"))?;
+        output[index] = (high << 4) | low;
+    }
+    Ok(output)
+}
+
+fn public_hns_non_name_read(
+    call: &ApprovedCall,
+    snapshot: &HnsAccountReadSnapshot,
+) -> Result<Value, ServiceFailure> {
+    validate_empty_params(&call.params)?;
+    match call.method {
+        ProviderMethod::HnsGetBalance => bounded_provider_value(json!({
+            "amount": public_hns_amount(snapshot.balance)?,
+        })),
+        ProviderMethod::HnsGetTransactions => {
+            if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+                return Err(hns_read_result_bound());
+            }
+            let transactions = snapshot
+                .transactions
+                .iter()
+                .map(public_hns_transaction_summary)
+                .collect::<Result<Vec<_>, _>>()?;
+            bounded_provider_value(json!({ "transactions": transactions }))
+        }
+        ProviderMethod::HnsGetReceiveAddress => bounded_provider_value(json!({
+            "target": public_hns_receive_target(&snapshot.receive_target, snapshot.account_id)?,
+        })),
+        _ => Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        )),
+    }
+}
+
+fn public_hns_name_read(
+    call: &ApprovedCall,
+    approved_names: &BTreeSet<[u8; 32]>,
+    known_names: &[KnownName],
+) -> Result<Value, ServiceFailure> {
+    if approved_names.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+        return Err(hns_read_result_bound());
+    }
+    let current_names = known_names
+        .iter()
+        .map(|name| (name.name_hash, name))
+        .collect::<BTreeMap<_, _>>();
+    if current_names.len() != known_names.len()
+        || !approved_names
+            .iter()
+            .all(|name_hash| current_names.contains_key(name_hash))
+    {
+        return Err(provider_failure(ProviderError::Unauthorized));
+    }
+    match call.method {
+        ProviderMethod::HnsGetNames => {
+            validate_empty_params(&call.params)?;
+            let names = approved_names
+                .iter()
+                .map(|name_hash| {
+                    current_names
+                        .get(name_hash)
+                        .ok_or_else(|| provider_failure(ProviderError::Unauthorized))
+                        .and_then(|name| public_hns_name_summary(name))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            bounded_provider_value(json!({ "names": names }))
+        }
+        ProviderMethod::HnsGetName => {
+            let name_hash = hns_name_hash_param(&call.params)?;
+            if !approved_names.contains(&name_hash) {
+                return Err(provider_failure(ProviderError::Unauthorized));
+            }
+            let name = current_names
+                .get(&name_hash)
+                .ok_or_else(|| provider_failure(ProviderError::Unauthorized))?;
+            bounded_provider_value(json!({ "name": public_hns_name_summary(name)? }))
+        }
+        _ => Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        )),
+    }
+}
+
+fn public_hns_amount(amount: Amount) -> Result<Value, ServiceFailure> {
+    if amount.asset != WalletAsset::Hns {
+        return Err(invalid_request("HNS balance contains a non-HNS asset"));
+    }
+    Ok(json!({
+        "asset": "HNS",
+        "baseUnits": amount.base_units.get().to_string(),
+    }))
+}
+
+fn public_hns_receive_target(
+    target: &ReceiveTarget,
+    expected_account: hns_wallet_types::AccountId,
+) -> Result<Value, ServiceFailure> {
+    if target.module != ModuleId::Handshake || target.account != expected_account {
+        return Err(invalid_request(
+            "HNS receive target does not match the synchronized account",
+        ));
+    }
+    target
+        .validate()
+        .map_err(|_| invalid_request("HNS receive target is invalid"))?;
+    if !is_printable_ascii(&target.display) {
+        return Err(invalid_request("HNS receive target is not canonical public text"));
+    }
+    Ok(json!({
+        "module": "handshake",
+        "account": lowercase_hex(target.account.as_bytes()),
+        "display": &target.display,
+        "derivationIndex": target.derivation_index,
+    }))
+}
+
+fn public_hns_transaction_summary(
+    transaction: &TransactionSummary,
+) -> Result<Value, ServiceFailure> {
+    if transaction.module != ModuleId::Handshake {
+        return Err(invalid_request(
+            "HNS transaction history contains a non-HNS transaction",
+        ));
+    }
+    if transaction
+        .block_height
+        .is_some_and(|height| height > MAX_JAVASCRIPT_SAFE_INTEGER)
+        || transaction
+            .first_seen_unix
+            .is_some_and(|time| time > MAX_JAVASCRIPT_SAFE_INTEGER)
+    {
+        return Err(invalid_request(
+            "HNS transaction history exceeds JavaScript integer precision",
+        ));
+    }
+    let status = match transaction.status {
+        LocalTransactionStatus::Prepared => "prepared",
+        LocalTransactionStatus::Authorized => "authorized",
+        LocalTransactionStatus::Broadcast => "broadcast",
+        LocalTransactionStatus::Mempool => "mempool",
+        LocalTransactionStatus::Confirmed => "confirmed",
+        LocalTransactionStatus::Replaced => "replaced",
+        LocalTransactionStatus::Conflicted => "conflicted",
+        LocalTransactionStatus::Reorged => "reorged",
+        LocalTransactionStatus::Dropped => "dropped",
+        LocalTransactionStatus::Failed => "failed",
+    };
+    Ok(json!({
+        "module": "handshake",
+        "txid": lowercase_hex(transaction.txid.as_bytes()),
+        "status": status,
+        "netAmount": {
+            "negative": transaction.net_amount.negative,
+            "magnitude": transaction.net_amount.magnitude.get().to_string(),
+        },
+        "fee": transaction.fee.map(|fee| fee.get().to_string()),
+        "blockHeight": transaction.block_height,
+        "firstSeenUnix": transaction.first_seen_unix,
+        "confirmationCount": transaction.confirmation_count,
+    }))
+}
+
+fn public_hns_name_summary(name: &KnownName) -> Result<Value, ServiceFailure> {
+    if name.proof_height > MAX_JAVASCRIPT_SAFE_INTEGER {
+        return Err(invalid_request(
+            "known HNS name proof height exceeds JavaScript integer precision",
+        ));
+    }
+    let display = std::str::from_utf8(&name.name)
+        .ok()
+        .filter(|display| {
+            !display.is_empty()
+                && display.len() <= MAX_PUBLIC_STRING_BYTES
+                && is_printable_ascii(display)
+        })
+        .ok_or_else(|| invalid_request("known HNS name is not canonical public text"))?;
+    let resource_status = match &name.resource_status {
+        NameResourceStatus::UnavailableCanonicalBinding => "unavailableCanonicalBinding",
+        NameResourceStatus::NoCurrentState => "noCurrentState",
+        NameResourceStatus::Empty => "empty",
+        NameResourceStatus::CanonicalDecoded => "canonicalDecoded",
+        NameResourceStatus::CanonicalOpaque => "canonicalOpaque",
+    };
+    let ownership_status = match &name.ownership_status {
+        NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable => {
+            "watchOnlyCanonicalStateDecoderUnavailable"
+        }
+        NameOwnershipStatus::WalletContextUnavailable => "walletContextUnavailable",
+        NameOwnershipStatus::NoCurrentOwner => "noCurrentOwner",
+        NameOwnershipStatus::NotWalletOwned => "notWalletOwned",
+        NameOwnershipStatus::WalletOwned { .. } => "walletOwned",
+        NameOwnershipStatus::IncomingTransfer { .. } => "incomingTransfer",
+        NameOwnershipStatus::OutgoingTransfer { .. } => "outgoingTransfer",
+    };
+    let (registered, expired) = name
+        .canonical_current_state
+        .as_ref()
+        .map_or((None, None), |state| {
+            (Some(state.registered), Some(state.expired))
+        });
+    Ok(json!({
+        "name": display,
+        "nameHash": lowercase_hex(&name.name_hash),
+        "proofHeight": name.proof_height,
+        "resourceStatus": resource_status,
+        "ownershipStatus": ownership_status,
+        "registered": registered,
+        "expired": expired,
+    }))
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn is_printable_ascii(value: &str) -> bool {
+    value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+}
+
+fn hns_read_result_bound() -> ServiceFailure {
+    ServiceFailure {
+        code: ServiceErrorCode::RuntimeFailure,
+        message: "synchronized Handshake read exceeds its public result bound".to_owned(),
+        unsupported_capability: None,
+    }
+}
+
+fn validate_hns_wallet_read_scope(
+    module: ModuleId,
+    requested: hns_wallet_types::AccountId,
+    selected: hns_wallet_types::AccountId,
+) -> Result<(), ServiceFailure> {
+    if module != ModuleId::Handshake || requested != selected {
+        return Err(invalid_request(
+            "wallet read does not match the selected HNS account",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hns_account_summary(account: &AccountSummary) -> Result<(), ServiceFailure> {
     let valid_receive = account.receive_display.as_ref().is_none_or(|value| {
-        !value.is_empty() && value.len() <= MAX_PUBLIC_STRING_BYTES && value.is_ascii()
+        !value.is_empty()
+            && value.len() <= MAX_PUBLIC_STRING_BYTES
+            && is_printable_ascii(value)
     });
     if account.module != ModuleId::Handshake
         || account.account_id.as_bytes().iter().all(|byte| *byte == 0)
         || account.label.is_empty()
         || account.label.len() > MAX_PUBLIC_STRING_BYTES
-        || !account.label.is_ascii()
+        || !is_printable_ascii(&account.label)
         || !valid_receive
     {
         return Err(invalid_request("runtime returned an invalid HNS account"));
@@ -1581,6 +2312,37 @@ fn hns_runtime_failure(error: HnsWalletError) -> ServiceFailure {
     }
 }
 
+fn hns_read_failure(error: HnsWalletError) -> ServiceFailure {
+    let (code, message) = match error {
+        HnsWalletError::StoreLocked => (ServiceErrorCode::WalletLocked, "wallet is locked"),
+        HnsWalletError::StaleNodeSnapshot | HnsWalletError::StaleAccountRead => (
+            ServiceErrorCode::RuntimeFailure,
+            "Handshake read snapshot changed during synchronization",
+        ),
+        HnsWalletError::Store
+        | HnsWalletError::StoreAuthorityMismatch
+        | HnsWalletError::AccountConfigurationMismatch
+        | HnsWalletError::DuplicateAccountDerivation
+        | HnsWalletError::InvalidEvidence => (
+            ServiceErrorCode::PersistenceFailure,
+            "synchronized Handshake account state failed authentication",
+        ),
+        HnsWalletError::ScanCapacityExhausted | HnsWalletError::HistoryLimit => (
+            ServiceErrorCode::RuntimeFailure,
+            "synchronized Handshake read exceeds its configured bound",
+        ),
+        _ => (
+            ServiceErrorCode::RuntimeFailure,
+            "Handshake account synchronization failed",
+        ),
+    };
+    ServiceFailure {
+        code,
+        message: message.to_owned(),
+        unsupported_capability: None,
+    }
+}
+
 fn stale_approval() -> ServiceFailure {
     ServiceFailure {
         code: ServiceErrorCode::ApprovalStale,
@@ -1668,11 +2430,15 @@ pub enum ServiceError {
 mod tests {
     use super::*;
     use hns_wallet_ffi::{HostHello, decode_service_frame, encode_host_frame};
-    use hns_wallet_hns::{HnsAccountRecord, HnsNetwork, HnsRuntimeConfig};
+    use hns_wallet_hns::{
+        CanonicalNameStateSummary, ChainTip, HnsAccountReadBinding, HnsAccountRecord, HnsNetwork,
+        HnsRuntimeConfig, MempoolSnapshotBinding, SnapshotBinding,
+    };
     use hns_wallet_provider::MemoryProviderState;
     use hns_wallet_store::WalletStore;
     use hns_wallet_types::{
-        AccountId, BaseUnits, BrowserRuntimeSessionId, ProviderAuthorityFingerprint, WalletId,
+        AccountId, BaseUnits, BrowserRuntimeSessionId, ProviderAuthorityFingerprint,
+        SignedBaseUnits, TransactionHash, WalletId,
     };
 
     const NOW_MS: u64 = 100_000;
@@ -1774,6 +2540,174 @@ mod tests {
                 ServiceCapability::WalletOperations,
             ))
         }
+    }
+
+    struct ProductionFollowupProjectionRuntime {
+        account: AccountSummary,
+        snapshot: HnsAccountReadSnapshot,
+    }
+
+    impl ServiceRuntime for ProductionFollowupProjectionRuntime {
+        fn capabilities(&self) -> BTreeSet<ServiceCapability> {
+            BTreeSet::from([ServiceCapability::ProviderDispatch])
+        }
+
+        fn supports_provider_method(&self, method: ProviderMethod) -> bool {
+            matches!(
+                method,
+                ProviderMethod::HnsRequestAccounts
+                    | ProviderMethod::HnsGetBalance
+                    | ProviderMethod::HnsGetTransactions
+                    | ProviderMethod::HnsGetReceiveAddress
+                    | ProviderMethod::HnsGetNames
+                    | ProviderMethod::HnsGetName
+            )
+        }
+
+        fn prepare_approval(
+            &mut self,
+            _: &PendingApproval,
+        ) -> Result<ApprovalSummary, ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ))
+        }
+
+        fn prepare_hns_account_grant(
+            &mut self,
+            _: &ApprovedCall,
+        ) -> Result<AccountSummary, ServiceFailure> {
+            Ok(self.account.clone())
+        }
+
+        fn selected_hns_account(&self) -> Result<AccountSummary, ServiceFailure> {
+            Ok(self.account.clone())
+        }
+
+        fn current_hns_name_scope(&mut self) -> Result<BTreeSet<[u8; 32]>, ServiceFailure> {
+            Ok(self
+                .snapshot
+                .known_names
+                .iter()
+                .map(|name| name.name_hash)
+                .collect())
+        }
+
+        fn execute_hns_name_read(
+            &mut self,
+            call: ApprovedCall,
+            approved_names: &BTreeSet<[u8; 32]>,
+        ) -> Result<Value, ServiceFailure> {
+            public_hns_name_read(&call, approved_names, &self.snapshot.known_names)
+        }
+
+        fn execute_provider(&mut self, call: ApprovedCall) -> Result<Value, ServiceFailure> {
+            public_hns_non_name_read(&call, &self.snapshot)
+        }
+
+        fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ))
+        }
+
+        fn execute_wallet(&mut self, _: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ))
+        }
+    }
+
+    fn production_followup_known_name() -> KnownName {
+        KnownName {
+            name: b"alpha".to_vec(),
+            name_hash: [17; 32],
+            proof_height: 99,
+            unbound_proof_owner_outpoint: None,
+            unbound_current_owner_outpoint: None,
+            proof_state: Some(vec![1, 2, 3]),
+            current_state: Some(vec![4, 5, 6]),
+            canonical_proof_state: None,
+            canonical_current_state: Some(CanonicalNameStateSummary {
+                owner_outpoint: None,
+                value: 1,
+                highest: 2,
+                start_height: 3,
+                renewal_height: 4,
+                transfer_height: 0,
+                revoked_height: 0,
+                claimed_height: 0,
+                renewals: 1,
+                registered: true,
+                expired: false,
+                weak: false,
+            }),
+            current_raw_resource: Some(vec![7, 8, 9]),
+            resource_status: NameResourceStatus::CanonicalDecoded,
+            ownership_status: NameOwnershipStatus::WalletContextUnavailable,
+        }
+    }
+
+    fn production_followup_projection_service(
+    ) -> WalletService<MemoryProviderState, ProductionFollowupProjectionRuntime> {
+        let account_id = AccountId::new([9; 16]);
+        let runtime = ProductionFollowupProjectionRuntime {
+            account: AccountSummary {
+                account_id,
+                module: ModuleId::Handshake,
+                label: "Handshake".to_owned(),
+                receive_display: None,
+            },
+            snapshot: HnsAccountReadSnapshot {
+                account_id,
+                binding: HnsAccountReadBinding {
+                    chain: SnapshotBinding {
+                        tip: ChainTip {
+                            height: 99,
+                            block_hash: [12; 32],
+                            tree_root: [13; 32],
+                            median_time_past: 1_700_000_000,
+                        },
+                        chain_epoch: 3,
+                    },
+                    mempool: MempoolSnapshotBinding {
+                        instance_nonce: [14; 32],
+                        generation: 4,
+                    },
+                },
+                balance: Amount::new(WalletAsset::Hns, 42),
+                transactions: vec![TransactionSummary {
+                    module: ModuleId::Handshake,
+                    txid: TransactionHash::new([0xab; 32]),
+                    status: LocalTransactionStatus::Confirmed,
+                    net_amount: SignedBaseUnits {
+                        negative: false,
+                        magnitude: BaseUnits::new(17),
+                    },
+                    fee: Some(BaseUnits::new(2)),
+                    block_height: Some(99),
+                    first_seen_unix: Some(1_700_000_000),
+                    confirmation_count: 3,
+                }],
+                receive_target: ReceiveTarget {
+                    module: ModuleId::Handshake,
+                    account: account_id,
+                    display: "rs1qproductionfollowup".to_owned(),
+                    derivation_index: 7,
+                },
+                known_names: vec![production_followup_known_name()],
+            },
+        };
+        let mut service = WalletService::new_ephemeral(MemoryProviderState::default(), runtime)
+            .expect("projection service");
+        service
+            .provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("projection HNS authority");
+        service
+            .provider
+            .set_wallet_state(service.wallet_session_id, false);
+        service
     }
 
     fn host_session() -> HostSessionId {
@@ -1957,6 +2891,386 @@ mod tests {
             },
         })
         .expect("hello")
+    }
+
+    #[test]
+    fn production_followup_account_grant_extends_to_minimized_hns_read_results() {
+        let mut service = production_followup_projection_service();
+        let methods = service.supported_provider_method_names();
+        for method in [
+            "hns_requestAccounts",
+            "hns_accounts",
+            "hns_getBalance",
+            "hns_getTransactions",
+            "hns_getReceiveAddress",
+            "hns_getNames",
+            "hns_getName",
+            "wallet_requestPermissions",
+        ] {
+            assert!(methods.contains(method), "missing {method}");
+        }
+        for method in [
+            "hns_send",
+            "hns_importKnownName",
+            "hns_transferName",
+            "hns_finalizeName",
+            "hns_signTypedMessage",
+            "wallet_enableModule",
+            "wallet_disableModule",
+        ] {
+            assert!(!methods.contains(method), "unexpected {method}");
+        }
+
+        let ServiceResponse::ApprovalRequired { approval } = service
+            .provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::HnsRequestAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 1,
+            )
+            .expect("account approval")
+        else {
+            panic!("account approval response")
+        };
+        let ServiceResponse::ProviderResult { value, .. } = service
+            .approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 2,
+            )
+            .expect("account grant")
+        else {
+            panic!("account grant result")
+        };
+        assert_eq!(value, json!([AccountId::new([9; 16]).to_string()]));
+
+        assert!(matches!(
+            service.provider_request(
+                handle(),
+                1,
+                2,
+                ProviderMethod::HnsGetBalance.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 3,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+
+        let ServiceResponse::ApprovalRequired { approval } = service
+            .provider_request(
+                handle(),
+                1,
+                3,
+                ProviderMethod::WalletRequestPermissions
+                    .wire_name()
+                    .to_owned(),
+                json!({
+                    "capabilities": ["balance", "transactions", "receive_target", "names"],
+                }),
+                NOW_MS + 4,
+            )
+            .expect("read permission approval")
+        else {
+            panic!("read permission approval response")
+        };
+        service
+            .approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 5,
+            )
+            .expect("read permission grant");
+        let permission = service
+            .provider
+            .permission(handle(), 1, NOW_MS + 5)
+            .expect("permission")
+            .expect("read permission record");
+        assert_eq!(
+            permission.capabilities,
+            BTreeSet::from([
+                PermissionCapability::Accounts,
+                PermissionCapability::Balance,
+                PermissionCapability::Transactions,
+                PermissionCapability::ReceiveTarget,
+                PermissionCapability::Names,
+            ])
+        );
+        assert_eq!(
+            permission.approved_accounts,
+            BTreeSet::from([AccountId::new([9; 16])])
+        );
+        assert_eq!(permission.approved_names, BTreeSet::from([[17; 32]]));
+
+        let ServiceResponse::ProviderResult { value, .. } = service
+            .provider_request(
+                handle(),
+                1,
+                4,
+                ProviderMethod::HnsGetBalance.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 6,
+            )
+            .expect("balance read")
+        else {
+            panic!("balance result")
+        };
+        assert_eq!(
+            value,
+            json!({ "amount": { "asset": "HNS", "baseUnits": "42" } })
+        );
+
+        let ServiceResponse::ProviderResult { value, .. } = service
+            .provider_request(
+                handle(),
+                1,
+                5,
+                ProviderMethod::HnsGetTransactions.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 7,
+            )
+            .expect("history read")
+        else {
+            panic!("history result")
+        };
+        assert_eq!(
+            value,
+            json!({
+                "transactions": [{
+                    "module": "handshake",
+                    "txid": "abababababababababababababababababababababababababababababababab",
+                    "status": "confirmed",
+                    "netAmount": { "negative": false, "magnitude": "17" },
+                    "fee": "2",
+                    "blockHeight": 99,
+                    "firstSeenUnix": 1_700_000_000_u64,
+                    "confirmationCount": 3,
+                }],
+            })
+        );
+
+        let ServiceResponse::ProviderResult { value, .. } = service
+            .provider_request(
+                handle(),
+                1,
+                6,
+                ProviderMethod::HnsGetReceiveAddress.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 8,
+            )
+            .expect("receive read")
+        else {
+            panic!("receive result")
+        };
+        assert_eq!(
+            value,
+            json!({
+                "target": {
+                    "module": "handshake",
+                    "account": AccountId::new([9; 16]).to_string(),
+                    "display": "rs1qproductionfollowup",
+                    "derivationIndex": 7,
+                },
+            })
+        );
+
+        let ServiceResponse::ProviderResult { value, .. } = service
+            .provider_request(
+                handle(),
+                1,
+                7,
+                ProviderMethod::HnsGetNames.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 9,
+            )
+            .expect("name list read")
+        else {
+            panic!("name list result")
+        };
+        let expected_name = json!({
+            "name": "alpha",
+            "nameHash": "1111111111111111111111111111111111111111111111111111111111111111",
+            "proofHeight": 99,
+            "resourceStatus": "canonicalDecoded",
+            "ownershipStatus": "walletContextUnavailable",
+            "registered": true,
+            "expired": false,
+        });
+        assert_eq!(value, json!({ "names": [expected_name.clone()] }));
+        let encoded = serde_json::to_string(&value).expect("encode minimized name");
+        for private_field in [
+            "proof_state",
+            "proofState",
+            "current_state",
+            "currentState",
+            "current_raw_resource",
+            "currentRawResource",
+            "ownerOutpoint",
+            "derivation",
+            "chainEpoch",
+            "mempool",
+        ] {
+            assert!(!encoded.contains(private_field), "leaked {private_field}");
+        }
+
+        let ServiceResponse::ProviderResult { value, .. } = service
+            .provider_request(
+                handle(),
+                1,
+                8,
+                ProviderMethod::HnsGetName.wire_name().to_owned(),
+                json!({
+                    "nameHash": "1111111111111111111111111111111111111111111111111111111111111111",
+                }),
+                NOW_MS + 10,
+            )
+            .expect("one approved name")
+        else {
+            panic!("one name result")
+        };
+        assert_eq!(value, json!({ "name": expected_name }));
+
+        assert!(matches!(
+            service.provider_request(
+                handle(),
+                1,
+                9,
+                ProviderMethod::HnsGetName.wire_name().to_owned(),
+                json!({
+                    "nameHash": "1212121212121212121212121212121212121212121212121212121212121212",
+                }),
+                NOW_MS + 11,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+        service.runtime.snapshot.known_names.clear();
+        assert!(matches!(
+            service.provider_request(
+                handle(),
+                1,
+                10,
+                ProviderMethod::HnsGetNames.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 12,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_followup_hns_reads_reject_namespace_malformed_bounds_and_value_surfaces() {
+        let mut service = production_followup_projection_service();
+        let mut icann = registration();
+        icann.namespace = SelectedNamespace::Icann;
+        service
+            .provider
+            .register_authority(restart_handle(), icann, NOW_MS)
+            .expect("ICANN authority");
+        assert!(matches!(
+            service.provider_request(
+                restart_handle(),
+                1,
+                1,
+                ProviderMethod::HnsGetBalance.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 1,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+        assert!(matches!(
+            service.provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::HnsGetName.wire_name().to_owned(),
+                json!({ "nameHash": "AA", "extra": true }),
+                NOW_MS + 2,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+        for (nonce, method) in [
+            ProviderMethod::HnsSend,
+            ProviderMethod::HnsImportKnownName,
+            ProviderMethod::HnsTransferName,
+            ProviderMethod::HnsFinalizeName,
+            ProviderMethod::HnsSignTypedMessage,
+            ProviderMethod::WalletEnableModule,
+            ProviderMethod::WalletDisableModule,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                service.provider_request(
+                    handle(),
+                    1,
+                    nonce as u64 + 2,
+                    method.wire_name().to_owned(),
+                    Value::Null,
+                    NOW_MS + nonce as u64 + 3,
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    ..
+                })
+            ));
+        }
+
+        let mut oversized = service.runtime.snapshot.clone();
+        oversized.transactions = vec![oversized.transactions[0].clone(); 129];
+        let call = ApprovedCall {
+            origin: Origin::parse("https://wallet.example").expect("origin"),
+            namespace: SelectedNamespace::Hns,
+            method: ProviderMethod::HnsGetTransactions,
+            params: Value::Null,
+            request_nonce: 99,
+        };
+        assert!(matches!(
+            public_hns_non_name_read(&call, &oversized),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::RuntimeFailure,
+                ..
+            })
+        ));
+        oversized.transactions.truncate(1);
+        oversized.transactions[0].block_height = Some(MAX_JAVASCRIPT_SAFE_INTEGER + 1);
+        assert!(matches!(
+            public_hns_non_name_read(&call, &oversized),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+        let invalid_account = AccountSummary {
+            account_id: AccountId::new([9; 16]),
+            module: ModuleId::Handshake,
+            label: "Handshake\nWallet".to_owned(),
+            receive_display: None,
+        };
+        assert!(validate_hns_account_summary(&invalid_account).is_err());
+        let mut unsafe_name = production_followup_known_name();
+        unsafe_name.proof_height = MAX_JAVASCRIPT_SAFE_INTEGER + 1;
+        assert!(public_hns_name_summary(&unsafe_name).is_err());
     }
 
     #[test]
