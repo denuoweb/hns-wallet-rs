@@ -92,6 +92,14 @@ applicable, price round and refund time. An incomplete or kind-mismatched
 summary fails closed. Recovery-phrase display is not a provider/service
 operation.
 
+Every ABI-v2 `Permissions` summary has a required `hnsNames` list. It is empty
+unless Names is requested and always empty for `hns_requestAccounts`. A Names
+summary contains at most 64 entries sorted by `(name,nameHash)` with unique
+canonical names and hashes. Validation uses the pinned `hns-covenants` rules
+and requires each lowercase hash to equal SHA3-256(name). The 16,384-byte
+approval-frame limit remains authoritative and prompts fail rather than
+truncate.
+
 Events are typed frames bound to host/service/restart sessions, the exact
 provider binding, a monotonic service channel sequence, and a per-authority
 event sequence. Connect and permissions-changed payload generations must equal
@@ -114,6 +122,12 @@ binding. Generic `wallet_requestPermissions` summaries cannot contain Accounts.
 Generic permission creation is advertised only when a currently supported
 permission-bearing runtime method can consume the requested scope. When
 provider dispatch is absent, `methods` is empty.
+
+Names are synchronized before the prompt and the exact account, display list,
+and binary hashes remain in process-local pending state. Approval synchronizes
+again; an account, permission, or current-name-set change rejects stale. The
+grant persists only the hashes already displayed and never discovers or
+expands authority after the decision.
 
 The website method `wallet_getCapabilities` instead returns only
 `providerApiVersion: 1` and `methods`. Its outer private result binding is
@@ -151,6 +165,14 @@ bounded valid and invalid structural fixtures covering every service request
 and response class, every wallet request/response class, all twelve approval
 summaries, all thirteen public events, fresh generation zero, a retained
 nonzero tombstone, private-field leaks, kind mismatches, and rollback metadata.
+Runtime-invalid vectors additionally cover name ordering and SHA3 name/hash
+equality, which JSON Schema cannot express.
+
+Approval schema v2 is unpublished, so this required field is updated
+coherently across wallet FFI, service, host, private/public schemas, and
+vectors without creating a second v2. Browser/mobile consumers must adopt and
+render it exactly before Names becomes available; strict old and new shapes
+reject one another rather than silently dropping disclosure.
 
 The frame fixtures describe the JSON payload after the four-byte length prefix;
 the prefix and encoded byte ceilings remain codec/transport invariants. JSON

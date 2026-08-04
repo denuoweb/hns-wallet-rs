@@ -180,11 +180,20 @@ returned.
 
 Read capabilities are additive only after a persisted exact Accounts grant.
 `wallet_requestPermissions` cannot replace or select that account. Approving
-Names stores the current exact set of at most 128 name hashes in the same
-permission generation. An empty set authorizes disclosure of no names; a
-missing/stale hash or a requested hash outside the set fails with permission
-denied. A nonempty name set is invalid unless the grant also contains Accounts,
-Names, a nonempty account set, and the HNS namespace.
+Names first performs one live synchronization and places the exact sorted
+canonical name/lowercase-hash pairs in required ABI-v2 `hnsNames`. Pending
+state freezes that account, display list, and binary hash set. Approval performs
+one new synchronization and fails stale if the permission, account, or current
+set differs; it persists exactly the displayed hashes and never adds a
+post-decision name. Empty authorizes no names. The consent list is limited to
+64 and the unchanged 16 KiB approval-frame ceiling also fails closed without
+truncation. A nonempty persisted set remains invalid without HNS namespace,
+Accounts, Names, and a nonempty account binding.
+
+Non-Names permission prompts and `hns_requestAccounts` carry `hnsNames: []`.
+This v2 shape is unpublished; browser/mobile consumers must adopt, preserve,
+and render it before the read composition is product-available. Strict older
+consumers reject the new field, while updated consumers reject its omission.
 
 Balance, transaction, receive-address, and name-list calls accept only null or
 an empty object. `hns_getName` accepts exactly one 64-character lowercase-hex

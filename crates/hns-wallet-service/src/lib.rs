@@ -4,8 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hns_wallet_ffi::{
-    APPROVAL_SCHEMA_VERSION, AccountSummary, ApprovalPrompt, ApprovalSummary, HostAuthorityFacts,
-    HostFrame, MAX_PROVIDER_RESULT_BYTES, MAX_PUBLIC_STRING_BYTES, ModuleApprovalAction,
+    APPROVAL_SCHEMA_VERSION, AccountSummary, ApprovalPrompt, ApprovalSummary, HnsNameDisclosure,
+    HostAuthorityFacts, HostFrame, MAX_HNS_NAME_BYTES, MAX_HNS_NAME_DISCLOSURES,
+    MAX_PROVIDER_RESULT_BYTES, MAX_PUBLIC_STRING_BYTES, ModuleApprovalAction,
     PROVIDER_SCHEMA_VERSION, ProviderBinding, ProviderCapabilitySnapshot, ProviderEventEnvelope,
     ProviderEventPayload, ProviderNamespace, ServiceCapability, ServiceErrorCode, ServiceFailure,
     ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest, ServiceResponse, SessionEnvelope,
@@ -69,10 +70,10 @@ pub trait ServiceRuntime {
         ))
     }
 
-    /// Reconcile and return the exact bounded known-name set disclosed by a
-    /// newly approved `Names` capability. A later read is restricted to this
-    /// persisted set until the origin explicitly re-approves it.
-    fn current_hns_name_scope(&mut self) -> Result<BTreeSet<[u8; 32]>, ServiceFailure> {
+    /// Reconcile and return the current bounded known names before a `Names`
+    /// permission prompt is emitted. The service minimizes and freezes this
+    /// set for display and later approval-time reauthentication.
+    fn current_hns_names(&mut self) -> Result<Vec<KnownName>, ServiceFailure> {
         Err(ServiceFailure::unsupported(
             ServiceCapability::ProviderDispatch,
         ))
@@ -494,23 +495,8 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsReadRuntime<B, 
         self.exact_account()
     }
 
-    fn current_hns_name_scope(&mut self) -> Result<BTreeSet<[u8; 32]>, ServiceFailure> {
-        let names = self.synchronize()?.known_names;
-        if names.len() > MAX_PROVIDER_HNS_READ_ITEMS {
-            return Err(hns_read_result_bound());
-        }
-        for name in &names {
-            public_hns_name_summary(name)?;
-        }
-        let name_count = names.len();
-        let scope = names
-            .into_iter()
-            .map(|name| name.name_hash)
-            .collect::<BTreeSet<_>>();
-        if scope.len() != name_count {
-            return Err(hns_read_failure(HnsWalletError::InvalidEvidence));
-        }
-        Ok(scope)
+    fn current_hns_names(&mut self) -> Result<Vec<KnownName>, ServiceFailure> {
+        Ok(self.synchronize()?.known_names)
     }
 
     fn execute_hns_name_read(
@@ -621,11 +607,24 @@ struct SessionState {
     next_service_sequence: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingState {
     binding: ProviderBinding,
     kind: ApprovalKind,
     expires_at_unix: u64,
+    hns_permission_scope: Option<PendingHnsPermissionScope>,
+}
+
+#[derive(Clone)]
+struct PendingHnsPermissionScope {
+    account: AccountSummary,
+    names: Option<PendingHnsNameScope>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct PendingHnsNameScope {
+    disclosures: Vec<HnsNameDisclosure>,
+    hashes: BTreeSet<[u8; 32]>,
 }
 
 /// One process-local service generation. Construction rotates both the service
@@ -1157,8 +1156,10 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                         .map_err(provider_failure)?;
                     return Err(invalid_request("too many pending approvals"));
                 }
-                let summary = match self.approval_summary(&approval) {
-                    Ok(summary) => summary,
+                let (summary, hns_permission_scope) = match self
+                    .approval_summary(&approval, now_unix_ms)
+                {
+                    Ok(prepared) => prepared,
                     Err(failure) => {
                         let _ = self.provider.reject(
                             authority_handle,
@@ -1228,6 +1229,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                         binding: prompt.binding,
                         kind: approval.kind,
                         expires_at_unix: approval.expires_at_unix,
+                        hns_permission_scope,
                     },
                 );
                 Ok(ServiceResponse::ApprovalRequired { approval: prompt })
@@ -1246,7 +1248,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         let pending = self
             .pending
             .get(&approval_id)
-            .copied()
+            .cloned()
             .ok_or_else(stale_approval)?;
         if pending.binding.authority_handle != authority_handle
             || pending.binding.authority_revision != authority_revision
@@ -1276,6 +1278,21 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 Ok(ServiceResponse::ApprovalRejected { approval_id })
             }
             hns_wallet_ffi::ApprovalDecision::Approve => {
+                if let Err(failure) = self.verify_pending_hns_permission_scope(
+                    authority_handle,
+                    authority_revision,
+                    &pending,
+                    now_unix_ms,
+                ) {
+                    let _ = self.provider.reject(
+                        authority_handle,
+                        authority_revision,
+                        internal_id,
+                        now_unix_ms,
+                    );
+                    self.pending.remove(&approval_id);
+                    return Err(failure);
+                }
                 let call = self.provider.approve(
                     authority_handle,
                     authority_revision,
@@ -1292,7 +1309,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     authority_handle,
                     authority_revision,
                     call,
-                    Some(pending.binding.permission_generation),
+                    Some(&pending),
                     now_unix_ms,
                 )?;
                 let binding =
@@ -1305,11 +1322,31 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
     fn approval_summary(
         &mut self,
         approval: &PendingApproval,
-    ) -> Result<ApprovalSummary, ServiceFailure> {
+        now_unix_ms: u64,
+    ) -> Result<(ApprovalSummary, Option<PendingHnsPermissionScope>), ServiceFailure> {
+        let mut hns_permission_scope = None;
         let summary = match approval.call.method {
-            ProviderMethod::WalletRequestPermissions | ProviderMethod::HnsRequestAccounts => {
+            ProviderMethod::WalletRequestPermissions => {
+                let capabilities = requested_capabilities(&approval.call)?;
+                hns_permission_scope = self.prepare_hns_permission_scope(
+                    approval,
+                    &capabilities,
+                    now_unix_ms,
+                )?;
+                let hns_names = hns_permission_scope
+                    .as_ref()
+                    .and_then(|scope| scope.names.as_ref())
+                    .map(|scope| scope.disclosures.clone())
+                    .unwrap_or_default();
+                Ok(ApprovalSummary::Permissions {
+                    capabilities,
+                    hns_names,
+                })
+            }
+            ProviderMethod::HnsRequestAccounts => {
                 Ok(ApprovalSummary::Permissions {
                     capabilities: requested_capabilities(&approval.call)?,
+                    hns_names: Vec::new(),
                 })
             }
             ProviderMethod::WalletEnableModule | ProviderMethod::WalletDisableModule => {
@@ -1324,7 +1361,107 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             _ => self.runtime.prepare_approval(approval),
         }?;
         validate_approval_summary(&approval.call, &summary)?;
-        Ok(summary)
+        Ok((summary, hns_permission_scope))
+    }
+
+    fn hns_permission_request_is_account_scoped(
+        &self,
+        requested: &BTreeSet<PermissionCapability>,
+    ) -> bool {
+        ProviderMethod::ALL.into_iter().any(|method| {
+            hns_account_read_method(method)
+                && self.runtime.supports_provider_method(method)
+                && method
+                    .permission()
+                    .is_some_and(|capability| requested.contains(&capability))
+        })
+    }
+
+    fn prepare_hns_permission_scope(
+        &mut self,
+        approval: &PendingApproval,
+        requested: &BTreeSet<PermissionCapability>,
+        now_unix_ms: u64,
+    ) -> Result<Option<PendingHnsPermissionScope>, ServiceFailure> {
+        if !self.hns_permission_request_is_account_scoped(requested) {
+            return Ok(None);
+        }
+        if approval.call.namespace != SelectedNamespace::Hns {
+            return Err(provider_failure(ProviderError::Unauthorized));
+        }
+        let permission = self
+            .provider
+            .permission_snapshot(
+                approval.authority_handle,
+                approval.authority_revision,
+                now_unix_ms,
+            )
+            .map_err(provider_failure)?;
+        if permission.generation != approval.permission_generation {
+            return Err(stale_approval());
+        }
+        let record = permission
+            .record
+            .ok_or_else(|| provider_failure(ProviderError::Unauthorized))?;
+        let selected = self.runtime.selected_hns_account()?;
+        validate_hns_account_summary(&selected)?;
+        if !record
+            .capabilities
+            .contains(&PermissionCapability::Accounts)
+            || record.approved_accounts != BTreeSet::from([selected.account_id])
+        {
+            return Err(provider_failure(ProviderError::Unauthorized));
+        }
+        let names = if requested.contains(&PermissionCapability::Names) {
+            Some(hns_name_approval_scope(self.runtime.current_hns_names()?)?)
+        } else {
+            None
+        };
+        Ok(Some(PendingHnsPermissionScope {
+            account: selected,
+            names,
+        }))
+    }
+
+    fn verify_pending_hns_permission_scope(
+        &mut self,
+        authority_handle: HostAuthorityHandleId,
+        authority_revision: u64,
+        pending: &PendingState,
+        now_unix_ms: u64,
+    ) -> Result<(), ServiceFailure> {
+        let Some(expected) = pending.hns_permission_scope.as_ref() else {
+            return Ok(());
+        };
+        let permission = self
+            .provider
+            .permission_snapshot(authority_handle, authority_revision, now_unix_ms)
+            .map_err(provider_failure)?;
+        let Some(record) = permission.record else {
+            return Err(stale_approval());
+        };
+        if permission.generation != pending.binding.permission_generation
+            || !record
+                .capabilities
+                .contains(&PermissionCapability::Accounts)
+            || record.approved_accounts != BTreeSet::from([expected.account.account_id])
+        {
+            return Err(stale_approval());
+        }
+        let selected = self.runtime.selected_hns_account()?;
+        validate_hns_account_summary(&selected)?;
+        if selected != expected.account {
+            return Err(stale_approval());
+        }
+        if let Some(expected_names) = expected.names.as_ref() {
+            let current_names = self.runtime.current_hns_names()?;
+            let current = hns_name_approval_scope(current_names)
+                .map_err(|_| stale_approval())?;
+            if &current != expected_names {
+                return Err(stale_approval());
+            }
+        }
+        Ok(())
     }
 
     fn execute_call(
@@ -1332,7 +1469,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         authority_handle: HostAuthorityHandleId,
         authority_revision: u64,
         call: ApprovedCall,
-        expected_permission_generation: Option<u64>,
+        approved_pending: Option<&PendingState>,
         now_unix_ms: u64,
     ) -> Result<Value, ServiceFailure> {
         match call.method {
@@ -1370,8 +1507,8 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                         ServiceCapability::ProviderDispatch,
                     ));
                 }
-                let expected_generation =
-                    expected_permission_generation.ok_or_else(stale_approval)?;
+                let approved_pending = approved_pending.ok_or_else(stale_approval)?;
+                let expected_generation = approved_pending.binding.permission_generation;
                 let (capabilities, approved_accounts, approved_names, expires_at_unix) = self
                     .hns_read_permission_extension(
                         authority_handle,
@@ -1379,6 +1516,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                         &call,
                         expected_generation,
                         requested,
+                        approved_pending.hns_permission_scope.as_ref(),
                         now_unix_ms,
                     )?;
                 let permission = self
@@ -1405,7 +1543,9 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 authority_handle,
                 authority_revision,
                 &call,
-                expected_permission_generation.ok_or_else(stale_approval)?,
+                approved_pending
+                    .map(|pending| pending.binding.permission_generation)
+                    .ok_or_else(stale_approval)?,
                 now_unix_ms,
             ),
             ProviderMethod::HnsAccounts => {
@@ -1445,6 +1585,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         call: &ApprovedCall,
         expected_generation: u64,
         requested: BTreeSet<PermissionCapability>,
+        pending_scope: Option<&PendingHnsPermissionScope>,
         now_unix_ms: u64,
     ) -> Result<
         (
@@ -1455,14 +1596,11 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         ),
         ServiceFailure,
     > {
-        let account_scoped = ProviderMethod::ALL.into_iter().any(|method| {
-            hns_account_read_method(method)
-                && self.runtime.supports_provider_method(method)
-                && method
-                    .permission()
-                    .is_some_and(|capability| requested.contains(&capability))
-        });
+        let account_scoped = self.hns_permission_request_is_account_scoped(&requested);
         if !account_scoped {
+            if pending_scope.is_some() {
+                return Err(stale_approval());
+            }
             return Ok((requested, BTreeSet::new(), BTreeSet::new(), None));
         }
         if call.namespace != SelectedNamespace::Hns {
@@ -1488,10 +1626,22 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         {
             return Err(provider_failure(ProviderError::Unauthorized));
         }
+        let pending_scope = pending_scope.ok_or_else(stale_approval)?;
+        if pending_scope.account != selected {
+            return Err(stale_approval());
+        }
         let refresh_name_scope = requested.contains(&PermissionCapability::Names);
         let approved_names = if refresh_name_scope {
-            self.runtime.current_hns_name_scope()?
+            pending_scope
+                .names
+                .as_ref()
+                .ok_or_else(stale_approval)?
+                .hashes
+                .clone()
         } else {
+            if pending_scope.names.is_some() {
+                return Err(stale_approval());
+            }
             record.approved_names
         };
         if approved_names.len() > MAX_PROVIDER_HNS_READ_ITEMS {
@@ -1946,6 +2096,53 @@ fn public_hns_non_name_read(
     }
 }
 
+fn hns_name_approval_scope(
+    known_names: Vec<KnownName>,
+) -> Result<PendingHnsNameScope, ServiceFailure> {
+    if known_names.len() > MAX_HNS_NAME_DISCLOSURES {
+        return Err(hns_read_result_bound());
+    }
+    let mut hashes = BTreeSet::new();
+    let mut canonical_names = BTreeSet::new();
+    let mut disclosures = Vec::with_capacity(known_names.len());
+    for known_name in &known_names {
+        let disclosure = hns_name_disclosure(known_name)?;
+        if !hashes.insert(known_name.name_hash)
+            || !canonical_names.insert(disclosure.name.clone())
+        {
+            return Err(hns_read_failure(HnsWalletError::InvalidEvidence));
+        }
+        disclosures.push(disclosure);
+    }
+    disclosures.sort();
+    Ok(PendingHnsNameScope {
+        disclosures,
+        hashes,
+    })
+}
+
+fn hns_name_disclosure(name: &KnownName) -> Result<HnsNameDisclosure, ServiceFailure> {
+    let disclosure = HnsNameDisclosure {
+        name: canonical_hns_name(name)?.to_owned(),
+        name_hash: lowercase_hex(&name.name_hash),
+    };
+    disclosure
+        .validate()
+        .map_err(|_| hns_read_failure(HnsWalletError::InvalidEvidence))?;
+    Ok(disclosure)
+}
+
+fn canonical_hns_name(name: &KnownName) -> Result<&str, ServiceFailure> {
+    std::str::from_utf8(&name.name)
+        .ok()
+        .filter(|display| {
+            !display.is_empty()
+                && display.len() <= MAX_HNS_NAME_BYTES
+                && is_printable_ascii(display)
+        })
+        .ok_or_else(|| invalid_request("known HNS name is not canonical public text"))
+}
+
 fn public_hns_name_read(
     call: &ApprovedCall,
     approved_names: &BTreeSet<[u8; 32]>,
@@ -2080,14 +2277,7 @@ fn public_hns_name_summary(name: &KnownName) -> Result<Value, ServiceFailure> {
             "known HNS name proof height exceeds JavaScript integer precision",
         ));
     }
-    let display = std::str::from_utf8(&name.name)
-        .ok()
-        .filter(|display| {
-            !display.is_empty()
-                && display.len() <= MAX_PUBLIC_STRING_BYTES
-                && is_printable_ascii(display)
-        })
-        .ok_or_else(|| invalid_request("known HNS name is not canonical public text"))?;
+    let disclosure = hns_name_disclosure(name)?;
     let resource_status = match &name.resource_status {
         NameResourceStatus::UnavailableCanonicalBinding => "unavailableCanonicalBinding",
         NameResourceStatus::NoCurrentState => "noCurrentState",
@@ -2113,8 +2303,8 @@ fn public_hns_name_summary(name: &KnownName) -> Result<Value, ServiceFailure> {
             (Some(state.registered), Some(state.expired))
         });
     Ok(json!({
-        "name": display,
-        "nameHash": lowercase_hex(&name.name_hash),
+        "name": disclosure.name,
+        "nameHash": disclosure.name_hash,
         "proofHeight": name.proof_height,
         "resourceStatus": resource_status,
         "ownershipStatus": ownership_status,
@@ -2584,13 +2774,8 @@ mod tests {
             Ok(self.account.clone())
         }
 
-        fn current_hns_name_scope(&mut self) -> Result<BTreeSet<[u8; 32]>, ServiceFailure> {
-            Ok(self
-                .snapshot
-                .known_names
-                .iter()
-                .map(|name| name.name_hash)
-                .collect())
+        fn current_hns_names(&mut self) -> Result<Vec<KnownName>, ServiceFailure> {
+            Ok(self.snapshot.known_names.clone())
         }
 
         fn execute_hns_name_read(
@@ -2618,10 +2803,26 @@ mod tests {
         }
     }
 
+    fn production_followup_alpha_hash() -> [u8; 32] {
+        [
+            0x27, 0x18, 0x78, 0xf8, 0xa9, 0x27, 0xb4, 0x56, 0x6a, 0xc9, 0x51, 0xfc, 0x81,
+            0x5b, 0x18, 0xdf, 0xad, 0x8d, 0x03, 0x02, 0xd6, 0x1d, 0x11, 0xd8, 0x0c, 0xbe,
+            0x15, 0xb7, 0xa3, 0xa0, 0x56, 0xaf,
+        ]
+    }
+
+    fn production_followup_beta_hash() -> [u8; 32] {
+        [
+            0xf0, 0x27, 0x7d, 0x92, 0x06, 0x2b, 0xd9, 0xa4, 0x1d, 0xd2, 0x6c, 0xdd, 0xba,
+            0xf2, 0xc4, 0x1d, 0x57, 0x6c, 0xf7, 0xb0, 0x17, 0x3c, 0xbe, 0x96, 0xc2, 0x3d,
+            0x5f, 0x5a, 0x4f, 0x92, 0xcc, 0x8f,
+        ]
+    }
+
     fn production_followup_known_name() -> KnownName {
         KnownName {
             name: b"alpha".to_vec(),
-            name_hash: [17; 32],
+            name_hash: production_followup_alpha_hash(),
             proof_height: 99,
             unbound_proof_owner_outpoint: None,
             unbound_current_owner_outpoint: None,
@@ -2980,6 +3181,23 @@ mod tests {
         else {
             panic!("read permission approval response")
         };
+        assert_eq!(
+            approval.summary,
+            ApprovalSummary::Permissions {
+                capabilities: BTreeSet::from([
+                    PermissionCapability::Balance,
+                    PermissionCapability::Transactions,
+                    PermissionCapability::ReceiveTarget,
+                    PermissionCapability::Names,
+                ]),
+                hns_names: vec![HnsNameDisclosure {
+                    name: "alpha".to_owned(),
+                    name_hash:
+                        "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af"
+                            .to_owned(),
+                }],
+            }
+        );
         service
             .approval_decision(
                 handle(),
@@ -3008,7 +3226,10 @@ mod tests {
             permission.approved_accounts,
             BTreeSet::from([AccountId::new([9; 16])])
         );
-        assert_eq!(permission.approved_names, BTreeSet::from([[17; 32]]));
+        assert_eq!(
+            permission.approved_names,
+            BTreeSet::from([production_followup_alpha_hash()])
+        );
 
         let ServiceResponse::ProviderResult { value, .. } = service
             .provider_request(
@@ -3097,7 +3318,7 @@ mod tests {
         };
         let expected_name = json!({
             "name": "alpha",
-            "nameHash": "1111111111111111111111111111111111111111111111111111111111111111",
+            "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
             "proofHeight": 99,
             "resourceStatus": "canonicalDecoded",
             "ownershipStatus": "walletContextUnavailable",
@@ -3128,7 +3349,7 @@ mod tests {
                 8,
                 ProviderMethod::HnsGetName.wire_name().to_owned(),
                 json!({
-                    "nameHash": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
                 }),
                 NOW_MS + 10,
             )
@@ -3166,6 +3387,107 @@ mod tests {
             ),
             Err(ServiceFailure {
                 code: ServiceErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_followup_name_permission_rejects_post_prompt_scope_or_account_change() {
+        let mut service = production_followup_projection_service();
+        let ServiceResponse::ApprovalRequired { approval } = service
+            .provider_request(
+                handle(),
+                1,
+                1,
+                ProviderMethod::HnsRequestAccounts.wire_name().to_owned(),
+                Value::Null,
+                NOW_MS + 1,
+            )
+            .expect("account approval")
+        else {
+            panic!("account approval response")
+        };
+        service
+            .approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 2,
+            )
+            .expect("account grant");
+
+        let ServiceResponse::ApprovalRequired { approval } = service
+            .provider_request(
+                handle(),
+                1,
+                2,
+                ProviderMethod::WalletRequestPermissions
+                    .wire_name()
+                    .to_owned(),
+                json!({ "capabilities": ["names"] }),
+                NOW_MS + 3,
+            )
+            .expect("exact name disclosure")
+        else {
+            panic!("name approval response")
+        };
+        let mut beta = production_followup_known_name();
+        beta.name = b"beta".to_vec();
+        beta.name_hash = production_followup_beta_hash();
+        service.runtime.snapshot.known_names.push(beta);
+        assert!(matches!(
+            service.approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 4,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::ApprovalStale,
+                ..
+            })
+        ));
+        let permission = service
+            .provider
+            .permission(handle(), 1, NOW_MS + 4)
+            .expect("permission")
+            .expect("account permission");
+        assert_eq!(
+            permission.capabilities,
+            BTreeSet::from([PermissionCapability::Accounts])
+        );
+        assert!(permission.approved_names.is_empty());
+
+        service.runtime.snapshot.known_names = vec![production_followup_known_name()];
+        let ServiceResponse::ApprovalRequired { approval } = service
+            .provider_request(
+                handle(),
+                1,
+                3,
+                ProviderMethod::WalletRequestPermissions
+                    .wire_name()
+                    .to_owned(),
+                json!({ "capabilities": ["names"] }),
+                NOW_MS + 5,
+            )
+            .expect("second exact name disclosure")
+        else {
+            panic!("second name approval response")
+        };
+        service.runtime.account.account_id = AccountId::new([10; 16]);
+        assert!(matches!(
+            service.approval_decision(
+                handle(),
+                1,
+                approval.approval_id,
+                hns_wallet_ffi::ApprovalDecision::Approve,
+                NOW_MS + 6,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::ApprovalStale,
                 ..
             })
         ));
@@ -4138,6 +4460,7 @@ mod tests {
             approval.summary,
             ApprovalSummary::Permissions {
                 capabilities: BTreeSet::from([PermissionCapability::Accounts]),
+                hns_names: Vec::new(),
             }
         );
 

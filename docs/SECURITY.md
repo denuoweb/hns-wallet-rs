@@ -207,12 +207,15 @@ cannot advertise the join; the explicit exact-account library composition can.
 The control and account-only compositions cannot advertise or execute generic
 permission creation because none of their methods consumes a non-Accounts
 scope. The synchronized read composition can extend only an existing exact
-Accounts grant, preserving its singleton account. A Names approval freezes the
-current bounded set of at most 128 exact name hashes in the same encrypted
-generation; a nonempty set is invalid without HNS namespace, Accounts, Names,
-and a nonempty account binding. Empty scope means no names, and any missing or
-stale approved name fails the whole read instead of falling back to all known
-names.
+Accounts grant, preserving its singleton account. Before a Names prompt, one
+live sync derives at most 64 sorted, unique canonical name/SHA3-hash pairs with
+the pinned `hns-covenants` authority. Pending state retains that exact account,
+display list, and binary hashes. Approval rechecks permission/account and
+performs a second live sync; any change rejects stale, and only the unchanged
+displayed hashes enter the encrypted generation. No post-consent discovery or
+expansion occurs. The 16 KiB prompt limit is an additional fail-closed bound.
+Empty scope means no names, and any missing approved name fails the whole read
+instead of falling back to all known names.
 
 Public HNS reads are explicitly projected rather than serializing wallet
 records. Amounts are decimal strings; account IDs and transaction/name hashes

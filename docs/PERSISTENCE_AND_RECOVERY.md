@@ -28,12 +28,15 @@ selection and website approvals remain process-local and must be reacquired
 after restart.
 
 An account-scoped read grant extends that same record; it never replaces the
-Accounts capability or singleton. When Names is approved, the service first
-performs a live reconciliation and persists the resulting exact bounded set of
-name hashes in the new permission generation. Nonempty name scope requires HNS
-namespace, Accounts, Names, and a nonempty account binding. Empty means no name
-disclosure. After restart, the current selected account and every requested or
-listed approved hash are checked again; a stale or missing hash fails closed.
+Accounts capability or singleton. A Names prompt performs a live reconciliation
+and retains its exact account, sorted maximum-64 minimized disclosures, and
+binary hashes only in process-local pending state. Approval re-synchronizes and
+rejects a changed permission, account, or current set as stale. Only the exact
+hashes shown to the user are persisted in the new permission generation;
+display names and pending approvals are not restored. Nonempty scope requires
+HNS namespace, Accounts, Names, and a nonempty account binding. Empty means no
+disclosure. After restart, account and approved hashes are checked again and a
+missing hash fails closed.
 
 Sensitive values use XChaCha20-Poly1305 with random nonces. Associated data
 binds the database ID, record domain and identifier, plus plaintext columns that

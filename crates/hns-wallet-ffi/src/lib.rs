@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 
+use hns_covenants::{hash_name, validate_name};
 use hns_wallet_types::{
     AccountId, Amount, ApprovalKind, BaseUnits, BrowserRuntimeSessionId, FinalityModel,
     HostAuthorityHandleId, HostSessionId, ModuleId, PermissionCapability, ProviderApprovalId,
@@ -29,6 +30,8 @@ pub const MAX_METHOD_BYTES: usize = 96;
 pub const MAX_ORIGIN_BYTES: usize = 512;
 pub const MAX_PUBLIC_STRING_BYTES: usize = 4_096;
 pub const MAX_PUBLIC_ITEMS: usize = 128;
+pub const MAX_HNS_NAME_DISCLOSURES: usize = 64;
+pub const MAX_HNS_NAME_BYTES: usize = 63;
 pub const MAX_FAILURE_MESSAGE_BYTES: usize = 1_024;
 pub const PROVIDER_SCHEMA_VERSION: u16 = 1;
 pub const APPROVAL_SCHEMA_VERSION: u16 = 2;
@@ -472,11 +475,34 @@ pub enum ApprovalWarning {
     SettlementCanBeDelayed,
 }
 
+/// One canonical Handshake name disclosed by a permission prompt. The hash is
+/// lowercase hexadecimal so a trusted UI can render and compare the exact
+/// authority being granted without receiving private wallet/name state.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HnsNameDisclosure {
+    pub name: String,
+    pub name_hash: String,
+}
+
+impl HnsNameDisclosure {
+    pub fn validate(&self) -> Result<(), AbiError> {
+        if validate_name(self.name.as_bytes())
+            && hns_name_hash_matches(&self.name, &self.name_hash)
+        {
+            Ok(())
+        } else {
+            Err(AbiError::InvalidApproval)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ApprovalSummary {
     Permissions {
         capabilities: BTreeSet<PermissionCapability>,
+        hns_names: Vec<HnsNameDisclosure>,
     },
     ModuleEnablement {
         module: ModuleId,
@@ -579,10 +605,17 @@ impl ApprovalSummary {
 
     fn validate(&self) -> Result<(), AbiError> {
         match self {
-            Self::Permissions { capabilities } => {
+            Self::Permissions {
+                capabilities,
+                hns_names,
+            } => {
                 if capabilities.is_empty() || capabilities.len() > MAX_PUBLIC_ITEMS {
                     return Err(AbiError::InvalidApproval);
                 }
+                if !capabilities.contains(&PermissionCapability::Names) && !hns_names.is_empty() {
+                    return Err(AbiError::InvalidApproval);
+                }
+                validate_hns_name_disclosures(hns_names)?;
             }
             Self::ModuleEnablement { .. } => {}
             Self::Send {
@@ -733,10 +766,14 @@ impl ApprovalSummary {
 
     fn validate_method(&self, method: &str) -> Result<(), AbiError> {
         let matches = match self {
-            Self::Permissions { capabilities } => match method {
+            Self::Permissions {
+                capabilities,
+                hns_names,
+            } => match method {
                 "hns_requestAccounts" => {
                     capabilities.len() == 1
                         && capabilities.contains(&PermissionCapability::Accounts)
+                        && hns_names.is_empty()
                 }
                 "wallet_requestPermissions" => {
                     !capabilities.contains(&PermissionCapability::Accounts)
@@ -1356,6 +1393,48 @@ fn validate_warnings(warnings: &BTreeSet<ApprovalWarning>) -> Result<(), AbiErro
     Ok(())
 }
 
+fn validate_hns_name_disclosures(names: &[HnsNameDisclosure]) -> Result<(), AbiError> {
+    if names.len() > MAX_HNS_NAME_DISCLOSURES
+        || names.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(AbiError::InvalidApproval);
+    }
+    let mut canonical_names = BTreeSet::new();
+    let mut canonical_hashes = BTreeSet::new();
+    for disclosure in names {
+        disclosure.validate()?;
+        if !canonical_names.insert(disclosure.name.as_str())
+            || !canonical_hashes.insert(disclosure.name_hash.as_str())
+        {
+            return Err(AbiError::InvalidApproval);
+        }
+    }
+    Ok(())
+}
+
+fn hns_name_hash_matches(name: &str, encoded: &str) -> bool {
+    if encoded.len() != 64 {
+        return false;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        let Some(high) = nibble(pair[0]) else {
+            return false;
+        };
+        let Some(low) = nibble(pair[1]) else {
+            return false;
+        };
+        decoded[index] = (high << 4) | low;
+    }
+    hash_name(name.as_bytes())
+        .is_ok_and(|expected| decoded == expected.into_bytes())
+}
+
 fn validate_public_string(value: &str) -> Result<(), AbiError> {
     if value.is_empty() || value.len() > MAX_PUBLIC_STRING_BYTES || !value.is_ascii() {
         return Err(AbiError::InvalidPublicValue);
@@ -1535,6 +1614,7 @@ mod tests {
             expires_at_unix_ms: 10_000,
             summary: ApprovalSummary::Permissions {
                 capabilities: BTreeSet::from([PermissionCapability::Balance]),
+                hns_names: Vec::new(),
             },
         };
         prompt
@@ -1623,6 +1703,7 @@ mod tests {
             expires_at_unix_ms: 10_000,
             summary: ApprovalSummary::Permissions {
                 capabilities: BTreeSet::from([PermissionCapability::Accounts]),
+                hns_names: Vec::new(),
             },
         };
         account_prompt
@@ -1631,6 +1712,7 @@ mod tests {
         let mut wrong_account_prompt = account_prompt.clone();
         wrong_account_prompt.summary = ApprovalSummary::Permissions {
             capabilities: BTreeSet::from([PermissionCapability::Balance]),
+            hns_names: Vec::new(),
         };
         assert_eq!(
             wrong_account_prompt.validate(ApprovalKind::Permission, 1_000),
@@ -1650,6 +1732,110 @@ mod tests {
                 capabilities: oversized_method,
             }),
             Err(AbiError::InvalidEnvelope)
+        );
+    }
+
+    #[test]
+    fn production_followup_permission_name_disclosures_are_exact_sorted_and_bounded() {
+        let alpha = HnsNameDisclosure {
+            name: "alpha".to_owned(),
+            name_hash: "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af"
+                .to_owned(),
+        };
+        let beta = HnsNameDisclosure {
+            name: "beta".to_owned(),
+            name_hash: "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f"
+                .to_owned(),
+        };
+        let mut prompt = ApprovalPrompt {
+            approval_id: approval_id(),
+            binding: ProviderBinding {
+                authority_handle: handle(),
+                authority_revision: 3,
+                wallet_session_id: wallet_session(),
+                permission_generation: 1,
+            },
+            origin: "https://wallet.example".to_owned(),
+            method: "wallet_requestPermissions".to_owned(),
+            expires_at_unix_ms: 10_000,
+            summary: ApprovalSummary::Permissions {
+                capabilities: BTreeSet::from([PermissionCapability::Names]),
+                hns_names: vec![alpha.clone(), beta.clone()],
+            },
+        };
+        prompt
+            .validate(ApprovalKind::Permission, 1_000)
+            .expect("sorted exact name disclosure");
+        let encoded = serde_json::to_value(&prompt).expect("name prompt JSON");
+        assert_eq!(
+            encoded["summary"]["hnsNames"],
+            serde_json::json!([
+                { "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" },
+                { "name": "beta", "nameHash": "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f" },
+            ])
+        );
+
+        let ApprovalSummary::Permissions { hns_names, .. } = &mut prompt.summary else {
+            panic!("permission summary")
+        };
+        hns_names.swap(0, 1);
+        assert_eq!(
+            prompt.validate(ApprovalKind::Permission, 1_000),
+            Err(AbiError::InvalidApproval)
+        );
+
+        let oversized = (0..=MAX_HNS_NAME_DISCLOSURES)
+            .map(|index| HnsNameDisclosure {
+                name: format!("name-{index:03}"),
+                name_hash: format!("{index:064x}"),
+            })
+            .collect();
+        prompt.summary = ApprovalSummary::Permissions {
+            capabilities: BTreeSet::from([PermissionCapability::Names]),
+            hns_names: oversized,
+        };
+        assert_eq!(
+            prompt.validate(ApprovalKind::Permission, 1_000),
+            Err(AbiError::InvalidApproval)
+        );
+
+        prompt.summary = ApprovalSummary::Permissions {
+            capabilities: BTreeSet::from([PermissionCapability::Names]),
+            hns_names: vec![HnsNameDisclosure {
+                name: "alpha".to_owned(),
+                name_hash:
+                    "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f"
+                        .to_owned(),
+            }],
+        };
+        assert_eq!(
+            prompt.validate(ApprovalKind::Permission, 1_000),
+            Err(AbiError::InvalidApproval)
+        );
+
+        prompt.summary = ApprovalSummary::Permissions {
+            capabilities: BTreeSet::from([PermissionCapability::Names]),
+            hns_names: vec![alpha.clone(), alpha.clone()],
+        };
+        assert_eq!(
+            prompt.validate(ApprovalKind::Permission, 1_000),
+            Err(AbiError::InvalidApproval)
+        );
+
+        prompt.summary = ApprovalSummary::Permissions {
+            capabilities: BTreeSet::from([PermissionCapability::Balance]),
+            hns_names: vec![alpha],
+        };
+        assert_eq!(
+            prompt.validate(ApprovalKind::Permission, 1_000),
+            Err(AbiError::InvalidApproval)
+        );
+        assert!(
+            serde_json::from_value::<ApprovalSummary>(serde_json::json!({
+                "kind": "permissions",
+                "capabilities": ["balance"],
+            }))
+            .is_err()
         );
     }
 

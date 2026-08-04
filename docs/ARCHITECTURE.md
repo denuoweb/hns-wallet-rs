@@ -87,6 +87,16 @@ retains the resulting binding internally and projects only the account's
 balance, transaction summaries, receive target, and approved known-name
 summaries.
 
+Names consent is a two-snapshot service flow, not post-approval enumeration.
+Prompt preparation synchronizes once, projects a sorted maximum-64 canonical
+name/hash list, and retains that exact account/list/hash set in ephemeral
+`PendingState`. Approval synchronizes again and rejects changed permission,
+account, or current scope before consuming the approval; the provider grant
+receives only the frozen hashes. Required ABI-v2 `hnsNames` prevents trusted
+host UIs from reducing Names consent to a generic capability label. Browser
+and mobile adapters remain unavailable until they adopt that unpublished
+shape.
+
 The earlier value-capable `HnsWalletRuntime` still owns a private
 `Mutex<WalletStore>` and its legacy full reconciliation holds that mutex across
 backend work. The synchronized provider read composition does not use that

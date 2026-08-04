@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hns-covenants.workspace = true
 hns-wallet-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

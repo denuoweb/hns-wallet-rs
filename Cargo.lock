@@ -843,6 +843,7 @@ dependencies = [
 name = "hns-wallet-ffi"
 version = "0.1.0"
 dependencies = [
+ "hns-covenants",
  "hns-wallet-types",
  "serde",
  "serde_json",

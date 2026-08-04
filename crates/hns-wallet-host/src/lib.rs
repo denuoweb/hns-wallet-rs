@@ -2002,7 +2002,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use hns_wallet_ffi::{ApprovalSummary, ProviderNamespace};
+    use hns_wallet_ffi::{ApprovalSummary, HnsNameDisclosure, ProviderNamespace};
     use hns_wallet_types::{
         BrowserRuntimeSessionId, PermissionCapability, ProviderAuthorityFingerprint,
         WalletSessionId,
@@ -2118,7 +2118,8 @@ mod tests {
             method: "wallet_requestPermissions".to_owned(),
             expires_at_unix_ms: 1_500,
             summary: ApprovalSummary::Permissions {
-                capabilities: BTreeSet::from([PermissionCapability::Accounts]),
+                capabilities: BTreeSet::from([PermissionCapability::Balance]),
+                hns_names: Vec::new(),
             },
         }
     }
@@ -2310,6 +2311,50 @@ mod tests {
                 decision: ApprovalDecision::Reject,
             } if authority_handle == handle() && response_approval_id == approval_id()
         ));
+    }
+
+    #[test]
+    fn production_followup_host_preserves_exact_sorted_name_disclosure() {
+        let (mut host, _) = new_host();
+        let mut capabilities = required_capabilities();
+        capabilities.insert(ServiceCapability::StructuredApprovals);
+        negotiate(&mut host, capabilities);
+        install_active_authority(&mut host, 2_000);
+        let alpha = HnsNameDisclosure {
+            name: "alpha".to_owned(),
+            name_hash: "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af"
+                .to_owned(),
+        };
+        let beta = HnsNameDisclosure {
+            name: "beta".to_owned(),
+            name_hash: "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f"
+                .to_owned(),
+        };
+        let mut prompt = approval_prompt();
+        prompt.summary = ApprovalSummary::Permissions {
+            capabilities: BTreeSet::from([PermissionCapability::Names]),
+            hns_names: vec![beta.clone(), alpha.clone()],
+        };
+        assert!(matches!(
+            host.install_approval(handle(), 1, "wallet_requestPermissions", prompt.clone()),
+            Err(HostError::ApprovalMismatch)
+        ));
+
+        let expected = vec![alpha, beta];
+        prompt.summary = ApprovalSummary::Permissions {
+            capabilities: BTreeSet::from([PermissionCapability::Names]),
+            hns_names: expected.clone(),
+        };
+        host.install_approval(handle(), 1, "wallet_requestPermissions", prompt)
+            .expect("exact disclosure prompt");
+        let stored = host.approval(approval_id()).expect("stored disclosure");
+        assert_eq!(
+            stored.summary,
+            ApprovalSummary::Permissions {
+                capabilities: BTreeSet::from([PermissionCapability::Names]),
+                hns_names: expected,
+            }
+        );
     }
 
     #[test]

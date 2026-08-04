@@ -94,6 +94,34 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "lowerHexDigest32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "canonicalHnsName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$",
+      "not": { "enum": ["example", "invalid", "local", "localhost", "test"] }
+    },
+    "hnsNameDisclosureV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "nameHash"],
+      "properties": {
+        "name": { "$ref": "#/$defs/canonicalHnsName" },
+        "nameHash": { "$ref": "#/$defs/lowerHexDigest32" }
+      },
+      "$comment": "The ABI validator uses the exact pinned hns-covenants rules and requires nameHash == SHA3-256(name)."
+    },
+    "hnsNameDisclosuresV2": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/hnsNameDisclosureV2" },
+      "$comment": "Wire producers sort by (name, nameHash); the ABI validator also rejects duplicate names or hashes and the 16384-byte approval-frame ceiling remains authoritative."
+    },
     "token128": {
       "type": "string",
       "minLength": 1,
@@ -649,11 +677,18 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "capabilities"],
+          "required": ["kind", "capabilities", "hnsNames"],
           "properties": {
             "kind": { "const": "permissions" },
-            "capabilities": { "$ref": "#/$defs/nonemptyPermissionCapabilities" }
-          }
+            "capabilities": { "$ref": "#/$defs/nonemptyPermissionCapabilities" },
+            "hnsNames": { "$ref": "#/$defs/hnsNameDisclosuresV2" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "capabilities": { "not": { "contains": { "const": "names" } } } } },
+              "then": { "properties": { "hnsNames": { "maxItems": 0 } } }
+            }
+          ]
         },
         {
           "type": "object",
@@ -826,7 +861,7 @@
       "allOf": [
         {
           "if": { "properties": { "method": { "const": "hns_requestAccounts" } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "const": ["accounts"] } } } } }
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "const": ["accounts"] }, "hnsNames": { "maxItems": 0 } } } } }
         },
         {
           "if": { "properties": { "method": { "const": "wallet_requestPermissions" } } },
@@ -1465,11 +1500,18 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "capabilities"],
+          "required": ["kind", "capabilities", "hnsNames"],
           "properties": {
             "kind": { "const": "permissions" },
-            "capabilities": { "$ref": "#/$defs/nonemptyPermissionCapabilities" }
-          }
+            "capabilities": { "$ref": "#/$defs/nonemptyPermissionCapabilities" },
+            "hnsNames": { "$ref": "#/$defs/hnsNameDisclosuresV2" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "capabilities": { "not": { "contains": { "const": "names" } } } } },
+              "then": { "properties": { "hnsNames": { "maxItems": 0 } } }
+            }
+          ]
         },
         {
           "type": "object",
@@ -1640,7 +1682,7 @@
       "allOf": [
         {
           "if": { "properties": { "method": { "const": "hns_requestAccounts" } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "const": ["accounts"] } } } } }
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "const": ["accounts"] }, "hnsNames": { "maxItems": 0 } } } } }
         },
         {
           "if": { "properties": { "method": { "const": "wallet_requestPermissions" } } },
