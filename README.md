@@ -69,8 +69,11 @@ TRANSFER authority; a harmless live binding advance is accepted only when the
 stable transfer/owner/state/renewal identity is unchanged, while the HNS
 runtime requires exact bindings within each immediate live fence. Persisted
 evidence never recreates authority. Every Shakedex and
-dependent HNS funding/value/fee gate remains `false`, and the new focused
-source tests were not built or executed in this tranche.
+dependent HNS funding/value/fee gate remains `false`. At exact local source
+revision `9d0cbeb8e59dcd74c189ec973b218a9f3afe167e`, the one combined
+`production_next` filter passed all 13 matching HNS, provider, service, and
+Shakedex tests with zero failures; this is not product, regtest, or full-gate
+qualification.
 
 ## Crates
 

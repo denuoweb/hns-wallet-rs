@@ -199,10 +199,10 @@ seller recovery, and seller-script FINALIZE. The fixed release gates remain
 `false`. Product-owned coin selection, product/startup orchestration, live
 Denuo/provider/trusted-UI integration, and complete
 regtest/restart/reorg/product qualification are still required before any gate
-can change. The previously recorded terminal-release tests remain the only
-executed focused evidence; the six new `production_next_` FINALIZE source tests
-plus the HNS purpose-separation test—seven `production_next_` tests total—were
-not built or executed in this tranche. Reverse Dutch is deferred.
+can change. At exact local source revision
+`9d0cbeb8e59dcd74c189ec973b218a9f3afe167e`, one combined filter passed the six
+new `production_next_` FINALIZE tests plus the HNS purpose-separation test—seven
+tests total—with zero failures. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 

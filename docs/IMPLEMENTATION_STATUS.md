@@ -126,8 +126,9 @@ after restart without treating its old snapshot as current authority.
 This source still does not select product funding coins, contact live Denuo
 peers, dispatch through a provider/trusted approval UI, integrate product
 startup supervision, or constitute restart/reorg/regtest qualification. The
-seven new `production_next_` FINALIZE source tests were not built or executed in
-this tranche. Purpose-bound seller proof/
+seven new `production_next_` HNS/FINALIZE tests passed together with zero
+failures at exact local source revision `9d0cbeb8e59dcd74c189ec973b218a9f3afe167e`.
+Purpose-bound seller proof/
 listing/cancellation/recovery signing remains separately constrained by
 canonical terms and current-lock authority. No Shakedex or dependent HNS
 Shakedex-funding/value/fee gate is enabled.
