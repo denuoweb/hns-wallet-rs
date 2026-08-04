@@ -9,7 +9,7 @@ if rg -n 'path\s*=\s*"\.\./' --glob Cargo.toml .; then
   exit 1
 fi
 
-hns_revision="4b989aabc132e7e79b8fd57a10f2465073faf588"
+hns_revision="29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
 hns_repository="https://github.com/handshake-rs/hns-rs.git"
 hns_lock_source="git+${hns_repository}?rev=${hns_revision}#${hns_revision}"
 for package in hns-covenants hns-encoding hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
